@@ -1,0 +1,11 @@
+.git/*
+target/*
+test/*
+
+Dockerfile
+docker-compose.yml
+.env*
+
+README.md
+LICENSE
+docs/*

@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  hubhook:
+    build: .
+    environment:
+      - HUBHOOK_PORT=${HUBHOOK_PORT}
+      - SLACK_TOKEN=${SLACK_TOKEN}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+    ports:
+      - 8080:${HUBHOOK_PORT}
+    volumes:
+      - ./config.json:/config/config.json

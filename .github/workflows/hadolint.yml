@@ -1,0 +1,19 @@
+name: reviewdog / hadolint
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/hadolint.yml
+
+jobs:
+  hadolint:
+    name: hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: hadolint
+        uses: reviewdog/action-hadolint@v1
+        with:
+          github_token: ${{ secrets.github_token }}
+          reporter: github-pr-review
