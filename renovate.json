@@ -2,6 +2,8 @@
   "extends": [
     "config:base"
   ],
+  "additionalReviewers": ["sksat"],
+  "assignees": ["meltingrabbit", "sksat"],
   "lockFileMaintenance": { "enabled": true },
   "regexManagers": [
     {
