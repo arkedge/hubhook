@@ -3,7 +3,7 @@
     "config:base"
   ],
   "additionalReviewers": ["sksat"],
-  "assignees": ["meltingrabbit", "sksat"],
+  "assignees": ["sksat"],
   "lockFileMaintenance": { "enabled": true },
   "regexManagers": [
     {
