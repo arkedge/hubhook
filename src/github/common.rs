@@ -180,7 +180,7 @@ pub struct PullRequest {
     pub updated_at: String,
     pub closed_at: Option<String>,
     pub merged_at: Option<String>,
-    pub merge_commit_sha: String,
+    pub merge_commit_sha: Option<String>,
     pub assignee: Option<User>, // Issueと挙動が違う？
     pub assignees: Vec<User>,
     pub requested_reviewers: Vec<User>, // TODO: teamの場合もある

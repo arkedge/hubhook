@@ -27,7 +27,6 @@ pub struct PullRequest {
     pub action: PullRequestAction,
     number: Option<usize>, // あったりなかったりする？
     pub pull_request: common::PullRequest,
-    pub assignee: common::User,
     pub repository: common::Repository,
     pub organization: common::Organization,
     pub sender: common::User,
