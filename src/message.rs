@@ -80,14 +80,17 @@ impl TryFrom<&github::Issues> for slack::Message {
                     ));
                     let title_link = Some(issue.html_url.clone());
 
-                    let mut text = issue.body.clone();
+                    let mut text: String = issue.body.clone().unwrap_or_default();
                     if let Some(astr) = users2str(&issue.assignees, "\n", true) {
                         text += "\n*Asiggnees*\n";
                         text += &astr;
                     }
 
-                    let fallback =
-                        format!("{title}\n{body}", title = issue.title, body = issue.body);
+                    let fallback = format!(
+                        "{title}\n{body}",
+                        title = issue.title,
+                        body = if let Some(b) = &issue.body { b } else { "" }
+                    );
 
                     slack::Attachment {
                         title,

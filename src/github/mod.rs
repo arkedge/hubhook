@@ -132,7 +132,14 @@ impl Payload {
 
     pub fn body(&self) -> &str {
         match &self {
-            Payload::Issues(issues) => &issues.issue.body,
+            Payload::Issues(issues) => {
+                if let Some(body) = &issues.issue.body {
+                    body
+                } else {
+                    ""
+                }
+            }
+
             Payload::IssueComment(icomment) => &icomment.comment.body,
             Payload::PullRequest(pr) => &pr.pull_request.body,
         }

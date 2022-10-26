@@ -155,7 +155,7 @@ pub struct Issue {
     pub closed_at: Option<String>,
     pub author_association: String,
     pub active_lock_reason: Option<()>,
-    pub body: String,
+    pub body: Option<String>,
     pub reactions: Reactions,
     pub timeline_url: Url,
     pub performed_via_github_app: Option<()>,
