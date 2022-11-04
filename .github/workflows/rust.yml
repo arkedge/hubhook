@@ -32,7 +32,7 @@ jobs:
           override: true
 
       - name: cache dependencies
-        uses: Swatinem/rust-cache@v2.0.1
+        uses: Swatinem/rust-cache@v2.0.2
 
       - name: reviewdog / clippy
         uses: sksat/action-clippy@v0.1.0
