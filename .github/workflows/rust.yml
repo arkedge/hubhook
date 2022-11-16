@@ -7,13 +7,6 @@ on:
     tags:
       - v*
   pull_request:
-    paths:
-      - 'src/**'
-      - 'test/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain'
-      - '.github/workflows/rust.yml'
 
 env:
   CARGO_INCREMENTAL: 0
