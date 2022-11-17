@@ -2,7 +2,7 @@ FROM rust:1.64.0 as chef
 LABEL maintainer "sksat <sksat@arkedgespace.com>"
 
 # depName=LukeMathWalker/cargo-chef datasource=github-releases
-ARG CARGO_CHEF_VERSION="v0.1.46"
+ARG CARGO_CHEF_VERSION="v0.1.47"
 RUN cargo install --version "${CARGO_CHEF_VERSION#v}" --locked cargo-chef
 WORKDIR build
 
