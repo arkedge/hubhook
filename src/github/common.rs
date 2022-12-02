@@ -148,7 +148,7 @@ pub struct Issue {
     pub locked: bool,
     pub assignee: Option<User>,
     pub assignees: Vec<User>,
-    pub minestone: Option<()>,
+    pub milestone: Option<()>,
     pub comments: usize,
     pub created_at: String,
     pub updated_at: String,
@@ -186,7 +186,7 @@ pub struct PullRequest {
     pub requested_reviewers: Vec<User>, // TODO: teamの場合もある
     pub requested_teams: Vec<()>,       // TODO: これは確実にteam
     pub labels: Vec<Label>,
-    pub minestone: Option<()>,
+    pub milestone: Option<()>,
     pub draft: bool,
     pub commits_url: Url,
     pub review_comments_url: Url,
