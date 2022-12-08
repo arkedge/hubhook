@@ -37,6 +37,9 @@ struct Opt {
     #[structopt(long, env)]
     webhook_secret: String,
 
+    #[structopt(long, env)]
+    sentry_dsn: String,
+
     #[structopt(long)]
     debug: bool,
 }
@@ -146,6 +149,16 @@ impl FromRequest for Data {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let opt = Opt::from_args();
+
+    let _guard = sentry::init((
+        opt.sentry_dsn.clone(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+    std::env::set_var("RUST_BACKTRACE", "1");
+
     let port = opt.hubhook_port;
 
     let level = if opt.debug {
@@ -181,6 +194,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(sentry_actix::Sentry::new())
             .app_data(web::Data::new(Arc::new(cfg.clone()))) // memo: https://github.com/actix/actix-web/issues/1454#issuecomment-867897725
             .app_data(web::Data::new(Arc::new(opt.clone())))
             .service(web::resource("/webhook").route(web::post().to(webhook)))
