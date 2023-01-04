@@ -1,4 +1,4 @@
-FROM rust:1.65.0 as chef
+FROM rust:1.66.0 as chef
 LABEL maintainer "sksat <sksat@arkedgespace.com>"
 
 # depName=LukeMathWalker/cargo-chef datasource=github-releases
