@@ -5,6 +5,13 @@
   "additionalReviewers": ["sksat"],
   "assignees": ["sksat"],
   "lockFileMaintenance": { "enabled": true },
+  "packageRules": [
+    {
+      "groupName": "sentry-rust",
+      "groupSlug": "sentry",
+      "packageNames": ["sentry", "sentry-actix"]
+    }
+  ],
   "regexManagers": [
     {
       "fileMatch": ["^rust-toolchain(\\.toml)?$"],
