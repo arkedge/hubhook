@@ -11,6 +11,7 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
       - '.github/workflows/build-image.yml'
+  merge_group:
 
 permissions:
   id-token: write

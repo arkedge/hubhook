@@ -5,6 +5,7 @@ on:
     paths:
       - 'renovate.json'
       - '.github/workflows/validate-renovate.yml'
+  merge_group:
 
 jobs:
   validate-renovate:
