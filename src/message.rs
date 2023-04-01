@@ -11,15 +11,15 @@ impl TryFrom<&github::Payload> for slack::Message {
 
         match payload {
             Payload::Issues(issues) => {
-                let i: &github::Issues = issues;
+                let i: &github::IssuesEvent = issues;
                 i.try_into()
             }
             Payload::PullRequest(pr) => {
-                let p: &github::PullRequest = pr;
+                let p: &github::PullRequestEvent = pr;
                 p.try_into()
             }
             Payload::IssueComment(ic) => {
-                let ic: &github::IssueComment = ic;
+                let ic: &github::IssueCommentEvent = ic;
                 ic.try_into()
             }
         }
@@ -47,10 +47,10 @@ fn users2str(assignees: &[github::common::User], delimiter: &str, to_link: bool)
     )
 }
 
-impl TryFrom<&github::Issues> for slack::Message {
+impl TryFrom<&github::IssuesEvent> for slack::Message {
     type Error = ();
 
-    fn try_from(issues: &github::Issues) -> Result<Self, Self::Error> {
+    fn try_from(issues: &github::IssuesEvent) -> Result<Self, Self::Error> {
         let repo = &issues.repository;
         let issue = &issues.issue;
         let user = &issue.user;
@@ -154,10 +154,10 @@ impl TryFrom<&github::Issues> for slack::Message {
     }
 }
 
-impl TryFrom<&github::PullRequest> for slack::Message {
+impl TryFrom<&github::PullRequestEvent> for slack::Message {
     type Error = ();
 
-    fn try_from(pull_request: &github::PullRequest) -> Result<Self, Self::Error> {
+    fn try_from(pull_request: &github::PullRequestEvent) -> Result<Self, Self::Error> {
         let repo = &pull_request.repository;
         let pr = &pull_request.pull_request;
 
@@ -240,10 +240,10 @@ impl TryFrom<&github::PullRequest> for slack::Message {
     }
 }
 
-impl TryFrom<&github::IssueComment> for slack::Message {
+impl TryFrom<&github::IssueCommentEvent> for slack::Message {
     type Error = ();
 
-    fn try_from(issue_comment: &github::IssueComment) -> Result<Self, Self::Error> {
+    fn try_from(issue_comment: &github::IssueCommentEvent) -> Result<Self, Self::Error> {
         let repo = &issue_comment.repository;
         let issue = &issue_comment.issue;
         let comment = &issue_comment.comment;

@@ -26,6 +26,7 @@ pub struct Attachment {
     pub color: Option<Color>,
 }
 
+#[allow(unused)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Color {
@@ -43,13 +44,6 @@ pub enum Color {
 }
 
 impl Message {
-    pub fn from_string(text: String) -> Self {
-        Self {
-            text,
-            attachments: None,
-        }
-    }
-
     pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
         let payload = MessagePayload {
             channel: channel.to_string(),

@@ -7,48 +7,35 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Payload {
-    IssueComment(Box<IssueComment>),
-    Issues(Box<Issues>),
-    PullRequest(Box<PullRequest>),
+    IssueComment(Box<IssueCommentEvent>),
+    Issues(Box<IssuesEvent>),
+    PullRequest(Box<PullRequestEvent>),
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Issues {
+pub struct IssuesEvent {
     pub action: IssuesAction,
     pub issue: common::Issue,
     pub repository: common::Repository,
-    pub organization: common::Organization,
     pub sender: common::User,
-    pub installation: common::InstallationLite,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PullRequest {
+pub struct PullRequestEvent {
     pub action: PullRequestAction,
-    number: Option<usize>, // あったりなかったりする？
     pub pull_request: common::PullRequest,
     pub repository: common::Repository,
-    pub organization: common::Organization,
     pub sender: common::User,
-    pub installation: common::InstallationLite,
 }
 
 // Issue Comment & Pull-Request Comment
 #[derive(Debug, Deserialize)]
-pub struct IssueComment {
+pub struct IssueCommentEvent {
     pub action: IssueCommentAction,
     pub issue: common::Issue,
     pub comment: common::IssueComment,
     pub repository: common::Repository,
-    pub organization: common::Organization,
     pub sender: common::User,
-    pub installation: common::InstallationLite,
-}
-
-impl IssueComment {
-    pub fn is_pull_request(&self) -> bool {
-        self.issue.is_pull_request()
-    }
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
