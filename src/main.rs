@@ -80,7 +80,7 @@ pub struct Query {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PayloadKind {
     IssueComment,
     Issues,
@@ -91,6 +91,34 @@ impl PayloadKind {
     const HEADER_NAME: &str = "x-github-event";
     fn from_header(headers: &HeaderMap) -> Option<Self> {
         serde_json::from_slice(headers.get(Self::HEADER_NAME)?.as_bytes()).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::http::header::*;
+
+    use super::*;
+
+    #[test]
+    fn test_event_payload_kind() {
+        fn header(s: &str) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            h.append("x-github-event".parse().unwrap(), s.parse().unwrap());
+            h
+        }
+        matches!(
+            PayloadKind::from_header(&header("issue_comment")),
+            Some(PayloadKind::IssueComment)
+        );
+        matches!(
+            PayloadKind::from_header(&header("issues")),
+            Some(PayloadKind::Issues)
+        );
+        matches!(
+            PayloadKind::from_header(&header("pull_request")),
+            Some(PayloadKind::PullRequest)
+        );
     }
 }
 
