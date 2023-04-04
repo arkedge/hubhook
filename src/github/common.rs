@@ -20,7 +20,6 @@ pub struct Issue<'a> {
     pub node_id: &'a str,
     pub number: usize,
     pub title: &'a str,
-    #[serde(borrow)]
     pub user: User<'a>,
     pub labels: Vec<Label<'a>>,
     pub assignee: Option<User<'a>>,
