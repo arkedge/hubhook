@@ -13,7 +13,11 @@ pub enum Payload<'a> {
 
 impl IntoMessage for Payload<'_> {
     fn create_message(&self) -> message::CreatedMessage {
-        todo!()
+        match self {
+            Payload::IssueComment(ic) => ic.create_message(),
+            Payload::Issues(i) => i.create_message(),
+            Payload::PullRequest(p) => p.create_message(),
+        }
     }
 }
 
