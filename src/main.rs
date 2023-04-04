@@ -322,16 +322,14 @@ impl Rule {
     }
 
     fn match_query(query: Option<&String>, payload: &str) -> Option<bool> {
-        query?;
-        Some(Rule::match_query_impl(query.unwrap(), payload))
+        Some(Rule::match_query_impl(query?, payload))
     }
 
     fn match_query_vec<T>(query: Option<&String>, payload: Vec<T>) -> Option<bool>
     where
         T: ToString, // Into<&str>にしようとしたけどダメだった
     {
-        query?;
-        let query = query.unwrap();
+        let query = query?;
 
         for p in payload {
             if Rule::match_query_impl(query, &p.to_string()) {
