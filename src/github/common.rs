@@ -22,13 +22,9 @@ pub struct Issue<'a> {
     pub title: &'a str,
     #[serde(borrow)]
     pub user: User<'a>,
-    #[serde(borrow)]
     pub labels: Vec<Label<'a>>,
-    #[serde(borrow)]
     pub assignee: Option<User<'a>>,
-    #[serde(borrow)]
     pub assignees: Vec<User<'a>>,
-    #[serde(borrow)]
     pub body: Option<&'a str>,
 }
 
