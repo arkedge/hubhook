@@ -218,7 +218,7 @@ impl IntoMessage for github::PullRequestEvent<'_> {
                     let title_link = Some(pr.html_url.clone());
                     let text = "*Assignees*\n".to_string()
                         + &users2str(assignees, "\n", true)
-                            .expect("no assignees on puull request assigned event");
+                            .expect("no assignees on pull request assigned event");
 
                     let color = Some(slack::Color::Good);
 
