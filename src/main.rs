@@ -132,26 +132,26 @@ impl FromRequest for Extracted {
             }
         };
 
-        let req = req.clone();
+        let (debug, webhook_secret) = {
+            let opt = req.app_data::<web::Data<Arc<Opt>>>().unwrap();
+            (opt.debug, opt.webhook_secret.clone())
+        };
         let pd = payload.take();
         async move {
-            let opt = req.app_data::<web::Data<Arc<Opt>>>().unwrap();
             let p = pd
-                .try_fold(Vec::new(), |mut acc, chunk| async move {
+                .try_fold(Vec::new(), |mut acc, chunk| async {
                     acc.extend(chunk);
                     Ok(acc)
                 })
                 .await;
             let payload_bytes: Vec<u8> = p.unwrap();
-
-            let webhook_secret = &opt.webhook_secret.as_bytes();
-            let mut mac = HmacSha256::new_from_slice(webhook_secret).unwrap();
+            let mut mac = HmacSha256::new_from_slice(webhook_secret.as_bytes()).unwrap();
             mac.update(&payload_bytes);
 
             // validate signature
             if mac.verify_slice(&sig256).is_err() {
                 error!("signature mismatch");
-                if !opt.debug {
+                if !debug {
                     return Err(ErrorBadRequest("signature mismatch!"));
                 }
             }
