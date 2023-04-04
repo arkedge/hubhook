@@ -3,29 +3,6 @@ use crate::slack;
 
 use tracing::info;
 
-impl TryFrom<&github::Payload> for slack::Message {
-    type Error = ();
-
-    fn try_from(payload: &github::Payload) -> Result<Self, Self::Error> {
-        use github::Payload;
-
-        match payload {
-            Payload::Issues(issues) => {
-                let i: &github::IssuesEvent = issues;
-                i.try_into()
-            }
-            Payload::PullRequest(pr) => {
-                let p: &github::PullRequestEvent = pr;
-                p.try_into()
-            }
-            Payload::IssueComment(ic) => {
-                let ic: &github::IssueCommentEvent = ic;
-                ic.try_into()
-            }
-        }
-    }
-}
-
 fn users2str(assignees: &[github::common::User], delimiter: &str, to_link: bool) -> Option<String> {
     if assignees.is_empty() {
         return None;
@@ -47,15 +24,32 @@ fn users2str(assignees: &[github::common::User], delimiter: &str, to_link: bool)
     )
 }
 
-impl TryFrom<&github::IssuesEvent> for slack::Message {
-    type Error = ();
+pub enum CreatedMessage {
+    Ok(slack::Message),
+    SkipThisEvent,
+}
 
-    fn try_from(issues: &github::IssuesEvent) -> Result<Self, Self::Error> {
-        let repo = &issues.repository;
-        let issue = &issues.issue;
+impl CreatedMessage {
+    pub fn as_ok(&self) -> Option<&slack::Message> {
+        if let Self::Ok(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+pub trait IntoMessage {
+    fn create_message(&self) -> CreatedMessage;
+}
+
+impl IntoMessage for github::IssuesEvent<'_> {
+    fn create_message(&self) -> CreatedMessage {
+        let repo = &self.repository;
+        let issue = &self.issue;
         let user = &issue.user;
 
-        match issues.action {
+        match self.action {
             github::IssuesAction::Opened => {
                 // enterpriseでなければこっちに入る？
                 // 2022-01-11: かと思ったがそうでもないようなのでログに出して様子を見る
@@ -80,7 +74,7 @@ impl TryFrom<&github::IssuesEvent> for slack::Message {
                     ));
                     let title_link = Some(issue.html_url.clone());
 
-                    let mut text: String = issue.body.clone().unwrap_or_default();
+                    let mut text: String = issue.body.map(|s| s.to_string()).unwrap_or_default();
                     if let Some(astr) = users2str(&issue.assignees, "\n", true) {
                         text += "\n*Asiggnees*\n";
                         text += &astr;
@@ -102,7 +96,7 @@ impl TryFrom<&github::IssuesEvent> for slack::Message {
                 };
                 let attachments = Some(vec![attach]);
 
-                Ok(Self { text, attachments })
+                CreatedMessage::Ok(slack::Message { text, attachments })
             }
             github::IssuesAction::Assigned => {
                 // enterpriseでなければこっちに入る？
@@ -147,21 +141,19 @@ impl TryFrom<&github::IssuesEvent> for slack::Message {
                 };
                 let attachments = Some(vec![attach]);
 
-                Ok(Self { text, attachments })
+                CreatedMessage::Ok(slack::Message { text, attachments })
             }
-            _ => Err(()),
+            _ => CreatedMessage::SkipThisEvent,
         }
     }
 }
 
-impl TryFrom<&github::PullRequestEvent> for slack::Message {
-    type Error = ();
+impl IntoMessage for github::PullRequestEvent<'_> {
+    fn create_message(&self) -> CreatedMessage {
+        let repo = &self.repository;
+        let pr = &self.pull_request;
 
-    fn try_from(pull_request: &github::PullRequestEvent) -> Result<Self, Self::Error> {
-        let repo = &pull_request.repository;
-        let pr = &pull_request.pull_request;
-
-        match pull_request.action {
+        match self.action {
             github::PullRequestAction::Opened => {
                 let text = format!(
                     "[{repo}] Pull Request opened by {user}",
@@ -178,11 +170,18 @@ impl TryFrom<&github::PullRequestEvent> for slack::Message {
                         title = pr.title
                     ));
                     let title_link = Some(pr.html_url.clone());
-                    let fallback = format!("{title}\n{body}", title = pr.title, body = pr.body);
+                    let fallback = format!(
+                        "{title}\n{body}",
+                        title = pr.title,
+                        body = pr.body.unwrap_or_default()
+                    );
 
-                    let mut text = pr.body.clone();
+                    let mut text = match pr.body {
+                        Some(s) => s.to_string(),
+                        None => String::default(),
+                    };
                     if let Some(astr) = users2str(&pr.assignees, "\n", true) {
-                        text += "\n*Asiggnees*\n";
+                        text += "\n*Assignees*\n";
                         text += &astr;
                     }
 
@@ -196,7 +195,7 @@ impl TryFrom<&github::PullRequestEvent> for slack::Message {
                 };
                 let attachments = Some(vec![attach]);
 
-                Ok(Self { text, attachments })
+                CreatedMessage::Ok(slack::Message { text, attachments })
             }
 
             github::PullRequestAction::Assigned => {
@@ -233,24 +232,22 @@ impl TryFrom<&github::PullRequestEvent> for slack::Message {
                 };
                 let attachments = Some(vec![attach]);
 
-                Ok(Self { text, attachments })
+                CreatedMessage::Ok(slack::Message { text, attachments })
             }
-            _ => Err(()),
+            _ => CreatedMessage::SkipThisEvent,
         }
     }
 }
 
-impl TryFrom<&github::IssueCommentEvent> for slack::Message {
-    type Error = ();
-
-    fn try_from(issue_comment: &github::IssueCommentEvent) -> Result<Self, Self::Error> {
-        let repo = &issue_comment.repository;
-        let issue = &issue_comment.issue;
-        let comment = &issue_comment.comment;
+impl IntoMessage for github::IssueCommentEvent<'_> {
+    fn create_message(&self) -> CreatedMessage {
+        let repo = &self.repository;
+        let issue = &self.issue;
+        let comment = &self.comment;
         let ic_link = &comment.html_url;
         let username = &comment.user.login;
 
-        match issue_comment.action {
+        match self.action {
             github::IssueCommentAction::Created => {
                 let color = Some(slack::Color::Comment);
 
@@ -268,15 +265,15 @@ impl TryFrom<&github::IssueCommentEvent> for slack::Message {
                 let attach = slack::Attachment {
                     title: None,
                     title_link: None,
-                    fallback: comment.body.clone(),
-                    text: comment.body.clone(),
+                    fallback: comment.body.to_string(),
+                    text: comment.body.to_string(),
                     color,
                 };
                 let attachments = Some(vec![attach]);
 
-                Ok(Self { text, attachments })
+                CreatedMessage::Ok(slack::Message { text, attachments })
             }
-            _ => Err(()),
+            _ => CreatedMessage::SkipThisEvent,
         }
     }
 }

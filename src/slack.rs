@@ -17,7 +17,7 @@ pub struct MessagePayload {
     pub attachments: Option<Vec<Attachment>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Attachment {
     pub title: Option<String>,
     pub title_link: Option<url::Url>,
@@ -27,7 +27,7 @@ pub struct Attachment {
 }
 
 #[allow(unused)]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Color {
     Good,
@@ -44,13 +44,13 @@ pub enum Color {
 }
 
 impl Message {
-    pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
+    pub async fn post_message(&self, token: &str, channel: &str, username: Option<&str>) {
         let payload = MessagePayload {
             channel: channel.to_string(),
             username: username.map(|u| u.to_string()),
-            text: self.text,
+            text: self.text.clone(),
             fallback: None,
-            attachments: self.attachments,
+            attachments: self.attachments.clone(),
         };
 
         // post

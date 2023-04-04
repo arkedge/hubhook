@@ -4,38 +4,46 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum Payload {
-    IssueComment(Box<IssueCommentEvent>),
-    Issues(Box<IssuesEvent>),
-    PullRequest(Box<PullRequestEvent>),
+#[derive(Debug)]
+pub enum Payload<'a> {
+    IssueComment(Box<IssueCommentEvent<'a>>),
+    Issues(Box<IssuesEvent<'a>>),
+    PullRequest(Box<PullRequestEvent<'a>>),
+}
+
+impl IntoMessage for Payload<'_> {
+    fn create_message(&self) -> message::CreatedMessage {
+        todo!()
+    }
 }
 
 #[derive(Debug, Deserialize)]
-pub struct IssuesEvent {
+pub struct IssuesEvent<'a> {
     pub action: IssuesAction,
-    pub issue: common::Issue,
-    pub repository: common::Repository,
-    pub sender: common::User,
+    #[serde(borrow)]
+    pub issue: common::Issue<'a>,
+    pub repository: common::Repository<'a>,
+    pub sender: common::User<'a>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PullRequestEvent {
+pub struct PullRequestEvent<'a> {
     pub action: PullRequestAction,
-    pub pull_request: common::PullRequest,
-    pub repository: common::Repository,
-    pub sender: common::User,
+    #[serde(borrow)]
+    pub pull_request: common::PullRequest<'a>,
+    pub repository: common::Repository<'a>,
+    pub sender: common::User<'a>,
 }
 
 // Issue Comment & Pull-Request Comment
 #[derive(Debug, Deserialize)]
-pub struct IssueCommentEvent {
+pub struct IssueCommentEvent<'a> {
     pub action: IssueCommentAction,
-    pub issue: common::Issue,
-    pub comment: common::IssueComment,
-    pub repository: common::Repository,
-    pub sender: common::User,
+    #[serde(borrow)]
+    pub issue: common::Issue<'a>,
+    pub comment: common::IssueComment<'a>,
+    pub repository: common::Repository<'a>,
+    pub sender: common::User<'a>,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -90,8 +98,11 @@ pub enum IssueCommentAction {
     Deleted,
 }
 
-use crate::{Rule, RuleMatchResult};
-impl Payload {
+use crate::{
+    message::{self, IntoMessage},
+    Rule, RuleMatchResult,
+};
+impl Payload<'_> {
     pub fn repo(&self) -> &common::Repository {
         match &self {
             Payload::Issues(issues) => &issues.repository,
@@ -110,24 +121,17 @@ impl Payload {
 
     pub fn title(&self) -> &str {
         match &self {
-            Payload::Issues(issues) => &issues.issue.title,
-            Payload::IssueComment(icomment) => &icomment.issue.title,
-            Payload::PullRequest(pr) => &pr.pull_request.title,
+            Payload::Issues(issues) => issues.issue.title,
+            Payload::IssueComment(icomment) => icomment.issue.title,
+            Payload::PullRequest(pr) => pr.pull_request.title,
         }
     }
 
     pub fn body(&self) -> &str {
         match &self {
-            Payload::Issues(issues) => {
-                if let Some(body) = &issues.issue.body {
-                    body
-                } else {
-                    ""
-                }
-            }
-
-            Payload::IssueComment(icomment) => &icomment.comment.body,
-            Payload::PullRequest(pr) => &pr.pull_request.body,
+            Payload::Issues(issues) => issues.issue.body.unwrap_or_default(),
+            Payload::IssueComment(icomment) => icomment.comment.body,
+            Payload::PullRequest(pr) => pr.pull_request.body.unwrap_or_default(),
         }
     }
 
@@ -175,14 +179,14 @@ impl Payload {
 
 #[cfg(test)]
 mod tests {
-    use crate::github::*;
+    // use crate::github::*;
 
-    fn de(test_json: &str) -> Payload {
-        let path = format!("test/{}", test_json);
-        let payload = std::fs::read_to_string(path).unwrap();
-        let p: Payload = serde_json::from_str(&payload).unwrap();
-        p
-    }
+    // fn de(test_json: &str) -> Payload {
+    //     let path = format!("test/{}", test_json);
+    //     let payload = std::fs::read_to_string(path).unwrap();
+    //     let p: Payload = serde_json::from_str(&payload).unwrap();
+    //     p
+    // }
 
     // TODO: add test for OSS
 

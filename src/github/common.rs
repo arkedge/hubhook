@@ -2,71 +2,76 @@ use serde::Deserialize;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
-pub struct User {
-    pub login: String,
+pub struct User<'a> {
+    pub login: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Repository {
-    pub full_name: String,
+pub struct Repository<'a> {
+    pub full_name: &'a str,
     #[serde(default)]
-    pub topics: Vec<String>,
+    pub topics: Vec<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Issue {
+pub struct Issue<'a> {
     pub url: Url,
     pub html_url: Url,
-    pub node_id: String,
+    pub node_id: &'a str,
     pub number: usize,
-    pub title: String,
-    pub user: User,
-    pub labels: Vec<Label>,
-    pub assignee: Option<User>,
-    pub assignees: Vec<User>,
-    pub body: Option<String>,
+    pub title: &'a str,
+    #[serde(borrow)]
+    pub user: User<'a>,
+    #[serde(borrow)]
+    pub labels: Vec<Label<'a>>,
+    #[serde(borrow)]
+    pub assignee: Option<User<'a>>,
+    #[serde(borrow)]
+    pub assignees: Vec<User<'a>>,
+    #[serde(borrow)]
+    pub body: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PullRequest {
+pub struct PullRequest<'a> {
     pub url: Url,
     pub html_url: Url,
     pub number: usize, // PR number
-    pub title: String,
-    pub user: User,
-    pub body: String,
-    pub assignees: Vec<User>,
-    pub requested_reviewers: Vec<User>, // TODO: teamの場合もある
-    pub requested_teams: Vec<()>,       // TODO: これは確実にteam
-    pub labels: Vec<Label>,
+    pub title: &'a str,
+    pub user: User<'a>,
+    pub body: Option<&'a str>,
+    pub assignees: Vec<User<'a>>,
+    pub requested_reviewers: Vec<User<'a>>, // TODO: teamの場合もある
+    pub requested_teams: Vec<()>,           // TODO: これは確実にteam
+    pub labels: Vec<Label<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct IssueComment {
+pub struct IssueComment<'a> {
     pub url: Url,
     pub html_url: Url,
-    pub user: User,
-    pub body: String,
+    pub user: User<'a>,
+    pub body: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Label {
-    pub name: String,
+pub struct Label<'a> {
+    pub name: &'a str,
 }
 
-impl Issue {
+impl Issue<'_> {
     pub fn is_pull_request(&self) -> bool {
         self.node_id.starts_with("PR_")
     }
 }
 
-impl<'a> From<&'a Label> for &'a str {
+impl<'a> From<&'a Label<'a>> for &'a str {
     fn from(label: &'a Label) -> &'a str {
-        &label.name
+        label.name
     }
 }
 
-impl ToString for &Label {
+impl ToString for &Label<'_> {
     fn to_string(&self) -> String {
         self.name.to_string()
     }

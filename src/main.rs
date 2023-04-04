@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use actix_web::http::header::HeaderMap;
 use structopt::StructOpt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use regex::RegexBuilder;
 
@@ -11,12 +13,14 @@ use actix_web::error::ErrorBadRequest;
 use actix_web::{web, App, Error, FromRequest, HttpRequest, HttpResponse, HttpServer, Result};
 
 use futures::future::{Future, FutureExt};
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::stream::TryStreamExt;
 
 use tracing::{debug, error, info, warn};
 
 use crypto_hashes::sha2::Sha256;
 use hmac::{Hmac, Mac};
+
+use crate::message::{CreatedMessage, IntoMessage};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -75,12 +79,28 @@ pub struct Query {
     //review_state: Option<String>,
 }
 
-#[derive(Debug)]
-struct Data {
-    json: web::Json<github::Payload>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadKind {
+    IssueComment,
+    Issues,
+    PullRequest,
 }
 
-impl FromRequest for Data {
+impl PayloadKind {
+    const HEADER_NAME: &str = "x-github-event";
+    fn from_header(headers: &HeaderMap) -> Option<Self> {
+        serde_json::from_slice(headers.get(Self::HEADER_NAME)?.as_bytes()).ok()
+    }
+}
+
+#[derive(Debug)]
+struct Extracted {
+    payload_kind: PayloadKind,
+    payload: Vec<u8>,
+}
+
+impl FromRequest for Extracted {
     type Error = Error;
     //type Future = Ready<Result<Self, Self::Error>>;
     type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
@@ -98,13 +118,18 @@ impl FromRequest for Data {
             return Box::pin(err(ErrorBadRequest("user-agent mismatch")));
         }
 
-        use actix_web::error::PayloadError;
-        use actix_web::web::Bytes;
         let sig256: Vec<u8> = {
             let sig = headers.get("x-hub-signature-256").unwrap();
-            let sig = String::from_utf8(sig.as_bytes().to_vec()).unwrap();
+            let sig = std::str::from_utf8(sig.as_bytes()).unwrap();
             let sig = sig.strip_prefix("sha256=").unwrap();
             hex::decode(sig).unwrap()
+        };
+        let payload_kind = match PayloadKind::from_header(headers) {
+            Some(p) => p,
+            None => {
+                error!("missing header value {}", PayloadKind::HEADER_NAME);
+                return Box::pin(err(ErrorBadRequest("missing header")));
+            }
         };
 
         let req = req.clone();
@@ -117,30 +142,24 @@ impl FromRequest for Data {
                     Ok(acc)
                 })
                 .await;
-            let p: Vec<u8> = p.unwrap();
+            let payload_bytes: Vec<u8> = p.unwrap();
 
             let webhook_secret = &opt.webhook_secret.as_bytes();
             let mut mac = HmacSha256::new_from_slice(webhook_secret).unwrap();
-            mac.update(&p);
-            let result = mac.finalize();
+            mac.update(&payload_bytes);
 
             // validate signature
-            if !compare_slice(&sig256, &result.into_bytes()) {
+            if mac.verify_slice(&sig256).is_err() {
                 error!("signature mismatch");
                 if !opt.debug {
                     return Err(ErrorBadRequest("signature mismatch!"));
                 }
             }
 
-            let b = Bytes::from(p);
-            let st = futures::stream::once(async { Ok::<_, PayloadError>(b) });
-            let mut p = actix_web::dev::Payload::Stream {
-                payload: st.boxed_local(),
-            };
-
-            let json = web::Json::<github::Payload>::from_request(&req, &mut p).await?;
-
-            Ok(Data { json }) // validate success
+            Ok(Extracted {
+                payload: payload_bytes,
+                payload_kind,
+            }) // validate success
         }
         .boxed_local()
     }
@@ -207,32 +226,42 @@ async fn main() -> std::io::Result<()> {
 async fn webhook(
     opt: web::Data<Arc<Opt>>,
     cfg: web::Data<Arc<Config>>,
-    data: Option<Data>,
+    Extracted {
+        payload_kind,
+        payload,
+    }: Extracted,
 ) -> Result<HttpResponse> {
-    let payload = if let Some(data) = data {
-        data.json
-    } else {
-        return Ok(HttpResponse::BadRequest().body("bad request"));
+    let map_err = |e| {
+        error!(
+            "failed to parse payload {}: {e}",
+            serde_json::to_string(&payload_kind).unwrap()
+        );
+        ErrorBadRequest("failed to parse payload")
     };
-
-    let payload = payload.into_inner();
+    use github::Payload::*;
+    let payload = match &payload_kind {
+        PayloadKind::IssueComment => {
+            IssueComment(serde_json::from_slice(&payload).map_err(map_err)?)
+        }
+        PayloadKind::Issues => Issues(serde_json::from_slice(&payload).map_err(map_err)?),
+        PayloadKind::PullRequest => PullRequest(serde_json::from_slice(&payload).map_err(map_err)?),
+    };
 
     //post_test(&opt, &payload).await;
 
     // match rule
-    let matches = payload.match_rules(&cfg.rule);
+    let matches = match_rules(&payload, &cfg.rule);
 
-    for (channel, m) in matches {
-        let msg: Result<slack::Message, _> = (&payload).try_into();
-        if let Ok(msg) = msg {
-            msg.post_message(&opt.slack_token, &channel, Some(&m.display_name))
-                .await;
-        } else {
-            error!(
-                "GitHub payload -> slack::Message failed. link = {}",
-                &payload.url()
-            );
-            //error!("payload: {:#?}", &payload);
+    if !matches.is_empty() {
+        use CreatedMessage::*;
+        match payload.create_message() {
+            Ok(msg) => {
+                for (channel, m) in matches {
+                    msg.post_message(&opt.slack_token, &channel, Some(&m.display_name))
+                        .await;
+                }
+            }
+            SkipThisEvent => (),
         }
     }
 
@@ -243,13 +272,13 @@ impl Rule {
     fn check_match(&self, payload: &github::Payload) -> bool {
         let query = &self.query;
 
-        let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
+        let r_repo = Rule::match_query(query.repo.as_ref(), payload.repo().full_name);
 
         let topics = &payload.repo().topics;
         let topics = topics.iter().collect();
         let r_topic = Rule::match_query_vec(query.topic.as_ref(), topics);
 
-        let r_sender = Rule::match_query(query.user.as_ref(), &payload.sender().login);
+        let r_sender = Rule::match_query(query.user.as_ref(), payload.sender().login);
         let r_title = Rule::match_query(query.title.as_ref(), payload.title());
         let r_body = Rule::match_query(query.body.as_ref(), payload.body());
 
@@ -303,24 +332,36 @@ impl Rule {
     }
 }
 
-#[allow(dead_code)]
-async fn post_test(opt: &Opt, payload: &github::Payload) {
-    let msg: slack::Message = payload.try_into().unwrap();
-    msg.post_message(&opt.slack_token, "tmp_hubhook", None)
-        .await;
+pub fn match_rules(payload: &github::Payload, rules: &[Rule]) -> HashMap<String, RuleMatchResult> {
+    let mut v = HashMap::<String, RuleMatchResult>::new();
+
+    for r in rules {
+        // not match
+        if !r.check_match(payload) {
+            continue;
+        }
+
+        // multiple display_name
+        let mut display_name = r.display_name.clone();
+        if let Some(res) = v.get(&r.channel) {
+            display_name = res.display_name.to_string() + "&" + &display_name;
+        }
+
+        let res = RuleMatchResult {
+            display_name,
+            channel: r.channel.clone(),
+        };
+        v.insert(r.channel.clone(), res);
+    }
+
+    v
 }
 
-fn compare_slice(a: &[u8], b: &[u8]) -> bool {
-    use std::cmp::Ordering;
-
-    if a.len() != b.len() {
-        return false;
-    }
-    for (ai, bi) in a.iter().zip(b.iter()) {
-        match ai.cmp(bi) {
-            Ordering::Equal => continue,
-            _ => return false,
-        }
-    }
-    true
+#[allow(dead_code)]
+async fn post_test<'a>(opt: &Opt, payload: &github::Payload<'a>) {
+    let msg = payload.create_message();
+    msg.as_ok()
+        .unwrap()
+        .post_message(&opt.slack_token, "tmp_hubhook", None)
+        .await;
 }
