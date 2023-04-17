@@ -1,9 +1,6 @@
-FROM rust:1.68.2 as chef
+FROM ghcr.io/sksat/cargo-chef-docker:1.68.2-bullseye as chef
 LABEL maintainer "sksat <sksat@arkedgespace.com>"
 
-# depName=LukeMathWalker/cargo-chef datasource=github-releases
-ARG CARGO_CHEF_VERSION="v0.1.54"
-RUN cargo install --version "${CARGO_CHEF_VERSION#v}" --locked cargo-chef
 WORKDIR build
 
 FROM chef as planner

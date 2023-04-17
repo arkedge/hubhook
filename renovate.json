@@ -7,6 +7,11 @@
   "lockFileMaintenance": { "enabled": true },
   "packageRules": [
     {
+      "groupName": "Rust",
+      "groupSlug": "rust",
+      "packageNames": ["rust", "ghcr.io/sksat/cargo-chef-docker"]
+    },
+    {
       "groupName": "sentry-rust",
       "groupSlug": "sentry",
       "packageNames": ["sentry", "sentry-actix"]
@@ -21,13 +26,6 @@
       "depNameTemplate": "rust",
       "lookupNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases"
-    },
-    {
-      "fileMatch": ["^Dockerfile$"],
-      "matchStrings": [
-        "# depName=(?<depName>.*?) datasource=(?<datasource>.*)\nARG .*_VERSION=\"(?<currentValue>.*)\""
-      ],
-      "versioningTemplate": "{{#if versioning}}{{versioning}}{{else}}semver{{/if}}"
     }
   ]
 }
