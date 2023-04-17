@@ -11,7 +11,7 @@ description = "GitHub notification manager"
 
 [dependencies]
 actix-service = "2.0.2"
-actix-web = "4.3.0"
+actix-web = "4.3.1"
 crypto-hashes = "0.10.0"
 futures = "0.3.26"
 hex = "0.4.3"
