@@ -19,11 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1.0.7
+      - name: Get Rust toolchain
+        id: toolchain
+        run: |
+          awk -F'[ ="]+' '$1 == "channel" { print "toolchain=" $2 }' rust-toolchain >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
           components: clippy
-          override: true
 
       - name: cache dependencies
         uses: Swatinem/rust-cache@v2.4.0
@@ -34,6 +38,5 @@ jobs:
           reporter: github-pr-review
 
       - name: unit test
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: test
+        run: |
+          cargo test
