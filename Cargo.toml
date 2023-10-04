@@ -20,7 +20,7 @@ regex = "1.9.4"
 sentry = "0.31.6"
 sentry-actix = "0.31.6"
 serde = "1.0.188"
-serde_json = "1.0.105"
+serde_json = "1.0.107"
 structopt = "0.3.26"
 surf = { version = "2.3.2", default-features = false, features = ["h1-client-rustls"] }
 tracing = "0.1.37"
