@@ -23,6 +23,6 @@ serde = "1.0.189"
 serde_json = "1.0.107"
 structopt = "0.3.26"
 surf = { version = "2.3.2", default-features = false, features = ["h1-client-rustls"] }
-tracing = "0.1.37"
+tracing = "0.1.40"
 tracing-subscriber = "0.3.17"
 url = { version = "2.4.1", features = ["serde"]}
