@@ -33,7 +33,7 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.0
 
       - name: reviewdog / clippy
-        uses: sksat/action-clippy@v0.2.1
+        uses: sksat/action-clippy@v0.3.0
         with:
           reporter: github-pr-review
 
