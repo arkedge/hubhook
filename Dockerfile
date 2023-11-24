@@ -1,4 +1,4 @@
-FROM ghcr.io/sksat/cargo-chef-docker:1.73.0-bullseye as chef
+FROM ghcr.io/sksat/cargo-chef-docker:1.74.0-bullseye as chef
 LABEL maintainer "sksat <sksat@arkedgespace.com>"
 
 WORKDIR build
