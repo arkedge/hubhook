@@ -59,6 +59,7 @@ pub struct RuleMatchResult {
 pub struct Rule {
     pub channel: String,
     pub query: Query,
+    pub exclude_query: Option<Query>,
     pub display_name: String,
 }
 
@@ -241,8 +242,17 @@ async fn webhook(
 
 impl Rule {
     fn check_match(&self, payload: &github::Payload) -> bool {
-        let query = &self.query;
+        let include_query_result = Rule::match_results(&self.query, payload).iter().all(|&r| r);
 
+        if let Some(exclude_query) = &self.exclude_query {
+            let exclude_query_result = Rule::match_results(exclude_query, payload).iter().any(|&r| r);
+            include_query_result && !exclude_query_result
+        } else {
+            include_query_result
+        }
+    }
+
+    fn match_results(query: &Query, payload: &github::Payload) -> Vec<bool> {
         let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
 
         let topics = &payload.repo().topics;
@@ -257,11 +267,9 @@ impl Rule {
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);
 
         vec![r_repo, r_topic, r_sender, r_title, r_body, r_labels]
-            .iter()
+            .into_iter()
             .flatten()
-            .collect::<Vec<&bool>>()
-            .iter()
-            .all(|x| **x)
+            .collect()
     }
 
     fn match_query(query: Option<&String>, payload: &str) -> Option<bool> {
