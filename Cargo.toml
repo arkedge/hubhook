@@ -19,7 +19,7 @@ hmac = "0.12.1"
 regex = "1.10.2"
 sentry = "0.32.0"
 sentry-actix = "0.32.0"
-serde = "1.0.193"
+serde = "1.0.197"
 serde_json = "1.0.108"
 structopt = "0.3.26"
 surf = { version = "2.3.2", default-features = false, features = ["h1-client-rustls"] }
