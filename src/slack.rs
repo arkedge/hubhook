@@ -60,14 +60,12 @@ impl Message {
         };
 
         // post
-        let r = surf::post("https://slack.com/api/chat.postMessage")
-            .header(
-                surf::http::headers::AUTHORIZATION,
-                format!("Bearer {}", &token),
-            )
-            .body_json(&payload)
-            .expect("post json")
-            .recv_string()
+        let client = reqwest::Client::new();
+        let r = client
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
             .await;
 
         debug!("{:?}", &r);
