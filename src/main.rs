@@ -199,7 +199,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(Arc::new(cfg.clone()))) // memo: https://github.com/actix/actix-web/issues/1454#issuecomment-867897725
             .app_data(web::Data::new(Arc::new(opt.clone())))
             .service(web::resource("/webhook").route(web::post().to(webhook)))
-            .service(web::resource("/healthcheck").route(web::get().to(|| HttpResponse::Ok())))
+            .service(web::resource("/healthcheck").route(web::get().to(HttpResponse::Ok)))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
