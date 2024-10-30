@@ -49,7 +49,7 @@ jobs:
         registry: ${{ secrets.ECR_URL }}
 
     - name: Build and Push
-      uses: docker/build-push-action@v5.4.0
+      uses: docker/build-push-action@v6.9.0
       with:
         context: .
         push: true
