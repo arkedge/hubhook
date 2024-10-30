@@ -246,7 +246,9 @@ impl Rule {
         let include_query_result = Rule::match_results(&self.query, payload).iter().all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
-            let exclude_query_result = Rule::match_results(exclude_query, payload).iter().any(|&r| r);
+            let exclude_query_result = Rule::match_results(exclude_query, payload)
+                .iter()
+                .any(|&r| r);
             include_query_result && !exclude_query_result
         } else {
             include_query_result
