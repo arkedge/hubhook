@@ -199,6 +199,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(Arc::new(cfg.clone()))) // memo: https://github.com/actix/actix-web/issues/1454#issuecomment-867897725
             .app_data(web::Data::new(Arc::new(opt.clone())))
             .service(web::resource("/webhook").route(web::post().to(webhook)))
+            .service(web::resource("/healthcheck").route(web::get().to(HttpResponse::Ok)))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
@@ -245,7 +246,9 @@ impl Rule {
         let include_query_result = Rule::match_results(&self.query, payload).iter().all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
-            let exclude_query_result = Rule::match_results(exclude_query, payload).iter().any(|&r| r);
+            let exclude_query_result = Rule::match_results(exclude_query, payload)
+                .iter()
+                .any(|&r| r);
             include_query_result && !exclude_query_result
         } else {
             include_query_result
