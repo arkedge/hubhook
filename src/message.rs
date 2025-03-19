@@ -82,7 +82,7 @@ impl TryFrom<&github::Issues> for slack::Message {
 
                     let mut text: String = issue.body.clone().unwrap_or_default();
                     if let Some(astr) = users2str(&issue.assignees, "\n", true) {
-                        text += "\n*Asiggnees*\n";
+                        text += "\n*Assignees*\n";
                         text += &astr;
                     }
 
@@ -182,7 +182,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
 
                     let mut text = pr.body.clone();
                     if let Some(astr) = users2str(&pr.assignees, "\n", true) {
-                        text += "\n*Asiggnees*\n";
+                        text += "\n*Assignees*\n";
                         text += &astr;
                     }
 
