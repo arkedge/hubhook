@@ -16,7 +16,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release
 
-FROM gcr.io/distroless/cc@sha256:6f05aba4de16e89f8d879bf2a1364de3e41aba04f1dcbba8c75494f6134b4b13
+FROM gcr.io/distroless/cc@sha256:eccec5274132c1be0ce5d2c8e6fe41033e64af5e987ccee9007826e4c012069d
 WORKDIR app
 COPY --from=builder /build/target/release/hubhook .
 CMD ["/app/hubhook"]
