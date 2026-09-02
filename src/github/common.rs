@@ -176,7 +176,7 @@ pub struct PullRequest {
     pub locked: bool,
     pub title: String,
     pub user: User,
-    pub body: String,
+    pub body: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
@@ -221,7 +221,7 @@ pub struct PullRequestHead {
     pub ref_: String,
     pub sha: String,
     pub user: User,
-    pub repo: Repository,
+    pub repo: Option<Repository>, // fork が消えていると null になる
 }
 
 #[derive(Debug, Deserialize)]

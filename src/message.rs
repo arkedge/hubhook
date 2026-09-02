@@ -178,9 +178,10 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title = pr.title
                     ));
                     let title_link = Some(pr.html_url.clone());
-                    let fallback = format!("{title}\n{body}", title = pr.title, body = pr.body);
+                    let body = pr.body.as_deref().unwrap_or("");
+                    let fallback = format!("{title}\n{body}", title = pr.title);
 
-                    let mut text = pr.body.clone();
+                    let mut text = body.to_string();
                     if let Some(astr) = users2str(&pr.assignees, "\n", true) {
                         text += "\n*Assignees*\n";
                         text += &astr;

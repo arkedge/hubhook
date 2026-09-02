@@ -140,7 +140,7 @@ impl Payload {
             }
 
             Payload::IssueComment(icomment) => &icomment.comment.body,
-            Payload::PullRequest(pr) => &pr.pull_request.body,
+            Payload::PullRequest(pr) => pr.pull_request.body.as_deref().unwrap_or(""),
         }
     }
 
