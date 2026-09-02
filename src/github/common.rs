@@ -1,3 +1,4 @@
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use url::Url;
 
@@ -148,17 +149,17 @@ pub struct Issue {
     pub locked: bool,
     pub assignee: Option<User>,
     pub assignees: Vec<User>,
-    pub milestone: Option<()>,
+    pub milestone: Option<IgnoredAny>,
     pub comments: usize,
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
     pub author_association: String,
-    pub active_lock_reason: Option<()>,
+    pub active_lock_reason: Option<IgnoredAny>,
     pub body: Option<String>,
     pub reactions: Reactions,
     pub timeline_url: Url,
-    pub performed_via_github_app: Option<()>,
+    pub performed_via_github_app: Option<IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,10 +184,10 @@ pub struct PullRequest {
     pub merge_commit_sha: Option<String>,
     pub assignee: Option<User>, // Issueと挙動が違う？
     pub assignees: Vec<User>,
-    pub requested_reviewers: Vec<User>, // TODO: teamの場合もある
-    pub requested_teams: Vec<()>,       // TODO: これは確実にteam
+    pub requested_reviewers: Vec<User>,   // TODO: teamの場合もある
+    pub requested_teams: Vec<IgnoredAny>, // TODO: これは確実にteam
     pub labels: Vec<Label>,
-    pub milestone: Option<()>,
+    pub milestone: Option<IgnoredAny>,
     pub draft: bool,
     pub commits_url: Url,
     pub review_comments_url: Url,
@@ -197,8 +198,8 @@ pub struct PullRequest {
     pub base: PullRequestBase,
     pub _links: PullRequestLinks,
     pub author_association: String,
-    pub auto_merge: Option<()>,
-    pub active_lock_reason: Option<()>,
+    pub auto_merge: Option<IgnoredAny>,
+    pub active_lock_reason: Option<IgnoredAny>,
     pub merged: Option<bool>,    // nullになりようがなくない？？？
     pub mergeable: Option<bool>, // ref: https://github.com/octokit/webhooks/blob/ce6ab8f2ca6c8358a415448f71e20d1d50d458f8/payload-schemas/api.github.com/common/pull-request.schema.json#L168-L170
     pub rebaseable: Option<bool>,
@@ -251,7 +252,7 @@ pub struct IssueComment {
     pub author_association: String,
     pub body: String,
     pub reactions: Reactions,
-    pub performed_via_github_app: Option<()>,
+    pub performed_via_github_app: Option<IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
