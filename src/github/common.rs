@@ -38,7 +38,7 @@ pub struct Organization {
     pub members_url: Url,
     pub public_members_url: Url,
     pub avatar_url: Url,
-    pub description: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,7 +91,7 @@ pub struct Repository {
     pub deployments_url: Url,
     pub created_at: String, // 2021-10-27T05:00:55Z
     pub updated_at: String,
-    pub pushed_at: String,
+    pub pushed_at: Option<String>, // 未 push の repo だと null
     pub git_url: Url,
     pub ssh_url: String, // "git@github.com:arkedge/hubhook.git"
     pub clone_url: Url,
@@ -184,8 +184,8 @@ pub struct PullRequest {
     pub merge_commit_sha: Option<String>,
     pub assignee: Option<User>, // Issueと挙動が違う？
     pub assignees: Vec<User>,
-    pub requested_reviewers: Vec<User>,   // TODO: teamの場合もある
-    pub requested_teams: Vec<IgnoredAny>, // TODO: これは確実にteam
+    pub requested_reviewers: Option<IgnoredAny>, // TODO: user か team
+    pub requested_teams: Option<IgnoredAny>,     // TODO: これは確実にteam
     pub labels: Vec<Label>,
     pub milestone: Option<IgnoredAny>,
     pub draft: bool,
