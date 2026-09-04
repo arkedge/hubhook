@@ -85,7 +85,7 @@ impl IssueComment {
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum IssuesAction {
     Opened,
     Edited,
@@ -107,16 +107,20 @@ pub enum IssuesAction {
 
 // https://docs.github.com/ja/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#pull_request
 #[derive(Debug, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PullRequestAction {
     Assigned,
     AutoMergeDisabled,
     AutoMergeEnabled,
     Closed,
     ConvertedToDraft,
+    Demilestoned,
+    Dequeued,
     Edited,
+    Enqueued,
     Labeled,
     Locked,
+    Milestoned,
     Opened,
     ReadyForReview,
     Reopened,
@@ -129,7 +133,7 @@ pub enum PullRequestAction {
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum IssueCommentAction {
     Created,
     Edited,
@@ -267,6 +271,71 @@ mod tests {
         let body = br#"{"action":"opened","issue":{"url":"not a url"}}"#;
         let err = Payload::from_event("issues", body).unwrap_err();
         assert!(err.to_string().starts_with("issue.url: "), "{err}");
+    }
+
+    /// GitHub が送る action 名を全部 deserialize できること。
+    /// 一覧は octokit/webhooks の payload-schemas/api.github.com/<event>/ に対応する。
+    fn assert_actions<T: for<'de> Deserialize<'de>>(actions: &[&str]) {
+        for action in actions {
+            let json = format!("\"{action}\"");
+            if let Err(e) = serde_json::from_str::<T>(&json) {
+                panic!("{action}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn pull_request_actions() {
+        assert_actions::<PullRequestAction>(&[
+            "assigned",
+            "auto_merge_disabled",
+            "auto_merge_enabled",
+            "closed",
+            "converted_to_draft",
+            "demilestoned",
+            "dequeued",
+            "edited",
+            "enqueued",
+            "labeled",
+            "locked",
+            "milestoned",
+            "opened",
+            "ready_for_review",
+            "reopened",
+            "review_request_removed",
+            "review_requested",
+            "synchronize",
+            "unassigned",
+            "unlabeled",
+            "unlocked",
+        ]);
+    }
+
+    #[test]
+    fn issues_actions() {
+        assert_actions::<IssuesAction>(&[
+            "assigned",
+            "closed",
+            "deleted",
+            "demilestoned",
+            "edited",
+            "labeled",
+            "locked",
+            "milestoned",
+            "opened",
+            "pinned",
+            "reopened",
+            "transferred",
+            "unassigned",
+            "unlabeled",
+            "unlocked",
+            "unpinned",
+        ]);
+    }
+
+    #[test]
+    fn issue_comment_actions() {
+        assert_actions::<IssueCommentAction>(&["created", "deleted", "edited"]);
     }
 
     // TODO: add test for OSS
