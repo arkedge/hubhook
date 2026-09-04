@@ -4,12 +4,45 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// `X-GitHub-Event` ヘッダで分岐して deserialize する ([`Payload::from_event`])。
+///
+/// 以前は `#[serde(untagged)]` だったが、1 フィールドの型不一致で全 variant が不一致になり、
+/// どの variant のどのフィールドで失敗したのか分からなかった (#311)。
+/// また `issue_comment` の `deleted` / `edited` は `comment` の deserialize が失敗すると
+/// `Issues` variant として成立してしまう (action 名が [`IssuesAction`] にも存在し、
+/// 必要なフィールドも揃っているため) という誤ルーティングの危険もあった。
+#[derive(Debug)]
 pub enum Payload {
     IssueComment(Box<IssueComment>),
     Issues(Box<Issues>),
     PullRequest(Box<PullRequest>),
+}
+
+/// [`Payload::from_event`] の deserialize 失敗。
+#[derive(Debug)]
+pub enum DeserializeError {
+    /// どのフィールドで失敗したかを持つ
+    Field(serde_path_to_error::Error<serde_json::Error>),
+    /// JSON の後ろにゴミが付いている
+    TrailingData(serde_json::Error),
+}
+
+impl std::fmt::Display for DeserializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field(e) => write!(f, "{path}: {inner}", path = e.path(), inner = e.inner()),
+            Self::TrailingData(e) => write!(f, "trailing data: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DeserializeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Field(e) => Some(e.inner()),
+            Self::TrailingData(e) => Some(e),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +138,28 @@ pub enum IssueCommentAction {
 
 use crate::{Rule, RuleMatchResult};
 impl Payload {
+    /// `X-GitHub-Event` に対応する variant として deserialize する。
+    /// 扱わないイベントは `Ok(None)`。
+    pub fn from_event(event: &str, body: &[u8]) -> Result<Option<Self>, DeserializeError> {
+        fn de<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, DeserializeError> {
+            let mut de = serde_json::Deserializer::from_slice(body);
+            let payload =
+                serde_path_to_error::deserialize(&mut de).map_err(DeserializeError::Field)?;
+            // body 全体が JSON であることを確認する (web::Json と同じ挙動)
+            de.end().map_err(DeserializeError::TrailingData)?;
+            Ok(payload)
+        }
+
+        let payload = match event {
+            "issues" => Payload::Issues(de(body)?),
+            "issue_comment" => Payload::IssueComment(de(body)?),
+            "pull_request" => Payload::PullRequest(de(body)?),
+            _ => return Ok(None),
+        };
+
+        Ok(Some(payload))
+    }
+
     pub fn repo(&self) -> &common::Repository {
         match &self {
             Payload::Issues(issues) => &issues.repository,
@@ -190,31 +245,48 @@ impl Payload {
 mod tests {
     use crate::github::*;
 
-    fn de(test_json: &str) -> Payload {
+    #[allow(dead_code)] // #292 で payload のテストを書くときに使う
+    fn de(event: &str, test_json: &str) -> Payload {
         let path = format!("test/{}", test_json);
         let payload = std::fs::read_to_string(path).unwrap();
-        let p: Payload = serde_json::from_str(&payload).unwrap();
-        p
+        Payload::from_event(event, payload.as_bytes())
+            .unwrap()
+            .expect("unsupported event")
+    }
+
+    #[test]
+    fn unsupported_event_is_ignored() {
+        assert!(Payload::from_event("push", b"{}").unwrap().is_none());
+        assert!(Payload::from_event("", b"{}").unwrap().is_none());
+    }
+
+    #[test]
+    fn deserialize_error_points_at_the_field() {
+        // untagged だった頃は
+        // "data did not match any variant of untagged enum Payload" しか出なかった
+        let body = br#"{"action":"opened","issue":{"url":"not a url"}}"#;
+        let err = Payload::from_event("issues", body).unwrap_err();
+        assert!(err.to_string().starts_with("issue.url: "), "{err}");
     }
 
     // TODO: add test for OSS
 
     //#[test]
     //fn de_issue_comment() {
-    //    assert!(matches!(de("issue_comment.json"), Payload::IssueComment(_)));
+    //    assert!(matches!(de("issue_comment", "issue_comment.json"), Payload::IssueComment(_)));
     //}
 
     //#[test]
     //fn de_issue() {
-    //    assert!(matches!(de("issue_open.json"), Payload::Issues(_)));
-    //    assert!(matches!(de("issue_assigned.json"), Payload::Issues(_)));
-    //    assert!(matches!(de("issue_labeled.json"), Payload::Issues(_)));
+    //    assert!(matches!(de("issues", "issue_open.json"), Payload::Issues(_)));
+    //    assert!(matches!(de("issues", "issue_assigned.json"), Payload::Issues(_)));
+    //    assert!(matches!(de("issues", "issue_labeled.json"), Payload::Issues(_)));
     //}
 
     //#[test]
     //fn de_pull_request() {
     //    assert!(matches!(
-    //        de("pull_request_assign.json"),
+    //        de("pull_request", "pull_request_assign.json"),
     //        Payload::PullRequest(_)
     //    ));
     //}

@@ -11,7 +11,7 @@ use actix_web::error::ErrorBadRequest;
 use actix_web::{web, App, Error, FromRequest, HttpRequest, HttpResponse, HttpServer, Result};
 
 use futures::future::{Future, FutureExt};
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::stream::TryStreamExt;
 
 use tracing::{debug, error, info, warn};
 
@@ -78,7 +78,8 @@ pub struct Query {
 
 #[derive(Debug)]
 struct Data {
-    json: web::Json<github::Payload>,
+    /// 扱わないイベントは `None`
+    payload: Option<github::Payload>,
 }
 
 impl FromRequest for Data {
@@ -99,8 +100,14 @@ impl FromRequest for Data {
             return Box::pin(err(ErrorBadRequest("user-agent mismatch")));
         }
 
-        use actix_web::error::PayloadError;
-        use actix_web::web::Bytes;
+        let event = match headers.get("x-github-event").and_then(|e| e.to_str().ok()) {
+            Some(event) => event.to_string(),
+            None => {
+                error!("missing X-GitHub-Event header");
+                return Box::pin(err(ErrorBadRequest("missing X-GitHub-Event header")));
+            }
+        };
+
         let sig256: Vec<u8> = {
             let sig = headers.get("x-hub-signature-256").unwrap();
             let sig = String::from_utf8(sig.as_bytes().to_vec()).unwrap();
@@ -133,15 +140,22 @@ impl FromRequest for Data {
                 }
             }
 
-            let b = Bytes::from(p);
-            let st = futures::stream::once(async { Ok::<_, PayloadError>(b) });
-            let mut p = actix_web::dev::Payload::Stream {
-                payload: st.boxed_local(),
+            let payload = match github::Payload::from_event(&event, &p) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    // untagged をやめたので、どのフィールドで失敗したかがそのまま出る
+                    let msg = format!("could not deserialize {event} payload: {e}");
+                    error!("{msg}");
+                    sentry::capture_message(&msg, sentry::Level::Error);
+                    return Err(ErrorBadRequest("could not deserialize payload"));
+                }
             };
 
-            let json = web::Json::<github::Payload>::from_request(&req, &mut p).await?;
+            if payload.is_none() {
+                debug!("ignoring event: {event}");
+            }
 
-            Ok(Data { json }) // validate success
+            Ok(Data { payload }) // validate success
         }
         .boxed_local()
     }
@@ -209,15 +223,12 @@ async fn main() -> std::io::Result<()> {
 async fn webhook(
     opt: web::Data<Arc<Opt>>,
     cfg: web::Data<Arc<Config>>,
-    data: Option<Data>,
+    data: Data,
 ) -> Result<HttpResponse> {
-    let payload = if let Some(data) = data {
-        data.json
-    } else {
-        return Ok(HttpResponse::BadRequest().body("bad request"));
+    // 扱わないイベントは何もしない
+    let Some(payload) = data.payload else {
+        return Ok(HttpResponse::Ok().body("ignored"));
     };
-
-    let payload = payload.into_inner();
 
     //post_test(&opt, &payload).await;
 
