@@ -304,11 +304,20 @@ impl Rule {
 
         let r_sender = Rule::match_query(query.user.as_ref(), &payload.sender().login);
         let r_title = Rule::match_query(query.title.as_ref(), payload.title());
-        // body クエリは「元の本文」と「team 展開結果」に別々に当てて OR を取る。
-        // 1 つの文字列に連結すると、アンカー付きの既存ルールの意味が変わる。
+        // body クエリは 2 つの対象に当てて OR を取る。
+        //
+        // 1. 元の本文 — `@org/team$` のようなアンカー付きルールの意味を保つ。
+        //    連結したものだけに当てると、末尾一致が効かなくなる
+        //    (exclude_query 側では、除外されるべきものが除外されなくなる)。
+        // 2. 元の本文 + team 展開結果 — 展開された `@login` を拾う。
+        //    本文の文脈と組み合わせたパターン (`レビュー.*@sksat` など) も
+        //    効くように、本文を含めて連結する。区切りは改行ではなく空白
+        //    (正規表現の `.` は既定で改行に一致しないため)。
         let r_body = query.body.as_ref().map(|q| {
-            Rule::match_query_impl(q, payload.body())
-                || (!mentions.is_empty() && Rule::match_query_impl(q, mentions))
+            let body = payload.body();
+            Rule::match_query_impl(q, body)
+                || (!mentions.is_empty()
+                    && Rule::match_query_impl(q, &format!("{body} {mentions}")))
         });
 
         let labels = payload.labels().iter().collect();

@@ -731,6 +731,36 @@ mod tests {
         );
     }
 
+    /// #286: 本文の文脈と展開された login を組み合わせたパターンが効くこと。
+    ///
+    /// 展開結果だけに当てると、`レビュー.*@sksat` のようなパターンは
+    /// 本文側にも展開側にも一致せず、どこにも当たらなくなる。
+    #[test]
+    fn expansion_supports_patterns_combining_body_and_member() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+        assert!(p.body().contains("レビュー"));
+        assert!(!p.body().contains("@sksat"));
+
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"combined","display_name":"x","query":{"body":"レビュー.*@sksat"}}"#,
+            )
+            .unwrap(),
+        ];
+
+        // 展開前は @sksat が本文に無いのでマッチしない
+        assert!(p.match_rules(&rules, "").is_empty(), "展開前はマッチしない");
+
+        // 展開すると、本文の文脈と合わせてマッチする
+        assert!(
+            !p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            "本文の文脈と展開結果を組み合わせたパターンが効いていない"
+        );
+    }
+
     /// #122: レビューコメント (と返信) の本文が body として取れること。
     #[test]
     fn de_pull_request_review_comment() {
