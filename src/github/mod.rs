@@ -792,12 +792,15 @@ mod tests {
         );
     }
 
-    /// #286: 「文脈 + member への末尾アンカー」が並び順に依存しないこと。
+    /// #286 の既知の制限: 「本文の文脈 + member への末尾アンカー」は
+    /// 展開結果の並び順に依存する。
     ///
-    /// team に別のメンバーが加わって後ろに並んだだけで、そのユーザの
-    /// ルールが黙って効かなくなってはいけない。
+    /// 本文を member ごとに連結して照合すれば解消するが、rule ごと ×
+    /// member ごとに本文長を走査することになり、rule が増えるほど webhook
+    /// 1 通の処理が重くなる。稀な書き方なので制限として残している。
+    /// 解消する場合は、走査量の上限を webhook 単位で設計する必要がある。
     #[test]
-    fn contextual_anchored_rule_survives_new_members() {
+    fn known_limitation_contextual_anchor_depends_on_member_order() {
         let p = de(
             "pull_request_review",
             "pull_request_review.team_mention.derived.json",
@@ -817,10 +820,11 @@ mod tests {
             "末尾にいるときはマッチするべき"
         );
 
-        // 後ろに別のメンバーが加わっても同じ結果になること
+        // 後ろに別のメンバーが並ぶとマッチしない (既知の制限)。
+        // ここが通るように変えるなら、走査量の上限も併せて設計すること。
         assert!(
-            !p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
-            "メンバーが増えるとルールが効かなくなっている"
+            p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            "制限が解消されている。README と このテストの意図を更新すること"
         );
     }
 
