@@ -171,12 +171,13 @@ async fn main() -> std::io::Result<()> {
 
     let opt = Opt::from_args();
 
+    // sentry 0.49 で ClientOptions が #[non_exhaustive] になり、
+    // 構造体リテラル + `..Default::default()` では作れなくなった (E0639)。
+    // 代わりに用意された builder を使う。release_name!() は Option を返すので
+    // maybe_release を使うのが本家推奨。
     let _guard = sentry::init((
         opt.sentry_dsn.clone(),
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            ..Default::default()
-        },
+        sentry::ClientOptions::new().maybe_release(sentry::release_name!()),
     ));
 
     let port = opt.hubhook_port;
