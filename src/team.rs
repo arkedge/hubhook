@@ -4,7 +4,7 @@
 //! `@sksat` を待っている個人のルールにはマッチせず、通知が飛ばなかった。
 //! team のメンバーは payload に入っていないため GitHub API で引く。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -131,8 +131,12 @@ pub struct TeamResolver {
     /// キャッシュミスして各自 API を叩く (cache stampede)。キャッシュだけでは
     /// 防げないので、team ごとにロックを取って取得を 1 本にまとめる。
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// `@org/team` を拾う。org / team slug に使える文字は英数と `-`、
-    /// team slug には `_` と `.` も入りうる。
+    /// `@org/team` を拾う。
+    ///
+    /// slug は英数で始まり英数で終わる形に限定する。`[A-Za-z0-9._-]*` で
+    /// 終わらせると `@arkedge/sat-sw.` のような文末の `.` まで slug に
+    /// 食い込み、`/teams/sat-sw./members` を引いて 404 になる
+    /// (= その team は展開されず、通知が静かに飛ばない)。
     mention: Regex,
     cache: RwLock<HashMap<String, CacheEntry>>,
 }
@@ -163,8 +167,10 @@ impl TeamResolver {
             token,
             base_url,
             inflight: Mutex::new(HashMap::new()),
-            mention: Regex::new(r"@([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)")
-                .expect("invalid team mention regex"),
+            mention: Regex::new(
+                r"@([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)",
+            )
+            .expect("invalid team mention regex"),
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -234,20 +240,23 @@ impl TeamResolver {
     /// 同じ team を 2 回引かないよう重複を落とし、上限で打ち切る。
     fn teams_in(&self, body: &str) -> Vec<(String, String)> {
         let mut teams: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
         for cap in self.mention.captures_iter(body) {
             let team = (cap[1].to_string(), cap[2].to_string());
-            if !teams.contains(&team) {
-                teams.push(team);
-            }
-        }
 
-        if teams.len() > MAX_TEAMS_PER_BODY {
-            warn!(
-                "too many team mentions ({}); expanding only the first {}",
-                teams.len(),
-                MAX_TEAMS_PER_BODY
-            );
-            teams.truncate(MAX_TEAMS_PER_BODY);
+            // Vec::contains で重複を見ると、mention 風の文字列を大量に
+            // 書かれたときに件数の 2 乗になる
+            if !seen.insert(team.clone()) {
+                continue;
+            }
+            teams.push(team);
+
+            // 上限を超えた分を集めてから捨てるのではなく、集める側で止める
+            if teams.len() >= MAX_TEAMS_PER_BODY {
+                warn!("stopping at {MAX_TEAMS_PER_BODY} team mentions");
+                break;
+            }
         }
 
         teams
@@ -267,9 +276,18 @@ impl TeamResolver {
             return cached;
         }
 
-        // この team の取得権を取る。同じ team を同時に引かないようにする
+        // この team の取得権を取る。同じ team を同時に引かないようにする。
+        // 待ち時間も残り予算で縛る。縛らないと、後から来た (= 残り時間が短い)
+        // リクエストが、先行者のページングを待って予算を超えてしまう。
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::BudgetExceeded);
+        }
+
         let lock = self.inflight_lock(&key);
-        let _guard = lock.lock().await;
+        let Ok(_guard) = actix_web::rt::time::timeout(remaining, lock.lock()).await else {
+            return Err(Error::BudgetExceeded);
+        };
 
         // 待っている間に、先に取得した人がキャッシュを埋めているかもしれない
         if let Some(cached) = self.cached(&key) {
@@ -656,6 +674,37 @@ mod tests {
     fn plain_user_mention_is_not_a_team() {
         let r = resolver();
         assert!(r.teams_in("@sksat をお願いします").is_empty());
+    }
+
+    /// 文末の `.` を slug に食わせないこと。
+    ///
+    /// `@arkedge/sat-sw.` を `sat-sw.` として引くと 404 になり、
+    /// その team は展開されないまま通知が静かに飛ばなくなる。
+    #[test]
+    fn sentence_final_period_is_not_part_of_the_slug() {
+        let r = resolver();
+
+        for body in [
+            "Please review @arkedge/sat-sw.",
+            "@arkedge/sat-sw.",
+            "@arkedge/sat-sw. あとで見ます",
+        ] {
+            assert_eq!(
+                r.teams_in(body),
+                vec![("arkedge".to_string(), "sat-sw".to_string())],
+                "body = {body:?}"
+            );
+        }
+    }
+
+    /// slug の途中の `.` `_` は残すこと (文末の `.` だけを外す)。
+    #[test]
+    fn punctuation_inside_the_slug_is_kept() {
+        let r = resolver();
+        assert_eq!(
+            r.teams_in("@arkedge/sat.sw_v2"),
+            vec![("arkedge".to_string(), "sat.sw_v2".to_string())]
+        );
     }
 
     /// 同じ team を何度書かれても 1 回しか引かないこと。
