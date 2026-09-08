@@ -1,6 +1,6 @@
 //! GitHub team のメンション (`@org/team`) をメンバーの login に展開する (#286)。
 //!
-//! ルールは `body` に対する正規表現なので、`@arkedge/sat-sw` と書かれても
+//! ルールは `body` に対する正規表現なので、`@Octocoders/octo-team` と書かれても
 //! `@sksat` を待っている個人のルールにはマッチせず、通知が飛ばなかった。
 //! team のメンバーは payload に入っていないため GitHub API で引く。
 
@@ -140,8 +140,8 @@ pub struct TeamResolver {
     /// `@org/team` を拾う。
     ///
     /// slug は英数で始まり英数で終わる形に限定する。`[A-Za-z0-9._-]*` で
-    /// 終わらせると `@arkedge/sat-sw.` のような文末の `.` まで slug に
-    /// 食い込み、`/teams/sat-sw./members` を引いて 404 になる
+    /// 終わらせると `@Octocoders/octo-team.` のような文末の `.` まで slug に
+    /// 食い込み、`/teams/octo-team./members` を引いて 404 になる
     /// (= その team は展開されず、通知が静かに飛ばない)。
     mention: Regex,
     cache: RwLock<HashMap<String, CacheEntry>>,
@@ -533,7 +533,7 @@ mod tests {
     async fn paginates_until_short_page() {
         let r = api_resolver(spawn_api(vec![PER_PAGE, PER_PAGE, 7], 200));
         let members = r
-            .members("arkedge", "sat-sw", far_deadline())
+            .members("Octocoders", "octo-team", far_deadline())
             .await
             .expect("取得できるべき");
 
@@ -551,7 +551,7 @@ mod tests {
         let r = api_resolver(spawn_api(sizes, 200));
 
         let members = r
-            .members("arkedge", "sat-sw", far_deadline())
+            .members("Octocoders", "octo-team", far_deadline())
             .await
             .expect("ちょうど上限なら受け入れるべき");
 
@@ -565,7 +565,7 @@ mod tests {
         let r = api_resolver(spawn_api(sizes, 200));
 
         let err = r
-            .members("arkedge", "sat-sw", far_deadline())
+            .members("Octocoders", "octo-team", far_deadline())
             .await
             .expect_err("上限超えはエラーにするべき");
 
@@ -576,14 +576,17 @@ mod tests {
     #[actix_web::test]
     async fn non_success_status_fails_open() {
         let r = api_resolver(spawn_api(vec![], 403));
-        assert_eq!(r.expand_mentions("@arkedge/sat-sw おねがい").await, "");
+        assert_eq!(
+            r.expand_mentions("@Octocoders/octo-team おねがい").await,
+            ""
+        );
     }
 
     /// 取得できた team メンバーが @login として展開されること。
     #[actix_web::test]
     async fn members_are_expanded_as_mentions() {
         let r = api_resolver(spawn_api(vec![2], 200));
-        let expanded = r.expand_mentions("@arkedge/sat-sw おねがい").await;
+        let expanded = r.expand_mentions("@Octocoders/octo-team おねがい").await;
 
         assert_eq!(expanded, "@u1_0 @u1_1");
     }
@@ -595,7 +598,7 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(1);
 
         let err = r
-            .members("arkedge", "sat-sw", past)
+            .members("Octocoders", "octo-team", past)
             .await
             .expect_err("予算切れならエラーにするべき");
 
@@ -615,7 +618,7 @@ mod tests {
 
         let started = Instant::now();
         let deadline = started + Duration::from_millis(500);
-        let result = r.members("arkedge", "sat-sw", deadline).await;
+        let result = r.members("Octocoders", "octo-team", deadline).await;
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "予算内に返らないのでエラーになるべき");
@@ -642,7 +645,7 @@ mod tests {
         for _ in 0..3 {
             let r = r.clone();
             tasks.push(actix_web::rt::spawn(async move {
-                r.members("arkedge", "sat-sw", far_deadline()).await
+                r.members("Octocoders", "octo-team", far_deadline()).await
             }));
         }
 
@@ -664,14 +667,14 @@ mod tests {
         let r = api_resolver(spawn_api(vec![3], 200));
 
         let first = r
-            .members("arkedge", "sat-sw", far_deadline())
+            .members("Octocoders", "octo-team", far_deadline())
             .await
             .unwrap();
         assert_eq!(first.len(), 3);
 
         // キャッシュに載っているので、予算切れでも返る
         let past = Instant::now() - Duration::from_secs(1);
-        let second = r.members("arkedge", "sat-sw", past).await.unwrap();
+        let second = r.members("Octocoders", "octo-team", past).await.unwrap();
         assert_eq!(second, first);
     }
 
@@ -679,13 +682,13 @@ mod tests {
     #[test]
     fn mention_regex_picks_up_teams() {
         let r = resolver();
-        let body = "@sksat @arkedge/sat-sw をお願いします。@arkedge/infra も。";
+        let body = "@sksat @Octocoders/octo-team をお願いします。@Octocoders/octo-infra も。";
 
         assert_eq!(
             r.teams_in(body),
             vec![
-                ("arkedge".to_string(), "sat-sw".to_string()),
-                ("arkedge".to_string(), "infra".to_string()),
+                ("Octocoders".to_string(), "octo-team".to_string()),
+                ("Octocoders".to_string(), "octo-infra".to_string()),
             ]
         );
     }
@@ -699,20 +702,20 @@ mod tests {
 
     /// 文末の `.` を slug に食わせないこと。
     ///
-    /// `@arkedge/sat-sw.` を `sat-sw.` として引くと 404 になり、
+    /// `@Octocoders/octo-team.` を `octo-team.` として引くと 404 になり、
     /// その team は展開されないまま通知が静かに飛ばなくなる。
     #[test]
     fn sentence_final_period_is_not_part_of_the_slug() {
         let r = resolver();
 
         for body in [
-            "Please review @arkedge/sat-sw.",
-            "@arkedge/sat-sw.",
-            "@arkedge/sat-sw. あとで見ます",
+            "Please review @Octocoders/octo-team.",
+            "@Octocoders/octo-team.",
+            "@Octocoders/octo-team. あとで見ます",
         ] {
             assert_eq!(
                 r.teams_in(body),
-                vec![("arkedge".to_string(), "sat-sw".to_string())],
+                vec![("Octocoders".to_string(), "octo-team".to_string())],
                 "body = {body:?}"
             );
         }
@@ -738,7 +741,7 @@ mod tests {
 
         let long_org = "a".repeat(MAX_ORG_LEN + 1);
         assert!(
-            r.teams_in(&format!("@{long_org}/sat-sw")).is_empty(),
+            r.teams_in(&format!("@{long_org}/octo-team")).is_empty(),
             "長い org を拾ってしまっている"
         );
 
@@ -751,8 +754,8 @@ mod tests {
         // 上限ぴったりは通す
         let ok_org = "c".repeat(MAX_ORG_LEN);
         assert_eq!(
-            r.teams_in(&format!("@{ok_org}/sat-sw")),
-            vec![(ok_org, "sat-sw".to_string())]
+            r.teams_in(&format!("@{ok_org}/octo-team")),
+            vec![(ok_org, "octo-team".to_string())]
         );
     }
 
@@ -760,10 +763,10 @@ mod tests {
     #[test]
     fn duplicate_team_mentions_are_deduped() {
         let r = resolver();
-        let body = "@arkedge/sat-sw @arkedge/sat-sw @arkedge/sat-sw";
+        let body = "@Octocoders/octo-team @Octocoders/octo-team @Octocoders/octo-team";
         assert_eq!(
             r.teams_in(body),
-            vec![("arkedge".to_string(), "sat-sw".to_string())]
+            vec![("Octocoders".to_string(), "octo-team".to_string())]
         );
     }
 
@@ -855,6 +858,9 @@ mod tests {
     #[actix_web::test]
     async fn missing_token_fails_open() {
         let r = resolver();
-        assert_eq!(r.expand_mentions("@arkedge/sat-sw おねがい").await, "");
+        assert_eq!(
+            r.expand_mentions("@Octocoders/octo-team おねがい").await,
+            ""
+        );
     }
 }

@@ -531,16 +531,16 @@
     "site_admin": false
   },
   "requested_team": {
-    "name": "Satellite Software",
+    "name": "Octo Team",
     "id": 3253433,
     "node_id": "MDQ6VGVhbTMyNTM0MzM=",
-    "slug": "sat-sw",
-    "description": "satellite software team",
+    "slug": "octo-team",
+    "description": "octo team",
     "privacy": "closed",
-    "url": "https://api.github.com/organizations/92292361/team/3253433",
-    "html_url": "https://github.com/orgs/arkedge/teams/sat-sw",
-    "members_url": "https://api.github.com/organizations/92292361/team/3253433/members{/member}",
-    "repositories_url": "https://api.github.com/organizations/92292361/team/3253433/repos",
+    "url": "https://api.github.com/organizations/38302899/team/3253433",
+    "html_url": "https://github.com/orgs/Octocoders/teams/octo-team",
+    "members_url": "https://api.github.com/organizations/38302899/team/3253433/members{/member}",
+    "repositories_url": "https://api.github.com/organizations/38302899/team/3253433/repos",
     "permission": "pull"
   }
 }

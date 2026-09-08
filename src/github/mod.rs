@@ -636,7 +636,7 @@ mod tests {
             "pull_request",
             "pull_request.review_requested.team.derived.json",
         );
-        assert_eq!(p.requested_reviewers(), vec!["sat-sw"]);
+        assert_eq!(p.requested_reviewers(), vec!["octo-team"]);
     }
 
     /// review_requested 以外のイベントでは reviewer は空にする。
@@ -674,7 +674,7 @@ mod tests {
             "pull_request_review",
             "pull_request_review.team_mention.derived.json",
         );
-        assert!(p.body().contains("@arkedge/sat-sw"));
+        assert!(p.body().contains("@Octocoders/octo-team"));
         assert!(!p.body().contains("@sksat"));
 
         // 展開前: team メンションのままなので個人のルールには当たらない
@@ -700,14 +700,14 @@ mod tests {
         );
         assert_eq!(
             p.body(),
-            "@arkedge/sat-sw",
+            "@Octocoders/octo-team",
             "末尾アンカーの検証に使う fixture"
         );
 
         // include: 末尾アンカーが展開後も効くこと
         let rules = vec![
             serde_json::from_str::<crate::Rule>(
-                r#"{"channel":"anchored","display_name":"x","query":{"body":"@arkedge/sat-sw$"}}"#,
+                r#"{"channel":"anchored","display_name":"x","query":{"body":"@Octocoders/octo-team$"}}"#,
             )
             .unwrap(),
         ];
@@ -720,7 +720,7 @@ mod tests {
         // exclude: 末尾アンカーによる除外が展開後も効くこと
         let rules = vec![
             serde_json::from_str::<crate::Rule>(
-                r#"{"channel":"excluded","display_name":"x","query":{"body":"sat-sw"},"exclude_query":{"body":"@arkedge/sat-sw$"}}"#,
+                r#"{"channel":"excluded","display_name":"x","query":{"body":"octo-team"},"exclude_query":{"body":"@Octocoders/octo-team$"}}"#,
             )
             .unwrap(),
         ];
