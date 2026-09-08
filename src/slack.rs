@@ -34,6 +34,18 @@ impl std::fmt::Display for PostError {
     }
 }
 
+/// blocks が原因と考えられるエラーか。
+///
+/// `invalid_auth` や `channel_not_found` は blocks を外しても直らないので、
+/// 再送しても 2 回目が無駄に失敗し、レート制限を悪化させるだけ。
+/// ここに無いエラーが blocks 由来だった場合はログに残るので、後から足せる。
+fn is_blocks_problem(error: &str) -> bool {
+    matches!(
+        error,
+        "invalid_blocks" | "invalid_blocks_format" | "invalid_arguments" | "msg_too_long"
+    )
+}
+
 /// `chat.postMessage` の応答。
 ///
 /// Slack は API エラーも HTTP 200 で返し、本文の `ok` で示す。
@@ -220,9 +232,14 @@ impl Message {
                 return;
             }
             Err(PostError::Api(e)) => {
+                if !is_blocks_problem(&e) {
+                    error!("POST: {e}");
+                    return;
+                }
+
                 // markdown ブロックが attachment 内で使えるか、本文が上限を
-                // 超えたかはこちらで判定できない。拒否されたら従来の表現
-                // (attachment の text) に退避して再送する。
+                // 超えたかはこちらで判定できない。blocks 由来と思われる
+                // エラーなら、従来の表現 (attachment の text) で再送する。
                 warn!("POST rejected ({e}); retrying without markdown blocks");
             }
         }
@@ -290,6 +307,31 @@ mod tests {
     fn suffix_only_makes_a_block() {
         let block = Block::markdown("", "**Assignees**: sksat").unwrap();
         assert_eq!(block.text(), "**Assignees**: sksat");
+    }
+
+    /// blocks 由来のエラーだけ再送すること。
+    ///
+    /// 認証やチャンネルの問題は blocks を外しても直らないので、
+    /// 再送しても無駄打ちになりレート制限を悪化させる。
+    #[test]
+    fn only_block_errors_are_retried() {
+        for e in [
+            "invalid_blocks",
+            "invalid_blocks_format",
+            "invalid_arguments",
+            "msg_too_long",
+        ] {
+            assert!(is_blocks_problem(e), "{e} は再送すべき");
+        }
+
+        for e in [
+            "invalid_auth",
+            "channel_not_found",
+            "not_in_channel",
+            "rate_limited",
+        ] {
+            assert!(!is_blocks_problem(e), "{e} は再送すべきでない");
+        }
     }
 
     /// 退避すると、ブロックの本文が attachment の text に移ること。
