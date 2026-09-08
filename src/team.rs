@@ -314,9 +314,15 @@ impl TeamResolver {
         loop {
             // 1 リクエストごとのタイムアウトだけでは、ページ数だけ合計が伸びる。
             // ページを進める前に全体の残り時間を見る。
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(Error::BudgetExceeded);
             }
+
+            // 残り時間より長いタイムアウトを許すと、チェックを通った直後の
+            // リクエストが満額まで走って予算を超える (残り 0.1 秒で 3 秒走る)。
+            // リクエスト単位のタイムアウトを残り時間で切る。
+            let timeout = remaining.min(API_TIMEOUT);
 
             let url = format!(
                 "{base}/orgs/{org}/teams/{slug}/members?per_page={PER_PAGE}&page={page}",
@@ -329,6 +335,7 @@ impl TeamResolver {
                 .bearer_auth(token)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
+                .timeout(timeout)
                 .send()
                 .await?;
 
@@ -375,6 +382,10 @@ mod tests {
     /// HTTP パスを実際に通さないと、pagination や非 2xx 時の fail-open が
     /// 壊れても気付けない (実際どちらも一度壊している)。
     fn spawn_api(page_sizes: Vec<usize>, status: u16) -> String {
+        spawn_api_with_delay(page_sizes, status, Duration::ZERO)
+    }
+
+    fn spawn_api_with_delay(page_sizes: Vec<usize>, status: u16, delay: Duration) -> String {
         use actix_web::{App, HttpResponse, HttpServer, web};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -388,6 +399,10 @@ mod tests {
                 web::get().to(move |q: web::Query<HashMap<String, String>>| {
                     let sizes = sizes.clone();
                     async move {
+                        if !delay.is_zero() {
+                            actix_web::rt::time::sleep(delay).await;
+                        }
+
                         if status != 200 {
                             return HttpResponse::build(
                                 actix_web::http::StatusCode::from_u16(status).unwrap(),
@@ -495,6 +510,30 @@ mod tests {
             .expect_err("予算切れならエラーにするべき");
 
         assert!(matches!(err, Error::BudgetExceeded), "{err}");
+    }
+
+    /// 残り予算が短いときは、リクエスト単位のタイムアウト (3 秒) を
+    /// 待たずに打ち切ること。
+    ///
+    /// 予算チェックを通った直後のリクエストが満額まで走ると、
+    /// 5 秒の予算を超えて webhook のレスポンスが遅れる。
+    #[actix_web::test]
+    async fn request_is_bounded_by_remaining_budget() {
+        // 応答しないサーバ (API_TIMEOUT より長く待たせる)
+        let base = spawn_api_with_delay(vec![1], 200, API_TIMEOUT * 2);
+        let r = api_resolver(base);
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(500);
+        let result = r.members("arkedge", "sat-sw", deadline).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "予算内に返らないのでエラーになるべき");
+        // 修正前は API_TIMEOUT (3 秒) まで走る。0.5 秒と 3 秒を余裕をもって分ける
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "残り予算 (0.5 秒) ではなく API_TIMEOUT ({API_TIMEOUT:?}) まで待っている: {elapsed:?}"
+        );
     }
 
     /// 2 回目は API を叩かずキャッシュから返すこと。
