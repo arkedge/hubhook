@@ -249,6 +249,23 @@ impl TeamResolver {
         let mut seen: HashSet<(String, String)> = HashSet::new();
 
         for cap in self.mention.captures_iter(body) {
+            let whole = cap.get(0).expect("group 0 は必ずある");
+
+            // `@` の直前が ASCII 英数か `_` なら、メンションではない
+            // (`mail@org/team` のようなアドレス風の文字列)。日本語などの
+            // 非 ASCII は「レビューは@org/team に」のように直に続くので許す。
+            if let Some(prev) = body[..whole.start()].chars().next_back()
+                && (prev.is_ascii_alphanumeric() || prev == '_')
+            {
+                continue;
+            }
+
+            // 直後が `/` なら、メンションではなくパス (`@org/team/repo`)。
+            // slug は英数で終わるので、直後に英数が来ることはない。
+            if body[whole.end()..].starts_with('/') {
+                continue;
+            }
+
             let (org, slug) = (&cap[1], &cap[2]);
 
             // body は誰でも書けるので、GitHub の識別子として妥当な長さを
@@ -362,9 +379,18 @@ impl TeamResolver {
 
         cache.retain(|_, entry| entry.is_fresh());
 
-        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&key) {
-            warn!("team cache is full ({MAX_CACHE_ENTRIES}); not caching {key}");
-            return;
+        // 満杯でも載せずに返すと、取得中ロックを待っていた側が全員
+        // キャッシュミスして順番に API を叩き、singleflight が崩れる。
+        // 最も古いものを捨てて、必ず載せる。
+        if cache.len() >= MAX_CACHE_ENTRIES
+            && !cache.contains_key(&key)
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(k, _)| k.clone())
+        {
+            warn!("team cache is full ({MAX_CACHE_ENTRIES}); evicting {oldest}");
+            cache.remove(&oldest);
         }
 
         cache.insert(
@@ -760,6 +786,74 @@ mod tests {
             r.teams_in(&format!("@{ok_org}/octo-team")),
             vec![(ok_org, "octo-team".to_string())]
         );
+    }
+
+    /// メンションとして成立しない形は拾わないこと。
+    #[test]
+    fn non_mention_shapes_are_not_teams() {
+        let r = resolver();
+
+        for body in [
+            // アドレス風 (直前が ASCII 英数)
+            "mail@Octocoders/octo-team",
+            "user_name@Octocoders/octo-team",
+            // パス (直後が `/`)
+            "@Octocoders/octo-team/repository",
+            "https://github.com/orgs/Octocoders/teams/octo-team",
+        ] {
+            assert!(r.teams_in(body).is_empty(), "body = {body:?}");
+        }
+    }
+
+    /// 日本語の直後や括弧内のメンションは拾うこと。
+    /// 直前が非 ASCII のときに弾いてしまうと、日本語の文章で書けなくなる。
+    #[test]
+    fn mentions_after_japanese_text_are_teams() {
+        let r = resolver();
+        let expected = vec![("octocoders".to_string(), "octo-team".to_string())];
+
+        for body in [
+            "レビューは@Octocoders/octo-team におねがいします",
+            "(@Octocoders/octo-team)",
+            "@Octocoders/octo-team",
+            "cc: @Octocoders/octo-team",
+        ] {
+            assert_eq!(r.teams_in(body), expected, "body = {body:?}");
+        }
+    }
+
+    /// キャッシュが満杯でも、最古を捨てて必ず載せること。
+    ///
+    /// 載せずに返すと、取得中ロックを待っていた側が全員キャッシュミスして
+    /// 順番に API を叩き、singleflight が崩れる。
+    #[test]
+    fn full_cache_evicts_instead_of_skipping() {
+        let r = resolver();
+
+        {
+            let mut cache = r.cache.write().unwrap();
+            for i in 0..MAX_CACHE_ENTRIES {
+                cache.insert(
+                    format!("org/team-{i}"),
+                    CacheEntry {
+                        members: Some(vec![]),
+                        // i が小さいほど古い
+                        fetched_at: Instant::now()
+                            - Duration::from_secs((MAX_CACHE_ENTRIES - i) as u64),
+                    },
+                );
+            }
+        }
+
+        r.remember("org/newcomer".to_string(), Some(vec!["a".to_string()]));
+
+        let cache = r.cache.read().unwrap();
+        assert!(
+            cache.contains_key("org/newcomer"),
+            "新しい team が載っていない"
+        );
+        assert!(!cache.contains_key("org/team-0"), "最古が捨てられていない");
+        assert!(cache.len() <= MAX_CACHE_ENTRIES, "上限を超えている");
     }
 
     /// 大文字小文字の違いを同じ team として扱うこと。
