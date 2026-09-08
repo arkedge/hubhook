@@ -50,6 +50,16 @@ struct Opt {
     debug: bool,
 }
 
+/// 本文の文脈と組み合わせて照合する member 数の上限。
+///
+/// 本文長 × member 数の走査になるため、際限なくは回せない。
+/// GitHub の issue / comment 本文は 65,536 文字までなので、
+/// この上限なら最悪でも数十 MB の走査に収まる。
+const MAX_MEMBERS_FOR_CONTEXT: usize = 500;
+
+/// 1 メンションの最大長 (`@` + org + `/` + slug に余裕を持たせた値)。
+const MAX_MENTION_LEN: usize = 300;
+
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     pub rule: Vec<Rule>,
@@ -346,10 +356,32 @@ impl Rule {
                 return true;
             }
 
-            // 3. 展開された `@login` を 1 つずつ。まとめて 1 つの文字列に当てると、
-            //    `@sksat$` のようなアンカー付きルールが「たまたま最後に並んだか」で
-            //    結果が変わってしまう (並び順は展開側の都合に過ぎない)。
-            mentions.split(' ').any(|m| re.is_match(m))
+            // 3. 本文 + 各 login を 1 つずつ。
+            //
+            //    まとめて 1 つの文字列に当てると、`レビュー.*@sksat$` のような
+            //    「文脈 + 末尾アンカー」のルールが並び順に依存する。team に別の
+            //    メンバーが加わって後ろに並んだだけで、そのユーザのルールが
+            //    黙って効かなくなってしまう。
+            //    本文を含めるのは、login 単体では文脈が失われるため。
+            let mut buf = String::with_capacity(body.len() + MAX_MENTION_LEN);
+            for (i, m) in mentions.split(' ').enumerate() {
+                // 本文長 × member 数の走査になるので、多すぎる場合は
+                // login 単体の照合に落とす (現実の team では起きない)
+                if i >= MAX_MEMBERS_FOR_CONTEXT {
+                    warn!("too many members to match with body context; matching bare logins");
+                    return mentions.split(' ').any(|m| re.is_match(m));
+                }
+
+                buf.clear();
+                buf.push_str(body);
+                buf.push(' ');
+                buf.push_str(m);
+                if re.is_match(&buf) {
+                    return true;
+                }
+            }
+
+            false
         });
 
         let labels = payload.labels().iter().collect();

@@ -792,6 +792,38 @@ mod tests {
         );
     }
 
+    /// #286: 「文脈 + member への末尾アンカー」が並び順に依存しないこと。
+    ///
+    /// team に別のメンバーが加わって後ろに並んだだけで、そのユーザの
+    /// ルールが黙って効かなくなってはいけない。
+    #[test]
+    fn contextual_anchored_rule_survives_new_members() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+        assert!(p.body().contains("レビュー"));
+
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"ctx","display_name":"x","query":{"body":"レビュー.*@sksat$"}}"#,
+            )
+            .unwrap(),
+        ];
+
+        // sksat が最後に並んでいる場合
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat").is_empty(),
+            "末尾にいるときはマッチするべき"
+        );
+
+        // 後ろに別のメンバーが加わっても同じ結果になること
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            "メンバーが増えるとルールが効かなくなっている"
+        );
+    }
+
     /// body クエリを使わない rule しか無ければ、team を引く必要がないこと。
     #[test]
     fn rules_without_body_query_do_not_need_expansion() {
