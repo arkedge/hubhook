@@ -1,14 +1,22 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use tracing::{debug, error, warn};
 
-/// Slack への 1 リクエストのタイムアウト。
+/// Slack への POST 全体の予算。**再送する分も含める。**
 ///
-/// GitHub の webhook 配信タイムアウト (10 秒) を超えると再送されるため、
-/// 応答しない Slack を無制限に待たない。
-pub const POST_TIMEOUT: Duration = Duration::from_secs(5);
+/// GitHub の webhook 配信タイムアウト (10 秒) を超えると GitHub が再送し、
+/// 通知が重複する。1 リクエストごとにタイムアウトを取り直すと、退避のための
+/// 再送で予算が倍になってしまうので、締め切りを 1 つ決めて分け合う。
+pub const POST_BUDGET: Duration = Duration::from_secs(5);
+
+/// 締め切りまでの残り時間。使い切っていれば `None`。
+fn remaining(deadline: Instant, now: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(now);
+
+    (!left.is_zero()).then_some(left)
+}
 
 #[derive(Debug)]
 pub struct Message {
@@ -46,6 +54,15 @@ fn is_blocks_problem(error: &str) -> bool {
     )
 }
 
+/// 退避して再送すべきか。
+///
+/// blocks を外して直るのは blocks 由来のエラーだけで、しかも payload に
+/// blocks が無ければ外しても何も変わらない。どちらも満たさない再送は
+/// 2 回目も同じ結果になり、時間とレート制限を捨てるだけになる。
+fn should_retry(payload: &MessagePayload, error: &str) -> bool {
+    is_blocks_problem(error) && payload.has_blocks()
+}
+
 /// `chat.postMessage` の応答。
 ///
 /// Slack は API エラーも HTTP 200 で返し、本文の `ok` で示す。
@@ -60,9 +77,11 @@ async fn post(
     client: &reqwest::Client,
     token: &str,
     payload: &MessagePayload,
+    timeout: Duration,
 ) -> Result<(), PostError> {
     let res = client
         .post("https://slack.com/api/chat.postMessage")
+        .timeout(timeout)
         .bearer_auth(token)
         .json(payload)
         .send()
@@ -214,6 +233,17 @@ impl MessagePayload {
 
         self
     }
+
+    /// markdown ブロックを含むか。
+    ///
+    /// 含まないなら退避しても payload は変わらない。再送しても同じエラーで
+    /// 確実に失敗するので、時間とレート制限を捨てるだけになる。
+    fn has_blocks(&self) -> bool {
+        self.attachments
+            .iter()
+            .flatten()
+            .any(|a| matches!(a.body, Body::Blocks { .. }))
+    }
 }
 
 impl Block {
@@ -276,10 +306,13 @@ impl Message {
     pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
         // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
         // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
+        // リクエストごとに残り時間を渡すが、渡し忘れの上限としても入れておく。
         let client = reqwest::Client::builder()
-            .timeout(POST_TIMEOUT)
+            .timeout(POST_BUDGET)
             .build()
             .expect("could not build http client");
+
+        let deadline = Instant::now() + POST_BUDGET;
 
         let payload = MessagePayload {
             channel: channel.to_string(),
@@ -289,7 +322,7 @@ impl Message {
             attachments: self.attachments,
         };
 
-        match post(&client, token, &payload).await {
+        match post(&client, token, &payload, POST_BUDGET).await {
             Ok(()) => return,
             // リクエスト自体の失敗は payload を変えても直らない。
             // 再送すると待ち時間も倍になるので諦める。
@@ -298,7 +331,7 @@ impl Message {
                 return;
             }
             Err(PostError::Api(e)) => {
-                if !is_blocks_problem(&e) {
+                if !should_retry(&payload, &e) {
                     error!("POST: {e}");
                     return;
                 }
@@ -310,8 +343,15 @@ impl Message {
             }
         }
 
+        // 再送も予算の中で行う。取り直すと webhook の締め切りを超えて
+        // GitHub が再送し、通知が重複する
+        let Some(left) = remaining(deadline, Instant::now()) else {
+            error!("POST (fallback): out of budget");
+            return;
+        };
+
         let fallback = payload.into_text_fallback();
-        if let Err(e) = post(&client, token, &fallback).await {
+        if let Err(e) = post(&client, token, &fallback, left).await {
             error!("POST (fallback): {e}");
         }
     }
@@ -451,6 +491,52 @@ mod tests {
 
         assert!(a.get("text").is_none(), "text が入っている: {a}");
         assert!(a.get("blocks").is_none(), "blocks が入っている: {a}");
+    }
+
+    /// blocks 由来のエラーで、かつ blocks を持つときだけ再送すること。
+    ///
+    /// blocks が無い payload は退避しても変わらないので、2 回目も同じエラーで
+    /// 確実に失敗する。
+    #[test]
+    fn only_block_errors_with_blocks_are_retried() {
+        let with_blocks = payload(blocks("## body", None));
+
+        assert!(should_retry(&with_blocks, "invalid_blocks"));
+        assert!(
+            !should_retry(&with_blocks, "invalid_auth"),
+            "blocks 由来でないエラーで再送している"
+        );
+
+        for body in [
+            Body::new(vec![], Some("body".to_string())),
+            Body::new(vec![], None),
+        ] {
+            assert!(
+                !should_retry(&payload(body), "invalid_blocks"),
+                "blocks が無いのに再送している"
+            );
+        }
+    }
+
+    /// 予算を使い切っていたら再送しないこと。
+    ///
+    /// 取り直すと GitHub の webhook 配信タイムアウトを超え、GitHub が再送して
+    /// 通知が重複する。
+    #[test]
+    fn exhausted_budget_leaves_no_time_for_the_fallback() {
+        let now = Instant::now();
+
+        assert_eq!(
+            remaining(now + Duration::from_secs(2), now),
+            Some(Duration::from_secs(2)),
+            "残っているのに再送されない"
+        );
+        assert_eq!(remaining(now, now), None, "使い切ったのに再送される");
+        assert_eq!(
+            remaining(now, now + Duration::from_secs(1)),
+            None,
+            "超過したのに再送される"
+        );
     }
 
     /// ブロックの無い本文は退避しても変わらないこと。
