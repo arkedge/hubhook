@@ -264,7 +264,10 @@ impl TeamResolver {
                 continue;
             }
 
-            let team = (org.to_string(), slug.to_string());
+            // GitHub のログイン名は大文字小文字を区別しないので、正規化してから
+            // 扱う。しないと `@Foo/bar` と `@FOO/bar` が別 team として通り、
+            // 重複排除・件数上限・取得中ロック・キャッシュをすべて回避できる。
+            let team = (org.to_lowercase(), slug.to_lowercase());
 
             // Vec::contains で重複を見ると、mention 風の文字列を大量に
             // 書かれたときに件数の 2 乗になる
@@ -687,8 +690,8 @@ mod tests {
         assert_eq!(
             r.teams_in(body),
             vec![
-                ("Octocoders".to_string(), "octo-team".to_string()),
-                ("Octocoders".to_string(), "octo-infra".to_string()),
+                ("octocoders".to_string(), "octo-team".to_string()),
+                ("octocoders".to_string(), "octo-infra".to_string()),
             ]
         );
     }
@@ -715,7 +718,7 @@ mod tests {
         ] {
             assert_eq!(
                 r.teams_in(body),
-                vec![("Octocoders".to_string(), "octo-team".to_string())],
+                vec![("octocoders".to_string(), "octo-team".to_string())],
                 "body = {body:?}"
             );
         }
@@ -759,6 +762,21 @@ mod tests {
         );
     }
 
+    /// 大文字小文字の違いを同じ team として扱うこと。
+    ///
+    /// 区別してしまうと、`@Foo/bar` と `@FOO/bar` が別 team として通り、
+    /// 重複排除・件数上限・取得中ロック・キャッシュを回避できてしまう。
+    #[test]
+    fn team_mentions_are_case_insensitive() {
+        let r = resolver();
+        let body = "@Octocoders/octo-team @OCTOCODERS/OCTO-TEAM @octocoders/octo-team";
+
+        assert_eq!(
+            r.teams_in(body),
+            vec![("octocoders".to_string(), "octo-team".to_string())]
+        );
+    }
+
     /// 同じ team を何度書かれても 1 回しか引かないこと。
     #[test]
     fn duplicate_team_mentions_are_deduped() {
@@ -766,7 +784,7 @@ mod tests {
         let body = "@Octocoders/octo-team @Octocoders/octo-team @Octocoders/octo-team";
         assert_eq!(
             r.teams_in(body),
-            vec![("Octocoders".to_string(), "octo-team".to_string())]
+            vec![("octocoders".to_string(), "octo-team".to_string())]
         );
     }
 
