@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: hadolint
-        uses: reviewdog/action-hadolint@fc7ee4a9f71e521bc43e370819247b70e5327540 # v1.50.2
+        uses: reviewdog/action-hadolint@2d0eb7c86a0ddd94eb625485f4cc2730e105edd8 # v1.53.0
         with:
           github_token: ${{ secrets.github_token }}
           reporter: github-pr-review
