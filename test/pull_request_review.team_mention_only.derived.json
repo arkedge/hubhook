@@ -1,6 +1,44 @@
 {
-  "action": "review_requested",
-  "number": 2,
+  "action": "submitted",
+  "review": {
+    "id": 237895671,
+    "node_id": "MDE3OlB1bGxSZXF1ZXN0UmV2aWV3MjM3ODk1Njcx",
+    "user": {
+      "login": "Codertocat",
+      "id": 21031067,
+      "node_id": "MDQ6VXNlcjIxMDMxMDY3",
+      "avatar_url": "https://avatars1.githubusercontent.com/u/21031067?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Codertocat",
+      "html_url": "https://github.com/Codertocat",
+      "followers_url": "https://api.github.com/users/Codertocat/followers",
+      "following_url": "https://api.github.com/users/Codertocat/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Codertocat/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Codertocat/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Codertocat/subscriptions",
+      "organizations_url": "https://api.github.com/users/Codertocat/orgs",
+      "repos_url": "https://api.github.com/users/Codertocat/repos",
+      "events_url": "https://api.github.com/users/Codertocat/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Codertocat/received_events",
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "@Octocoders/octo-team",
+    "commit_id": "ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+    "submitted_at": "2019-05-15T15:20:38Z",
+    "state": "approved",
+    "html_url": "https://github.com/Codertocat/Hello-World/pull/2#pullrequestreview-237895671",
+    "pull_request_url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/2",
+    "author_association": "OWNER",
+    "_links": {
+      "html": {
+        "href": "https://github.com/Codertocat/Hello-World/pull/2#pullrequestreview-237895671"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/Codertocat/Hello-World/pulls/2"
+      }
+    }
+  },
   "pull_request": {
     "url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/2",
     "id": 279147437,
@@ -35,10 +73,10 @@
     },
     "body": "This is a pretty simple change that we need to pull into master.",
     "created_at": "2019-05-15T15:20:33Z",
-    "updated_at": "2019-05-15T15:20:33Z",
+    "updated_at": "2019-05-15T15:20:38Z",
     "closed_at": null,
     "merged_at": null,
-    "merge_commit_sha": null,
+    "merge_commit_sha": "c4295bd74fb0f4fda03689c3df3f2803b658fd85",
     "assignee": null,
     "assignees": [
       {
@@ -97,6 +135,7 @@
       }
     ],
     "milestone": null,
+    "draft": false,
     "commits_url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/2/commits",
     "review_comments_url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/2/comments",
     "review_comment_url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/comments{/number}",
@@ -193,8 +232,8 @@
         "releases_url": "https://api.github.com/repos/Codertocat/Hello-World/releases{/id}",
         "deployments_url": "https://api.github.com/repos/Codertocat/Hello-World/deployments",
         "created_at": "2019-05-15T15:19:25Z",
-        "updated_at": "2019-05-15T15:19:27Z",
-        "pushed_at": "2019-05-15T15:20:32Z",
+        "updated_at": "2019-05-15T15:20:34Z",
+        "pushed_at": "2019-05-15T15:20:33Z",
         "git_url": "git://github.com/Codertocat/Hello-World.git",
         "ssh_url": "git@github.com:Codertocat/Hello-World.git",
         "clone_url": "https://github.com/Codertocat/Hello-World.git",
@@ -203,7 +242,7 @@
         "size": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "language": null,
+        "language": "Ruby",
         "has_issues": true,
         "has_projects": true,
         "has_downloads": true,
@@ -317,8 +356,8 @@
         "releases_url": "https://api.github.com/repos/Codertocat/Hello-World/releases{/id}",
         "deployments_url": "https://api.github.com/repos/Codertocat/Hello-World/deployments",
         "created_at": "2019-05-15T15:19:25Z",
-        "updated_at": "2019-05-15T15:19:27Z",
-        "pushed_at": "2019-05-15T15:20:32Z",
+        "updated_at": "2019-05-15T15:20:34Z",
+        "pushed_at": "2019-05-15T15:20:33Z",
         "git_url": "git://github.com/Codertocat/Hello-World.git",
         "ssh_url": "git@github.com:Codertocat/Hello-World.git",
         "clone_url": "https://github.com/Codertocat/Hello-World.git",
@@ -327,7 +366,7 @@
         "size": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "language": null,
+        "language": "Ruby",
         "has_issues": true,
         "has_projects": true,
         "has_downloads": true,
@@ -378,20 +417,7 @@
     },
     "author_association": "OWNER",
     "auto_merge": null,
-    "active_lock_reason": null,
-    "draft": false,
-    "merged": false,
-    "mergeable": null,
-    "rebaseable": null,
-    "mergeable_state": "unknown",
-    "merged_by": null,
-    "comments": 0,
-    "review_comments": 0,
-    "maintainer_can_modify": false,
-    "commits": 1,
-    "additions": 1,
-    "deletions": 1,
-    "changed_files": 1
+    "active_lock_reason": null
   },
   "repository": {
     "id": 186853002,
@@ -460,8 +486,8 @@
     "releases_url": "https://api.github.com/repos/Codertocat/Hello-World/releases{/id}",
     "deployments_url": "https://api.github.com/repos/Codertocat/Hello-World/deployments",
     "created_at": "2019-05-15T15:19:25Z",
-    "updated_at": "2019-05-15T15:19:27Z",
-    "pushed_at": "2019-05-15T15:20:32Z",
+    "updated_at": "2019-05-15T15:20:34Z",
+    "pushed_at": "2019-05-15T15:20:33Z",
     "git_url": "git://github.com/Codertocat/Hello-World.git",
     "ssh_url": "git@github.com:Codertocat/Hello-World.git",
     "clone_url": "https://github.com/Codertocat/Hello-World.git",
@@ -470,7 +496,7 @@
     "size": 0,
     "stargazers_count": 0,
     "watchers_count": 0,
-    "language": null,
+    "language": "Ruby",
     "has_issues": true,
     "has_projects": true,
     "has_downloads": true,
@@ -491,10 +517,6 @@
     "visibility": "public",
     "web_commit_signoff_required": false,
     "custom_properties": {}
-  },
-  "installation": {
-    "id": 1,
-    "node_id": "MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uMQ=="
   },
   "organization": {
     "login": "Octocoders",
@@ -530,17 +552,8 @@
     "type": "User",
     "site_admin": false
   },
-  "requested_team": {
-    "name": "Octo Team",
-    "id": 3253433,
-    "node_id": "MDQ6VGVhbTMyNTM0MzM=",
-    "slug": "octo-team",
-    "description": "octo team",
-    "privacy": "closed",
-    "url": "https://api.github.com/organizations/38302899/team/3253433",
-    "html_url": "https://github.com/orgs/Octocoders/teams/octo-team",
-    "members_url": "https://api.github.com/organizations/38302899/team/3253433/members{/member}",
-    "repositories_url": "https://api.github.com/organizations/38302899/team/3253433/repos",
-    "permission": "pull"
+  "installation": {
+    "id": 1,
+    "node_id": "MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uMQ=="
   }
 }

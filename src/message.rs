@@ -548,7 +548,7 @@ mod tests {
         .expect("team への review request も通知されるべき");
 
         assert!(
-            msg.text.contains("requested a review from team sat-sw"),
+            msg.text.contains("requested a review from team octo-team"),
             "text = {}",
             msg.text
         );

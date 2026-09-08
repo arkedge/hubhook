@@ -7,6 +7,7 @@ services:
       - HUBHOOK_PORT=${HUBHOOK_PORT}
       - SLACK_TOKEN=${SLACK_TOKEN}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
     ports:
       - 8080:${HUBHOOK_PORT}
     volumes:

@@ -348,12 +348,30 @@ impl Payload {
         }
     }
 
-    pub fn match_rules(&self, rules: &[Rule]) -> HashMap<String, RuleMatchResult> {
+    /// `extra_mentions` は team メンションを展開した `@login` の列 (#286)。
+    ///
+    /// 本文と連結せずにそのまま渡す。連結すると、`$` などのアンカーを使う
+    /// 既存ルールの意味が変わってしまう (`@org/team$` が末尾に一致しなくなる、
+    /// exclude_query 側では除外されるべきものが除外されなくなる)。
+    pub fn match_rules(
+        &self,
+        rules: &[Rule],
+        extra_mentions: &str,
+    ) -> HashMap<String, RuleMatchResult> {
+        // 「本文 + 展開結果」は rule ごとに使うので、ここで 1 回だけ組み立てる。
+        // rule ごとに format! すると、展開結果が大きいときに rule 数だけ
+        // 確保と走査を繰り返すことになる。
+        let combined = if extra_mentions.is_empty() {
+            String::new()
+        } else {
+            format!("{body} {extra_mentions}", body = self.body())
+        };
+
         let mut v = HashMap::<String, RuleMatchResult>::new();
 
         for r in rules {
             // not match
-            if !r.check_match(self) {
+            if !r.check_match(self, extra_mentions, &combined) {
                 continue;
             }
 
@@ -525,7 +543,7 @@ mod tests {
             "pull_request_review.approved.derived.json",
         );
         assert!(
-            !p.match_rules(&rules).is_empty(),
+            !p.match_rules(&rules, "").is_empty(),
             "review にはマッチするべき"
         );
 
@@ -535,7 +553,7 @@ mod tests {
             "pull_request_review_comment.created.with-organization.json",
         );
         assert!(
-            p.match_rules(&rules).is_empty(),
+            p.match_rules(&rules, "").is_empty(),
             "review_state を持たないイベントにマッチしてはいけない"
         );
     }
@@ -627,7 +645,7 @@ mod tests {
             "pull_request",
             "pull_request.review_requested.team.derived.json",
         );
-        assert_eq!(p.requested_reviewers(), vec!["sat-sw"]);
+        assert_eq!(p.requested_reviewers(), vec!["octo-team"]);
     }
 
     /// review_requested 以外のイベントでは reviewer は空にする。
@@ -648,6 +666,197 @@ mod tests {
             "pull_request_review.approved.derived.json",
         );
         assert!(p.requested_reviewers().is_empty());
+    }
+
+    /// #286: team メンションを展開すると、個人のルールにマッチすること。
+    /// 展開前 (extra_mentions が空) ではマッチしないことも確認する。
+    #[test]
+    fn expanded_team_mention_matches_personal_rule() {
+        let rule: crate::Rule = serde_json::from_str(
+            r#"{"channel":"test","display_name":"sksat","query":{"body":"@sksat"}}"#,
+        )
+        .unwrap();
+        let rules = vec![rule];
+
+        // body には team メンションだけが書かれている payload
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+        assert!(p.body().contains("@Octocoders/octo-team"));
+        assert!(!p.body().contains("@sksat"));
+
+        // 展開前: team メンションのままなので個人のルールには当たらない
+        assert!(
+            p.match_rules(&rules, "").is_empty(),
+            "展開前にマッチしてはいけない"
+        );
+
+        // 展開後: メンバーの @login が body に足されるのでマッチする
+        let matched = p.match_rules(&rules, "@sksat @meltingrabbit");
+        assert!(matched.contains_key("test"), "展開後はマッチするべき");
+    }
+
+    /// #286: team 展開を足しても、アンカー付きの既存ルールの意味が変わらないこと。
+    ///
+    /// 本文と展開結果を連結すると `@org/team$` が末尾に一致しなくなり、
+    /// exclude_query 側では「除外されるべきものが除外されない」= 余計な通知が飛ぶ。
+    #[test]
+    fn expansion_does_not_break_anchored_rules() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention_only.derived.json",
+        );
+        assert_eq!(
+            p.body(),
+            "@Octocoders/octo-team",
+            "末尾アンカーの検証に使う fixture"
+        );
+
+        // include: 末尾アンカーが展開後も効くこと
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"anchored","display_name":"x","query":{"body":"@Octocoders/octo-team$"}}"#,
+            )
+            .unwrap(),
+        ];
+        assert!(!p.match_rules(&rules, "").is_empty(), "展開前はマッチする");
+        assert!(
+            !p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            "展開すると末尾アンカーが効かなくなっている"
+        );
+
+        // exclude: 末尾アンカーによる除外が展開後も効くこと
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"excluded","display_name":"x","query":{"body":"octo-team"},"exclude_query":{"body":"@Octocoders/octo-team$"}}"#,
+            )
+            .unwrap(),
+        ];
+        assert!(p.match_rules(&rules, "").is_empty(), "展開前は除外される");
+        assert!(
+            p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            "展開すると除外が効かなくなっている"
+        );
+    }
+
+    /// #286: 本文の文脈と展開された login を組み合わせたパターンが効くこと。
+    ///
+    /// 展開結果だけに当てると、`レビュー.*@sksat` のようなパターンは
+    /// 本文側にも展開側にも一致せず、どこにも当たらなくなる。
+    #[test]
+    fn expansion_supports_patterns_combining_body_and_member() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+        assert!(p.body().contains("レビュー"));
+        assert!(!p.body().contains("@sksat"));
+
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"combined","display_name":"x","query":{"body":"レビュー.*@sksat"}}"#,
+            )
+            .unwrap(),
+        ];
+
+        // 展開前は @sksat が本文に無いのでマッチしない
+        assert!(p.match_rules(&rules, "").is_empty(), "展開前はマッチしない");
+
+        // 展開すると、本文の文脈と合わせてマッチする
+        assert!(
+            !p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            "本文の文脈と展開結果を組み合わせたパターンが効いていない"
+        );
+    }
+
+    /// #286: 展開された login のマッチが並び順に依存しないこと。
+    ///
+    /// まとめて 1 つの文字列に当てると、`@sksat$` は sksat が
+    /// たまたま最後に並んだときだけ一致してしまう。
+    #[test]
+    fn expanded_member_matching_is_order_independent() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"anchored-member","display_name":"x","query":{"body":"@sksat$"}}"#,
+            )
+            .unwrap(),
+        ];
+
+        // 最後に並んでいる場合
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat").is_empty(),
+            "末尾にいるときはマッチするべき"
+        );
+
+        // 途中に並んでいる場合も同じ結果になること
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            "並び順で結果が変わっている"
+        );
+    }
+
+    /// #286 の既知の制限: 「本文の文脈 + member への末尾アンカー」は
+    /// 展開結果の並び順に依存する。
+    ///
+    /// 本文を member ごとに連結して照合すれば解消するが、rule ごと ×
+    /// member ごとに本文長を走査することになり、rule が増えるほど webhook
+    /// 1 通の処理が重くなる。稀な書き方なので制限として残している。
+    /// 解消する場合は、走査量の上限を webhook 単位で設計する必要がある。
+    #[test]
+    fn known_limitation_contextual_anchor_depends_on_member_order() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+        assert!(p.body().contains("レビュー"));
+
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"ctx","display_name":"x","query":{"body":"レビュー.*@sksat$"}}"#,
+            )
+            .unwrap(),
+        ];
+
+        // sksat が最後に並んでいる場合
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat").is_empty(),
+            "末尾にいるときはマッチするべき"
+        );
+
+        // 後ろに別のメンバーが並ぶとマッチしない (既知の制限)。
+        // ここが通るように変えるなら、走査量の上限も併せて設計すること。
+        assert!(
+            p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            "制限が解消されている。README と このテストの意図を更新すること"
+        );
+    }
+
+    /// body クエリを使わない rule しか無ければ、team を引く必要がないこと。
+    #[test]
+    fn rules_without_body_query_do_not_need_expansion() {
+        let no_body: crate::Rule = serde_json::from_str(
+            r#"{"channel":"c","display_name":"x","query":{"repo":"hubhook","label":"bug"}}"#,
+        )
+        .unwrap();
+        assert!(!no_body.uses_body());
+
+        let with_body: crate::Rule =
+            serde_json::from_str(r#"{"channel":"c","display_name":"x","query":{"body":"@sksat"}}"#)
+                .unwrap();
+        assert!(with_body.uses_body());
+
+        // exclude_query 側だけで使っている場合も展開が必要
+        let exclude_body: crate::Rule = serde_json::from_str(
+            r#"{"channel":"c","display_name":"x","query":{"repo":"hubhook"},"exclude_query":{"body":"@sksat"}}"#,
+        )
+        .unwrap();
+        assert!(exclude_body.uses_body());
     }
 
     /// #122: レビューコメント (と返信) の本文が body として取れること。

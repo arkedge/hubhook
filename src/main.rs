@@ -5,7 +5,7 @@ use structopt::StructOpt;
 
 use serde::Deserialize;
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 
 use actix_web::error::ErrorBadRequest;
 use actix_web::{App, Error, FromRequest, HttpRequest, HttpResponse, HttpServer, Result, web};
@@ -23,6 +23,7 @@ type HmacSha256 = Hmac<Sha256>;
 mod github;
 mod message;
 mod slack;
+mod team;
 
 #[derive(Debug, Clone, StructOpt)]
 #[structopt(name = "hubhook")]
@@ -39,6 +40,11 @@ struct Opt {
 
     #[structopt(long, env)]
     sentry_dsn: String,
+
+    /// team メンションを展開するための GitHub token (#286)。
+    /// 未設定でも動くが、team メンションは展開されない。
+    #[structopt(long, env)]
+    github_token: Option<String>,
 
     #[structopt(long)]
     debug: bool,
@@ -219,11 +225,15 @@ async fn main() -> std::io::Result<()> {
         res.unwrap()
     };
 
+    // キャッシュを worker 間で共有するため、closure の外で 1 つだけ作る
+    let teams = Arc::new(team::TeamResolver::new(opt.github_token.clone()));
+
     HttpServer::new(move || {
         App::new()
             .wrap(sentry_actix::Sentry::new())
             .app_data(web::Data::new(Arc::new(cfg.clone()))) // memo: https://github.com/actix/actix-web/issues/1454#issuecomment-867897725
             .app_data(web::Data::new(Arc::new(opt.clone())))
+            .app_data(web::Data::new(teams.clone()))
             .service(web::resource("/webhook").route(web::post().to(webhook)))
             .service(web::resource("/healthcheck").route(web::get().to(HttpResponse::Ok)))
     })
@@ -235,6 +245,7 @@ async fn main() -> std::io::Result<()> {
 async fn webhook(
     opt: web::Data<Arc<Opt>>,
     cfg: web::Data<Arc<Config>>,
+    teams: web::Data<Arc<team::TeamResolver>>,
     data: Data,
 ) -> Result<HttpResponse> {
     // 扱わないイベントは何もしない
@@ -244,8 +255,17 @@ async fn webhook(
 
     //post_test(&opt, &payload).await;
 
+    // team メンションをメンバーの @login に展開してから照合する (#286)。
+    // body クエリを使う rule が 1 つも無ければ展開結果は使われないので、
+    // GitHub API を叩かない (repo / label / assignee だけの設定で待たされないため)。
+    let extra_mentions = if cfg.rule.iter().any(|r| r.uses_body()) {
+        teams.expand_mentions(payload.body()).await
+    } else {
+        String::new()
+    };
+
     // match rule
-    let matches = payload.match_rules(&cfg.rule);
+    let matches = payload.match_rules(&cfg.rule, &extra_mentions);
 
     for (channel, m) in matches {
         let msg: Result<slack::Message, _> = (&payload).try_into();
@@ -265,20 +285,42 @@ async fn webhook(
 }
 
 impl Rule {
-    fn check_match(&self, payload: &github::Payload) -> bool {
-        let include_query_result = Rule::match_results(&self.query, payload).iter().all(|&r| r);
+    /// body クエリを使っているか (include / exclude のいずれか)。
+    ///
+    /// 使っていない rule しか無いなら team を引く必要がない。
+    fn uses_body(&self) -> bool {
+        self.query.body.is_some()
+            || self
+                .exclude_query
+                .as_ref()
+                .is_some_and(|q| q.body.is_some())
+    }
+
+    /// `mentions` は team メンションを展開した `@login` の列、
+    /// `combined` は「元の本文 + `mentions`」を組み立てたもの (#286)。
+    /// どちらも webhook ごとに 1 回作って rule 間で使い回す。
+    fn check_match(&self, payload: &github::Payload, mentions: &str, combined: &str) -> bool {
+        let include_query_result = Rule::match_results(&self.query, payload, mentions, combined)
+            .iter()
+            .all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
-            let exclude_query_result = Rule::match_results(exclude_query, payload)
-                .iter()
-                .any(|&r| r);
+            let exclude_query_result =
+                Rule::match_results(exclude_query, payload, mentions, combined)
+                    .iter()
+                    .any(|&r| r);
             include_query_result && !exclude_query_result
         } else {
             include_query_result
         }
     }
 
-    fn match_results(query: &Query, payload: &github::Payload) -> Vec<bool> {
+    fn match_results(
+        query: &Query,
+        payload: &github::Payload,
+        mentions: &str,
+        combined: &str,
+    ) -> Vec<bool> {
         let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
 
         let topics = &payload.repo().topics;
@@ -287,7 +329,43 @@ impl Rule {
 
         let r_sender = Rule::match_query(query.user.as_ref(), &payload.sender().login);
         let r_title = Rule::match_query(query.title.as_ref(), payload.title());
-        let r_body = Rule::match_query(query.body.as_ref(), payload.body());
+        // body クエリは 3 つの対象に当てて OR を取る。正規表現のコンパイルは 1 回。
+        let r_body = query.body.as_ref().map(|q| {
+            let Some(re) = Rule::compile_query(q) else {
+                return false;
+            };
+            let body = payload.body();
+
+            // 1. 元の本文。`@org/team$` のようなアンカー付きルールの意味を保つ。
+            //    連結したものだけに当てると末尾一致が効かなくなり、
+            //    exclude_query 側では除外されるべきものが除外されなくなる。
+            if re.is_match(body) {
+                return true;
+            }
+
+            if mentions.is_empty() {
+                return false;
+            }
+
+            // 2. 元の本文 + 展開結果。本文の文脈と組み合わせたパターン
+            //    (`レビュー.*@sksat` など) を拾う。区切りは改行ではなく空白
+            //    (正規表現の `.` は既定で改行に一致しない)。
+            //    組み立て済みのものを受け取るので、rule ごとには確保しない。
+            if re.is_match(combined) {
+                return true;
+            }
+
+            // 3. 展開された `@login` を 1 つずつ。まとめて 1 つの文字列に当てると、
+            //    `@sksat$` のようなアンカー付きルールが「たまたま最後に並んだか」で
+            //    結果が変わってしまう (並び順は展開側の都合に過ぎない)。
+            //
+            //    ここで本文を連結しないのは、rule ごと × member ごとに本文長を
+            //    走査することになり、rule が増えるほど webhook 1 通の処理が
+            //    重くなるため。その結果、「本文の文脈 + member への末尾アンカー」
+            //    (`レビュー.*@sksat$`) は並び順に依存するという制限が残る。
+            //    稀な書き方のために全体のコストを上げない判断 (README に記載)。
+            mentions.split(' ').any(|m| re.is_match(m))
+        });
 
         let labels = payload.labels().iter().collect();
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);
@@ -347,21 +425,23 @@ impl Rule {
         Some(false)
     }
 
-    fn match_query_impl(query: &str, payload: &str) -> bool {
+    /// query を正規表現にする。空クエリは警告して `None`。
+    fn compile_query(query: &str) -> Option<Regex> {
         if query.is_empty() {
             warn!("query is empty");
-            return false;
+            return None;
         }
 
-        let re = RegexBuilder::new(query)
-            .case_insensitive(true)
-            .build()
-            .unwrap();
-        if re.is_match(payload) {
-            return true;
-        }
+        Some(
+            RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        )
+    }
 
-        false
+    fn match_query_impl(query: &str, payload: &str) -> bool {
+        Rule::compile_query(query).is_some_and(|re| re.is_match(payload))
     }
 }
 
