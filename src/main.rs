@@ -73,7 +73,9 @@ pub struct Query {
     title: Option<String>,
     body: Option<String>,
     label: Option<String>,
-    //review_state: Option<String>,
+    /// `pull_request_review` の state (`approved` / `changes_requested` / `commented`)。
+    /// review 以外のイベントに対しては常に不一致になる (#285)。
+    review_state: Option<String>,
 }
 
 #[derive(Debug)]
@@ -286,10 +288,25 @@ impl Rule {
         let labels = payload.labels().iter().collect();
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);
 
-        vec![r_repo, r_topic, r_sender, r_title, r_body, r_labels]
-            .into_iter()
-            .flatten()
-            .collect()
+        // review_state を持たないイベントは空文字と照合するので、
+        // review_state を指定した rule は review 以外にマッチしない
+        let r_review_state = Rule::match_query(
+            query.review_state.as_ref(),
+            payload.review_state().unwrap_or(""),
+        );
+
+        vec![
+            r_repo,
+            r_topic,
+            r_sender,
+            r_title,
+            r_body,
+            r_labels,
+            r_review_state,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     fn match_query(query: Option<&String>, payload: &str) -> Option<bool> {

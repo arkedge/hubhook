@@ -16,6 +16,8 @@ pub enum Payload {
     IssueComment(Box<IssueComment>),
     Issues(Box<Issues>),
     PullRequest(Box<PullRequest>),
+    PullRequestReview(Box<PullRequestReview>),
+    PullRequestReviewComment(Box<PullRequestReviewComment>),
 }
 
 /// [`Payload::from_event`] の deserialize 失敗。
@@ -92,6 +94,37 @@ impl IssueComment {
     }
 }
 
+/// `pull_request_review`: レビューの submit / edit / dismiss。
+/// approve 時のメッセージは `review.body` に入る (#285)。
+// payload schema の写しなので、読んでいないフィールドも残す
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct PullRequestReview {
+    pub action: PullRequestReviewAction,
+    pub review: common::Review,
+    pub pull_request: common::SimplePullRequest,
+    pub repository: common::Repository,
+    // organization / installation は org 所有リポジトリ以外では存在しないので Option。
+    // 欠けたフィールドで deserialize に失敗すると通知が飛ばなくなる (#311)。
+    pub organization: Option<common::Organization>,
+    pub sender: common::User,
+    pub installation: Option<common::InstallationLite>,
+}
+
+/// `pull_request_review_comment`: diff 上のコメントと、それへの返信 (#122)。
+// payload schema の写しなので、読んでいないフィールドも残す
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct PullRequestReviewComment {
+    pub action: PullRequestReviewCommentAction,
+    pub comment: common::ReviewComment,
+    pub pull_request: common::SimplePullRequest,
+    pub repository: common::Repository,
+    pub organization: Option<common::Organization>,
+    pub sender: common::User,
+    pub installation: Option<common::InstallationLite>,
+}
+
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssuesAction {
@@ -148,6 +181,24 @@ pub enum IssueCommentAction {
     Deleted,
 }
 
+// https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request_review
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestReviewAction {
+    Submitted,
+    Edited,
+    Dismissed,
+}
+
+// https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request_review_comment
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestReviewCommentAction {
+    Created,
+    Edited,
+    Deleted,
+}
+
 use crate::{Rule, RuleMatchResult};
 impl Payload {
     /// `X-GitHub-Event` に対応する variant として deserialize する。
@@ -166,6 +217,8 @@ impl Payload {
             "issues" => Payload::Issues(de(body)?),
             "issue_comment" => Payload::IssueComment(de(body)?),
             "pull_request" => Payload::PullRequest(de(body)?),
+            "pull_request_review" => Payload::PullRequestReview(de(body)?),
+            "pull_request_review_comment" => Payload::PullRequestReviewComment(de(body)?),
             _ => return Ok(None),
         };
 
@@ -177,6 +230,8 @@ impl Payload {
             Payload::Issues(issues) => &issues.repository,
             Payload::IssueComment(icomment) => &icomment.repository,
             Payload::PullRequest(pr) => &pr.repository,
+            Payload::PullRequestReview(review) => &review.repository,
+            Payload::PullRequestReviewComment(comment) => &comment.repository,
         }
     }
 
@@ -185,6 +240,8 @@ impl Payload {
             Payload::Issues(issues) => &issues.sender,
             Payload::IssueComment(icomment) => &icomment.sender,
             Payload::PullRequest(pr) => &pr.sender,
+            Payload::PullRequestReview(review) => &review.sender,
+            Payload::PullRequestReviewComment(comment) => &comment.sender,
         }
     }
 
@@ -193,6 +250,8 @@ impl Payload {
             Payload::Issues(issues) => &issues.issue.title,
             Payload::IssueComment(icomment) => &icomment.issue.title,
             Payload::PullRequest(pr) => &pr.pull_request.title,
+            Payload::PullRequestReview(review) => &review.pull_request.title,
+            Payload::PullRequestReviewComment(comment) => &comment.pull_request.title,
         }
     }
 
@@ -208,6 +267,11 @@ impl Payload {
 
             Payload::IssueComment(icomment) => &icomment.comment.body,
             Payload::PullRequest(pr) => pr.pull_request.body.as_deref().unwrap_or(""),
+
+            // approve のメッセージ (#285) と、レビューコメント・その返信 (#122) を
+            // body として扱うことで、既存の body クエリでのメンション検出に乗る
+            Payload::PullRequestReview(review) => review.review.body.as_deref().unwrap_or(""),
+            Payload::PullRequestReviewComment(comment) => &comment.comment.body,
         }
     }
 
@@ -216,6 +280,8 @@ impl Payload {
             Payload::Issues(issues) => &issues.issue.labels,
             Payload::IssueComment(icomment) => &icomment.issue.labels,
             Payload::PullRequest(pr) => &pr.pull_request.labels,
+            Payload::PullRequestReview(review) => &review.pull_request.labels,
+            Payload::PullRequestReviewComment(comment) => &comment.pull_request.labels,
         }
     }
 
@@ -224,6 +290,18 @@ impl Payload {
             Payload::Issues(issues) => &issues.issue.url,
             Payload::IssueComment(icomment) => &icomment.comment.url,
             Payload::PullRequest(pr) => &pr.pull_request.url,
+            // Review には API url が無いので html_url を使う
+            Payload::PullRequestReview(review) => &review.review.html_url,
+            Payload::PullRequestReviewComment(comment) => &comment.comment.url,
+        }
+    }
+
+    /// `pull_request_review` の review state (`approved` / `changes_requested` /
+    /// `commented` など)。それ以外のイベントでは `None`。
+    pub fn review_state(&self) -> Option<&str> {
+        match &self {
+            Payload::PullRequestReview(review) => Some(&review.review.state),
+            _ => None,
         }
     }
 
@@ -253,18 +331,27 @@ impl Payload {
     }
 }
 
+/// `test/` 以下の payload-example を読むテスト用ローダ。
+/// message 側のテストからも使う。
 #[cfg(test)]
-mod tests {
-    use crate::github::*;
+pub(crate) mod testing {
+    use super::Payload;
 
-    #[allow(dead_code)] // #292 で payload のテストを書くときに使う
-    fn de(event: &str, test_json: &str) -> Payload {
-        let path = format!("test/{}", test_json);
-        let payload = std::fs::read_to_string(path).unwrap();
+    pub(crate) fn de(event: &str, test_json: &str) -> Payload {
+        let path = format!("test/{test_json}");
+        let payload =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+        // 失敗したフィールドが分かるように、エラーをそのまま出す
         Payload::from_event(event, payload.as_bytes())
-            .unwrap()
+            .unwrap_or_else(|e| panic!("{test_json}: {e}"))
             .expect("unsupported event")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::github::testing::de;
+    use crate::github::*;
 
     #[test]
     fn unsupported_event_is_ignored() {
@@ -344,6 +431,70 @@ mod tests {
     #[test]
     fn issue_comment_actions() {
         assert_actions::<IssueCommentAction>(&["created", "deleted", "edited"]);
+    }
+
+    #[test]
+    fn pull_request_review_actions() {
+        assert_actions::<PullRequestReviewAction>(&["dismissed", "edited", "submitted"]);
+    }
+
+    #[test]
+    fn pull_request_review_comment_actions() {
+        assert_actions::<PullRequestReviewCommentAction>(&["created", "deleted", "edited"]);
+    }
+
+    /// octokit/webhooks の payload-examples をそのまま deserialize できること。
+    /// フィールドが 1 つ足りないだけで deserialize に失敗し、通知が飛ばなくなるので、
+    /// 実物の payload に対して型を検証しておく (#292)。
+    #[test]
+    fn de_pull_request_review() {
+        let p = de("pull_request_review", "pull_request_review.submitted.json");
+        assert!(matches!(p, Payload::PullRequestReview(_)));
+        // インラインコメントだけを submit した review は body が null
+        assert_eq!(p.review_state(), Some("commented"));
+        assert_eq!(p.body(), "");
+
+        // 本番は org 所有リポジトリなので organization 入りも確認する
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.submitted.with-organization.json",
+        );
+        assert_eq!(p.review_state(), Some("commented"));
+
+        let p = de("pull_request_review", "pull_request_review.dismissed.json");
+        assert!(matches!(p, Payload::PullRequestReview(_)));
+    }
+
+    /// #285: approve に付けたメッセージが body として取れること。
+    /// octokit に approved の payload-example が無いため、
+    /// submitted.with-organization から state と body だけ差し替えたものを使う。
+    #[test]
+    fn review_approved_body_is_captured() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.approved.derived.json",
+        );
+        assert_eq!(p.review_state(), Some("approved"));
+        assert!(p.body().contains("@sksat"), "body = {:?}", p.body());
+    }
+
+    /// #122: レビューコメント (と返信) の本文が body として取れること。
+    #[test]
+    fn de_pull_request_review_comment() {
+        let p = de(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.json",
+        );
+        assert!(matches!(p, Payload::PullRequestReviewComment(_)));
+        assert!(!p.body().is_empty(), "body が空");
+        // review_state を持たないので review_state クエリにはマッチしない
+        assert_eq!(p.review_state(), None);
+
+        let p = de(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.with-organization.json",
+        );
+        assert!(!p.body().is_empty(), "body が空");
     }
 
     // TODO: add test for OSS

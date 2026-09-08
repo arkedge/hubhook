@@ -26,7 +26,8 @@ pub struct Attachment {
     pub color: Option<Color>,
 }
 
-// Slack attachment の色パレット。現時点で使っていない色も定義として残す
+// Slack attachment の色パレット。
+// Warning と Closed は今のところ使っていないが、定義として残す
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
