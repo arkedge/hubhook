@@ -538,6 +538,22 @@ mod tests {
         );
     }
 
+    /// #87: team への review request が team 名で通知されること。
+    #[test]
+    fn team_review_request_notifies_with_slug() {
+        let msg = message(
+            "pull_request",
+            "pull_request.review_requested.team.derived.json",
+        )
+        .expect("team への review request も通知されるべき");
+
+        assert!(
+            msg.text.contains("requested a review from team sat-sw"),
+            "text = {}",
+            msg.text
+        );
+    }
+
     /// #122: レビューコメントが本文付きで通知されること。
     #[test]
     fn review_comment_notifies_with_body() {

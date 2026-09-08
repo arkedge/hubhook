@@ -72,9 +72,13 @@ pub struct PullRequest {
     /// team に依頼したときだけ入る
     pub requested_team: Option<common::Team>,
     pub repository: common::Repository,
-    pub organization: common::Organization,
+    // どちらも octokit の schema では required ではない。
+    // organization は個人リポジトリ、installation は GitHub App 以外の
+    // webhook で入らないので、必須にすると deserialize が失敗して
+    // 通知が止まる (どちらも読んでいないフィールド)。
+    pub organization: Option<common::Organization>,
     pub sender: common::User,
-    pub installation: common::InstallationLite,
+    pub installation: Option<common::InstallationLite>,
 }
 
 // Issue Comment & Pull-Request Comment
@@ -597,6 +601,33 @@ mod tests {
     fn requested_reviewer_is_exposed() {
         let p = de("pull_request", "pull_request.review_requested.json");
         assert_eq!(p.requested_reviewers(), vec!["octocat"]);
+    }
+
+    /// organization / installation が無い payload も deserialize できること。
+    ///
+    /// octokit の `pull_request/assigned` example には `organization` が無い
+    /// (個人リポジトリでは付かない)。必須にしていると deserialize が失敗して
+    /// 通知が止まるので、実物で確認しておく。
+    #[test]
+    fn de_pull_request_without_organization() {
+        let p = de("pull_request", "pull_request.assigned.json");
+        assert!(matches!(p, Payload::PullRequest(_)));
+
+        let logins: Vec<&str> = p.assignees().iter().map(|u| u.login.as_str()).collect();
+        assert!(!logins.is_empty(), "assignees が取れていない");
+    }
+
+    /// #87: team に review を依頼した場合、slug が取れること。
+    ///
+    /// schema は `requested_reviewer` か `requested_team` の oneOf で、
+    /// team 側の payload-example は octokit に無いので derived を使う。
+    #[test]
+    fn requested_team_is_exposed() {
+        let p = de(
+            "pull_request",
+            "pull_request.review_requested.team.derived.json",
+        );
+        assert_eq!(p.requested_reviewers(), vec!["sat-sw"]);
     }
 
     /// review_requested 以外のイベントでは reviewer は空にする。
