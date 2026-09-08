@@ -1,6 +1,14 @@
+use std::time::Duration;
+
 use serde::Serialize;
 
 use tracing::{debug, error};
+
+/// Slack への 1 リクエストのタイムアウト。
+///
+/// GitHub の webhook 配信タイムアウト (10 秒) を超えると再送されるため、
+/// 応答しない Slack を無制限に待たない。
+pub const POST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct Message {
@@ -64,7 +72,13 @@ impl Message {
         };
 
         // post
-        let client = reqwest::Client::new();
+        //
+        // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
+        // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
+        let client = reqwest::Client::builder()
+            .timeout(POST_TIMEOUT)
+            .build()
+            .expect("could not build http client");
         let r = client
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(token)
