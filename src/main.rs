@@ -5,7 +5,7 @@ use structopt::StructOpt;
 
 use serde::Deserialize;
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 
 use actix_web::error::ErrorBadRequest;
 use actix_web::{App, Error, FromRequest, HttpRequest, HttpResponse, HttpServer, Result, web};
@@ -255,8 +255,14 @@ async fn webhook(
 
     //post_test(&opt, &payload).await;
 
-    // team メンションをメンバーの @login に展開してから照合する (#286)
-    let extra_mentions = teams.expand_mentions(payload.body()).await;
+    // team メンションをメンバーの @login に展開してから照合する (#286)。
+    // body クエリを使う rule が 1 つも無ければ展開結果は使われないので、
+    // GitHub API を叩かない (repo / label / assignee だけの設定で待たされないため)。
+    let extra_mentions = if cfg.rule.iter().any(|r| r.uses_body()) {
+        teams.expand_mentions(payload.body()).await
+    } else {
+        String::new()
+    };
 
     // match rule
     let matches = payload.match_rules(&cfg.rule, &extra_mentions);
@@ -279,6 +285,17 @@ async fn webhook(
 }
 
 impl Rule {
+    /// body クエリを使っているか (include / exclude のいずれか)。
+    ///
+    /// 使っていない rule しか無いなら team を引く必要がない。
+    fn uses_body(&self) -> bool {
+        self.query.body.is_some()
+            || self
+                .exclude_query
+                .as_ref()
+                .is_some_and(|q| q.body.is_some())
+    }
+
     /// `mentions` は team メンションを展開した `@login` の列 (#286)。
     fn check_match(&self, payload: &github::Payload, mentions: &str) -> bool {
         let include_query_result = Rule::match_results(&self.query, payload, mentions)
@@ -304,20 +321,35 @@ impl Rule {
 
         let r_sender = Rule::match_query(query.user.as_ref(), &payload.sender().login);
         let r_title = Rule::match_query(query.title.as_ref(), payload.title());
-        // body クエリは 2 つの対象に当てて OR を取る。
-        //
-        // 1. 元の本文 — `@org/team$` のようなアンカー付きルールの意味を保つ。
-        //    連結したものだけに当てると、末尾一致が効かなくなる
-        //    (exclude_query 側では、除外されるべきものが除外されなくなる)。
-        // 2. 元の本文 + team 展開結果 — 展開された `@login` を拾う。
-        //    本文の文脈と組み合わせたパターン (`レビュー.*@sksat` など) も
-        //    効くように、本文を含めて連結する。区切りは改行ではなく空白
-        //    (正規表現の `.` は既定で改行に一致しないため)。
+        // body クエリは 3 つの対象に当てて OR を取る。正規表現のコンパイルは 1 回。
         let r_body = query.body.as_ref().map(|q| {
+            let Some(re) = Rule::compile_query(q) else {
+                return false;
+            };
             let body = payload.body();
-            Rule::match_query_impl(q, body)
-                || (!mentions.is_empty()
-                    && Rule::match_query_impl(q, &format!("{body} {mentions}")))
+
+            // 1. 元の本文。`@org/team$` のようなアンカー付きルールの意味を保つ。
+            //    連結したものだけに当てると末尾一致が効かなくなり、
+            //    exclude_query 側では除外されるべきものが除外されなくなる。
+            if re.is_match(body) {
+                return true;
+            }
+
+            if mentions.is_empty() {
+                return false;
+            }
+
+            // 2. 元の本文 + 展開結果。本文の文脈と組み合わせたパターン
+            //    (`レビュー.*@sksat` など) を拾う。区切りは改行ではなく空白
+            //    (正規表現の `.` は既定で改行に一致しない)。
+            if re.is_match(&format!("{body} {mentions}")) {
+                return true;
+            }
+
+            // 3. 展開された `@login` を 1 つずつ。まとめて 1 つの文字列に当てると、
+            //    `@sksat$` のようなアンカー付きルールが「たまたま最後に並んだか」で
+            //    結果が変わってしまう (並び順は展開側の都合に過ぎない)。
+            mentions.split(' ').any(|m| re.is_match(m))
         });
 
         let labels = payload.labels().iter().collect();
@@ -378,21 +410,23 @@ impl Rule {
         Some(false)
     }
 
-    fn match_query_impl(query: &str, payload: &str) -> bool {
+    /// query を正規表現にする。空クエリは警告して `None`。
+    fn compile_query(query: &str) -> Option<Regex> {
         if query.is_empty() {
             warn!("query is empty");
-            return false;
+            return None;
         }
 
-        let re = RegexBuilder::new(query)
-            .case_insensitive(true)
-            .build()
-            .unwrap();
-        if re.is_match(payload) {
-            return true;
-        }
+        Some(
+            RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        )
+    }
 
-        false
+    fn match_query_impl(query: &str, payload: &str) -> bool {
+        Rule::compile_query(query).is_some_and(|re| re.is_match(payload))
     }
 }
 

@@ -761,6 +761,59 @@ mod tests {
         );
     }
 
+    /// #286: 展開された login のマッチが並び順に依存しないこと。
+    ///
+    /// まとめて 1 つの文字列に当てると、`@sksat$` は sksat が
+    /// たまたま最後に並んだときだけ一致してしまう。
+    #[test]
+    fn expanded_member_matching_is_order_independent() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"anchored-member","display_name":"x","query":{"body":"@sksat$"}}"#,
+            )
+            .unwrap(),
+        ];
+
+        // 最後に並んでいる場合
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat").is_empty(),
+            "末尾にいるときはマッチするべき"
+        );
+
+        // 途中に並んでいる場合も同じ結果になること
+        assert!(
+            !p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            "並び順で結果が変わっている"
+        );
+    }
+
+    /// body クエリを使わない rule しか無ければ、team を引く必要がないこと。
+    #[test]
+    fn rules_without_body_query_do_not_need_expansion() {
+        let no_body: crate::Rule = serde_json::from_str(
+            r#"{"channel":"c","display_name":"x","query":{"repo":"hubhook","label":"bug"}}"#,
+        )
+        .unwrap();
+        assert!(!no_body.uses_body());
+
+        let with_body: crate::Rule =
+            serde_json::from_str(r#"{"channel":"c","display_name":"x","query":{"body":"@sksat"}}"#)
+                .unwrap();
+        assert!(with_body.uses_body());
+
+        // exclude_query 側だけで使っている場合も展開が必要
+        let exclude_body: crate::Rule = serde_json::from_str(
+            r#"{"channel":"c","display_name":"x","query":{"repo":"hubhook"},"exclude_query":{"body":"@sksat"}}"#,
+        )
+        .unwrap();
+        assert!(exclude_body.uses_body());
+    }
+
     /// #122: レビューコメント (と返信) の本文が body として取れること。
     #[test]
     fn de_pull_request_review_comment() {
