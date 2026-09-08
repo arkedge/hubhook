@@ -127,6 +127,13 @@ pub struct MessagePayload {
     pub text: String,
     pub fallback: Option<String>,
     pub attachments: Option<Vec<Attachment>>,
+    /// 本文中のリンクを unfurl させない。
+    ///
+    /// 既定では Slack が URL を展開してプレビューを付けるため、repo や
+    /// アカウントをリンクにすると通知が縦に伸びて読みにくくなる。
+    /// 既定値に依存せず明示的に切る。
+    pub unfurl_links: bool,
+    pub unfurl_media: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,6 +364,8 @@ impl Message {
             text: self.text,
             fallback: None,
             attachments: self.attachments,
+            unfurl_links: false,
+            unfurl_media: false,
         };
 
         match post(&client, base, token, &payload, POST_BUDGET).await {
@@ -425,6 +434,8 @@ mod tests {
             username: None,
             text: "summary".to_string(),
             fallback: None,
+            unfurl_links: false,
+            unfurl_media: false,
             attachments: Some(vec![attachment(body)]),
         }
     }

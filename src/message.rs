@@ -34,10 +34,10 @@ impl TryFrom<&github::Payload> for slack::Message {
     }
 }
 
-/// リンクの記法。同じ内容でも、入れる場所によって解釈される方言が違う。
+/// リンクの記法。同じメッセージでも場所によって解釈される方言が違う。
 ///
-/// - markdown ブロック: `[text](url)`
-/// - attachment の `text` (mrkdwn): `<url|text>`
+/// - トップレベルの `text` は mrkdwn なので `<url|text>`
+/// - attachment の本文は markdown ブロックなので `[text](url)`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkStyle {
     Mrkdwn,
@@ -53,13 +53,26 @@ impl LinkStyle {
     }
 }
 
+/// リポジトリ名をリンクにする (トップレベルの `text` 用)。
+fn repo_link(repo: &github::common::Repository) -> String {
+    LinkStyle::Mrkdwn.link(&repo.full_name, repo.html_url.as_str())
+}
+
+/// アカウント名をリンクにする (トップレベルの `text` 用)。
+fn user_link(user: &github::common::User) -> String {
+    LinkStyle::Mrkdwn.link(&user.login, user.html_url.as_str())
+}
+
 /// Assignees の行。入れる場所の方言に合わせて作る。
+///
+/// 1 人 1 行で並べると人数の分だけ縦に伸びて本文が見えなくなるので、
+/// `Assignees: a, b, c` の 1 行にまとめる。
 fn assignees_line(
     assignees: &[github::common::User],
     style: LinkStyle,
     bold: &str,
 ) -> Option<String> {
-    users2str(assignees, "\n", Some(style)).map(|a| format!("{bold}Assignees{bold}\n{a}"))
+    users2str(assignees, ", ", Some(style)).map(|a| format!("{bold}Assignees{bold}: {a}"))
 }
 
 /// 本文の後ろに Assignees を足す。
@@ -140,11 +153,12 @@ impl TryFrom<&github::Issues> for slack::Message {
                     info!("IssuesAction::Opened: issue.assignee = {assign}");
                 }
 
-                // ここにユーザへのリンクを入れるとGitHub Appが破壊するので入れない(#13)
+                // 以前はここにリンクを入れると unfurl でメッセージが崩れていたため
+                // 避けていたが、post 時に unfurl を明示的に切ったのでリンクにできる
                 let text = format!(
                     "[{repo}] Issue created by {user}",
-                    repo = repo.full_name,
-                    user = user.login
+                    repo = repo_link(repo),
+                    user = user_link(user)
                 );
 
                 let attach = {
@@ -189,8 +203,9 @@ impl TryFrom<&github::Issues> for slack::Message {
 
                 let text = format!(
                     "[{}] Issue assigned to {}",
-                    repo.full_name,
-                    users2str(assignees, ", ", None).expect("no assignees on issue assigned event")
+                    repo_link(repo),
+                    users2str(assignees, ", ", Some(LinkStyle::Mrkdwn))
+                        .expect("no assignees on issue assigned event")
                 );
 
                 let attach = {
@@ -231,8 +246,8 @@ impl TryFrom<&github::PullRequest> for slack::Message {
             github::PullRequestAction::Opened => {
                 let text = format!(
                     "[{repo}] Pull Request opened by {user}",
-                    repo = repo.full_name,
-                    user = pr.user.login
+                    repo = repo_link(repo),
+                    user = user_link(&pr.user)
                 );
 
                 let attach = {
@@ -266,16 +281,20 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                     &pull_request.requested_reviewer,
                     &pull_request.requested_team,
                 ) {
-                    (Some(user), _) => user.login.clone(),
-                    (None, Some(team)) => format!("team {slug}", slug = team.slug),
+                    (Some(user), _) => user_link(user),
+                    (None, Some(team)) => match &team.html_url {
+                        Some(url) => LinkStyle::Mrkdwn
+                            .link(&format!("team {slug}", slug = team.slug), url.as_str()),
+                        None => format!("team {slug}", slug = team.slug),
+                    },
                     // user も team も無い payload は想定していないので通知しない
                     (None, None) => return Err(()),
                 };
 
                 let text = format!(
                     "[{repo}] {sender} requested a review from {requested}",
-                    repo = repo.full_name,
-                    sender = pull_request.sender.login,
+                    repo = repo_link(repo),
+                    sender = user_link(&pull_request.sender),
                 );
 
                 let attach = {
@@ -307,9 +326,9 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                 assert!(!assignees.is_empty());
 
                 let text = {
-                    let repo = &repo.full_name;
-                    let assignees = users2str(assignees, ", ", None)
-                        .expect("no assignees on issue assigned event");
+                    let repo = repo_link(repo);
+                    let assignees = users2str(assignees, ", ", Some(LinkStyle::Mrkdwn))
+                        .expect("no assignees on pull request assigned event");
                     format!("[{repo}] Pull Request assigned to {assignees}",)
                 };
 
@@ -347,7 +366,6 @@ impl TryFrom<&github::IssueComment> for slack::Message {
         let issue = &issue_comment.issue;
         let comment = &issue_comment.comment;
         let ic_link = &comment.html_url;
-        let username = &comment.user.login;
 
         match issue_comment.action {
             github::IssueCommentAction::Created => {
@@ -360,7 +378,8 @@ impl TryFrom<&github::IssueComment> for slack::Message {
                 };
                 let text = format!(
                     "[{repo_name}] New comment by {username} on {typ} <{ic_link}|#{number}: {title}>",
-                    repo_name = repo.full_name,
+                    repo_name = repo_link(repo),
+                    username = user_link(&comment.user),
                     number = issue.number,
                     title = issue.title
                 );
@@ -412,8 +431,8 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
 
         let text = format!(
             "[{repo}] {user} {verb} pull request <{link}|#{number}: {title}>",
-            repo = repo.full_name,
-            user = r.user.login,
+            repo = repo_link(repo),
+            user = user_link(&r.user),
             link = r.html_url,
             number = pr.number,
             title = pr.title,
@@ -463,8 +482,8 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
 
         let text = format!(
             "[{repo}] {kind} by {user} on pull request <{link}|#{number}: {title}>",
-            repo = repo.full_name,
-            user = comment.user.login,
+            repo = repo_link(repo),
+            user = user_link(&comment.user),
             link = comment.html_url,
             number = pr.number,
             title = pr.title,
@@ -488,7 +507,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
 
 #[cfg(test)]
 mod tests {
-    use super::with_assignees;
+    use super::{LinkStyle, assignees_line, with_assignees};
     use crate::github::testing::de;
     use crate::slack;
 
@@ -627,8 +646,8 @@ mod tests {
 
         let body = msg.attachments.as_ref().unwrap()[0].body.blocks()[0].text();
         assert!(
-            body.contains("**Assignees**"),
-            "太字が Markdown でない: {body}"
+            body.contains("**Assignees**: "),
+            "1 行になっていない: {body}"
         );
         assert!(
             body.contains("[Codertocat](https://github.com/Codertocat)"),
@@ -663,14 +682,41 @@ mod tests {
     #[test]
     fn assignees_are_separated_from_the_body_by_a_blank_line() {
         assert_eq!(
-            with_assignees("本文", Some("**Assignees**\nsksat".to_string())),
-            "本文\n\n**Assignees**\nsksat"
+            with_assignees("本文", Some("**Assignees**: sksat".to_string())),
+            "本文\n\n**Assignees**: sksat"
         );
         assert_eq!(
             with_assignees("本文", None),
             "本文",
             "余計な改行が付いている"
         );
+    }
+
+    /// Assignees が 1 行にまとまること。
+    ///
+    /// 1 人 1 行で並べると人数の分だけ縦に伸びて、本文が見えなくなる。
+    #[test]
+    fn assignees_are_on_one_line() {
+        let payload = de(
+            "pull_request",
+            "pull_request.assigned.two-assignees.derived.json",
+        );
+        let assignees = payload.assignees();
+        assert_eq!(assignees.len(), 2, "2 人以上の fixture が必要");
+
+        // 入れる場所によって方言が違うので、両方確かめる
+        for (style, bold) in [(LinkStyle::Markdown, "**"), (LinkStyle::Mrkdwn, "*")] {
+            let line = assignees_line(assignees, style, bold).expect("Assignees が無い");
+
+            assert!(!line.contains('\n'), "1 行に収まっていない: {line:?}");
+            for (login, url) in [
+                ("Codertocat", "https://github.com/Codertocat"),
+                ("octocat", "http://github.com/octocat"),
+            ] {
+                let link = style.link(login, url);
+                assert!(line.contains(&link), "{link} が無い: {line}");
+            }
+        }
     }
 
     /// 主となるブロックは Markdown、退避先は mrkdwn になること。
@@ -707,6 +753,29 @@ mod tests {
         );
     }
 
+    /// repo とアカウントがトップレベルの text でリンクになること。
+    ///
+    /// トップレベルは mrkdwn なので `<url|text>` 記法。
+    #[test]
+    fn repo_and_user_are_linked_in_text() {
+        let msg = message(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.with-organization.json",
+        )
+        .expect("通知されるべき");
+
+        assert!(
+            msg.text.contains("|Codertocat/Hello-World>"),
+            "repo がリンクになっていない: {}",
+            msg.text
+        );
+        assert!(
+            msg.text.contains("|Codertocat>"),
+            "アカウントがリンクになっていない: {}",
+            msg.text
+        );
+    }
+
     /// 本文が無い PR でもブロックを作らず、通知は飛ぶこと。
     ///
     /// 空の `text` を持つ markdown ブロックを送ると `invalid_blocks` で
@@ -739,10 +808,11 @@ mod tests {
         let msg = message("pull_request", "pull_request.review_requested.json")
             .expect("review request は通知されるべき");
         assert!(
-            msg.text.contains("requested a review from octocat"),
-            "text = {}",
+            msg.text.contains("requested a review from <"),
+            "依頼先がリンクになっていない: {}",
             msg.text
         );
+        assert!(msg.text.contains("|octocat>"), "text = {}", msg.text);
     }
 
     /// #87: team への review request が team 名で通知されること。
@@ -755,8 +825,8 @@ mod tests {
         .expect("team への review request も通知されるべき");
 
         assert!(
-            msg.text.contains("requested a review from team octo-team"),
-            "text = {}",
+            msg.text.contains("|team octo-team>"),
+            "team がリンクになっていない: {}",
             msg.text
         );
     }
