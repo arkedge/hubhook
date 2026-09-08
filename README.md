@@ -23,6 +23,8 @@ Edit config.json.
 |title|Issue title|
 |body|Issue / Issue Comment / review / review comment の本文|
 |label|Issue label|
+|assignee|Issue / PR の assignee の login|
+|reviewer|review を依頼された user の login、または team の slug|
 |review_state|`pull_request_review` の state (`approved` / `changes_requested` / `commented`)|
 
 ### Notified events

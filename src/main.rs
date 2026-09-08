@@ -73,6 +73,10 @@ pub struct Query {
     title: Option<String>,
     body: Option<String>,
     label: Option<String>,
+    /// Issue / PR の assignee の login (#41)
+    assignee: Option<String>,
+    /// review を依頼された user の login、または team の slug (#87)
+    reviewer: Option<String>,
     /// `pull_request_review` の state (`approved` / `changes_requested` / `commented`)。
     /// review 以外のイベントに対しては常に不一致になる (#285)。
     review_state: Option<String>,
@@ -288,6 +292,14 @@ impl Rule {
         let labels = payload.labels().iter().collect();
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);
 
+        let assignees = payload.assignees().iter().collect();
+        let r_assignee = Rule::match_query_vec(query.assignee.as_ref(), assignees);
+
+        // review を依頼されたイベント以外では空なので、reviewer を指定した rule は
+        // review_requested にしかマッチしない
+        let r_reviewer =
+            Rule::match_query_vec(query.reviewer.as_ref(), payload.requested_reviewers());
+
         // review_state を持たないイベントには、query が指定されていれば必ず不一致を返す。
         // 空文字を照合対象にすると、query は正規表現なので `.*` や `^$` のような
         // パターンがマッチしてしまい、review 以外のイベントまで通知されてしまう
@@ -305,6 +317,8 @@ impl Rule {
             r_title,
             r_body,
             r_labels,
+            r_assignee,
+            r_reviewer,
             r_review_state,
         ]
         .into_iter()

@@ -66,6 +66,11 @@ pub struct PullRequest {
     pub action: PullRequestAction,
     number: Option<usize>, // あったりなかったりする？
     pub pull_request: common::PullRequest,
+    /// `review_requested` / `review_request_removed` で、
+    /// user に依頼したときだけ入る (#87)
+    pub requested_reviewer: Option<common::User>,
+    /// team に依頼したときだけ入る
+    pub requested_team: Option<common::Team>,
     pub repository: common::Repository,
     pub organization: common::Organization,
     pub sender: common::User,
@@ -294,6 +299,40 @@ impl Payload {
             Payload::PullRequestReview(review) => &review.review.html_url,
             Payload::PullRequestReviewComment(comment) => &comment.comment.url,
         }
+    }
+
+    /// assignee のマッチ対象 (#41)。
+    pub fn assignees(&self) -> &[common::User] {
+        match &self {
+            Payload::Issues(issues) => &issues.issue.assignees,
+            Payload::IssueComment(icomment) => &icomment.issue.assignees,
+            Payload::PullRequest(pr) => &pr.pull_request.assignees,
+            Payload::PullRequestReview(review) => &review.pull_request.assignees,
+            Payload::PullRequestReviewComment(comment) => &comment.pull_request.assignees,
+        }
+    }
+
+    /// review を依頼された相手の名前 (user は login、team は slug) (#87)。
+    ///
+    /// `pull_request.requested_reviewers` (依頼中の全員) ではなく、
+    /// **そのイベントで新たに依頼された相手**だけを返す。全員を返すと、
+    /// PR への commit やコメントごとに reviewer 全員へ通知が飛んでしまう。
+    pub fn requested_reviewers(&self) -> Vec<&str> {
+        let Payload::PullRequest(pr) = self else {
+            return Vec::new();
+        };
+        if pr.action != PullRequestAction::ReviewRequested {
+            return Vec::new();
+        }
+
+        let mut reviewers = Vec::new();
+        if let Some(user) = &pr.requested_reviewer {
+            reviewers.push(user.login.as_str());
+        }
+        if let Some(team) = &pr.requested_team {
+            reviewers.push(team.slug.as_str());
+        }
+        reviewers
     }
 
     /// `pull_request_review` の review state (`approved` / `changes_requested` /
@@ -540,6 +579,44 @@ mod tests {
         );
         assert_eq!(p.review_state(), Some("approved"));
         assert!(p.body().contains("@sksat"), "body = {:?}", p.body());
+    }
+
+    /// #41: assignee の login がマッチ対象として取れること。
+    #[test]
+    fn assignees_are_exposed() {
+        let p = de(
+            "pull_request",
+            "pull_request.assigned.with-organization.json",
+        );
+        let logins: Vec<&str> = p.assignees().iter().map(|u| u.login.as_str()).collect();
+        assert_eq!(logins, vec!["Codertocat"]);
+    }
+
+    /// #87: review を依頼された相手が取れること。
+    #[test]
+    fn requested_reviewer_is_exposed() {
+        let p = de("pull_request", "pull_request.review_requested.json");
+        assert_eq!(p.requested_reviewers(), vec!["octocat"]);
+    }
+
+    /// review_requested 以外のイベントでは reviewer は空にする。
+    /// ここが空でないと、PR への commit やコメントごとに reviewer 全員へ
+    /// 通知が飛んでしまう。
+    #[test]
+    fn requested_reviewers_are_empty_for_other_events() {
+        let p = de(
+            "pull_request",
+            "pull_request.assigned.with-organization.json",
+        );
+        assert!(p.requested_reviewers().is_empty());
+
+        // review イベント側の PR にも requested_reviewers は入っているが、
+        // 「今依頼された」わけではないので空にする
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.approved.derived.json",
+        );
+        assert!(p.requested_reviewers().is_empty());
     }
 
     /// #122: レビューコメント (と返信) の本文が body として取れること。

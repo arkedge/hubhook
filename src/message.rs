@@ -208,6 +208,48 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                 Ok(Self { text, attachments })
             }
 
+            // #87: review を依頼されたことを通知する
+            github::PullRequestAction::ReviewRequested => {
+                let requested = match (
+                    &pull_request.requested_reviewer,
+                    &pull_request.requested_team,
+                ) {
+                    (Some(user), _) => user.login.clone(),
+                    (None, Some(team)) => format!("team {slug}", slug = team.slug),
+                    // user も team も無い payload は想定していないので通知しない
+                    (None, None) => return Err(()),
+                };
+
+                let text = format!(
+                    "[{repo}] {sender} requested a review from {requested}",
+                    repo = repo.full_name,
+                    sender = pull_request.sender.login,
+                );
+
+                let attach = {
+                    let title = Some(format!(
+                        "#{number} {title}",
+                        number = pr.number,
+                        title = pr.title
+                    ));
+                    let title_link = Some(pr.html_url.clone());
+
+                    slack::Attachment {
+                        title,
+                        title_link,
+                        fallback: pr.title.to_string(),
+                        text: pr.body.as_deref().unwrap_or("").to_string(),
+                        // 「対応してほしい」通知なので opened / assigned とは色を変える
+                        color: Some(slack::Color::Warning),
+                    }
+                };
+
+                Ok(Self {
+                    text,
+                    attachments: Some(vec![attach]),
+                })
+            }
+
             github::PullRequestAction::Assigned => {
                 let assignees = &pr.assignees;
                 assert!(!assignees.is_empty());
@@ -482,6 +524,18 @@ mod tests {
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(!attach.text.is_empty(), "attachment の本文が空");
         assert_eq!(attach.text, attach.fallback);
+    }
+
+    /// #87: review request が通知されること。
+    #[test]
+    fn review_requested_notifies() {
+        let msg = message("pull_request", "pull_request.review_requested.json")
+            .expect("review request は通知されるべき");
+        assert!(
+            msg.text.contains("requested a review from octocat"),
+            "text = {}",
+            msg.text
+        );
     }
 
     /// #122: レビューコメントが本文付きで通知されること。
