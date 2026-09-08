@@ -192,8 +192,8 @@ pub struct PullRequest {
     pub merge_commit_sha: Option<String>,
     pub assignee: Option<User>, // Issueと挙動が違う？
     pub assignees: Vec<User>,
-    pub requested_reviewers: Option<IgnoredAny>, // TODO: user か team
-    pub requested_teams: Option<IgnoredAny>,     // TODO: これは確実にteam
+    pub requested_reviewers: Vec<Reviewer>,
+    pub requested_teams: Vec<Team>,
     pub labels: Vec<Label>,
     pub milestone: Option<IgnoredAny>,
     pub draft: bool,
@@ -291,8 +291,8 @@ pub struct SimplePullRequest {
     pub merge_commit_sha: Option<String>,
     pub assignee: Option<User>,
     pub assignees: Vec<User>,
-    pub requested_reviewers: Option<IgnoredAny>,
-    pub requested_teams: Option<IgnoredAny>,
+    pub requested_reviewers: Vec<Reviewer>,
+    pub requested_teams: Vec<Team>,
     pub labels: Vec<Label>,
     pub milestone: Option<IgnoredAny>,
     /// `pull_request_review_comment` の payload には無い
@@ -366,6 +366,50 @@ pub struct ReviewComment {
     pub subject_type: Option<String>,
 }
 
+/// GitHub team。`requested_team` / `requested_teams` に入る。
+///
+/// team の review request を扱った payload-example が octokit に無く、実物で
+/// 検証できていないため、`slug` などマッチに使うものだけ必須にして残りは Option。
+/// 必須フィールドを増やすと deserialize 失敗で通知が止まる。
+#[derive(Debug, Deserialize)]
+pub struct Team {
+    pub name: String,
+    pub slug: String,
+    pub id: usize,
+    pub node_id: String,
+    pub description: Option<String>,
+    pub privacy: Option<String>,
+    pub notification_setting: Option<String>,
+    pub permission: Option<String>,
+    pub url: Option<Url>,
+    pub html_url: Option<Url>,
+    pub members_url: Option<String>,
+    pub repositories_url: Option<Url>,
+    pub parent: Option<IgnoredAny>,
+}
+
+/// `pull_request.requested_reviewers` の 1 要素。
+///
+/// GitHub のスキーマ上ここは user と team が混ざりうる。untagged enum にすると
+/// 1 フィールドの不一致で全体が失敗する (#311) ので、user なら `login`、
+/// team なら `slug` が入る形で両方を受け取れる型にしている。
+#[derive(Debug, Deserialize)]
+pub struct Reviewer {
+    /// user のときだけ入る
+    pub login: Option<String>,
+    /// team のときだけ入る
+    pub slug: Option<String>,
+    pub id: usize,
+    pub node_id: String,
+}
+
+impl Reviewer {
+    /// マッチに使う名前。user なら login、team なら slug。
+    pub fn name(&self) -> Option<&str> {
+        self.login.as_deref().or(self.slug.as_deref())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Label {
     pub id: usize,
@@ -408,6 +452,14 @@ impl Issue {
 impl<'a> From<&'a Label> for &'a str {
     fn from(label: &'a Label) -> &'a str {
         &label.name
+    }
+}
+
+// Label と同じく、Rule::match_query_vec の `T: ToString` 境界に &User を
+// 渡せるようにする。assignee のマッチ (#41) で使う。
+impl std::fmt::Display for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.login)
     }
 }
 
