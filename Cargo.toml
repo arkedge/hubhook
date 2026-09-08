@@ -15,7 +15,7 @@ actix-web = "4.9.0"
 crypto-hashes = "0.10.0"
 futures = "0.3.30"
 hex = "0.4.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 regex = "1.10.4"
 reqwest = { version = "0.13.0", features = ["json"] }
 sentry = "0.49.0"
