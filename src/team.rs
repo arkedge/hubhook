@@ -19,8 +19,13 @@ const CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 /// 1 ページあたりの取得件数 (GitHub API の最大値)。
 const PER_PAGE: usize = 100;
 
-/// ページを辿る上限。API が常に満杯のページを返しても止まるようにする。
-const MAX_PAGES: usize = 20;
+/// 取得するメンバー数の上限。これを **超える** team はエラーにする。
+///
+/// ページ数で数えると、最終ページが満杯だった時点では「上限を超えている」と
+/// 断定できず、ちょうど上限ぴったりの team を誤って弾いてしまう
+/// (満杯の次が空ページかどうかは、引かないと分からない)。
+/// 実際に集まった人数で判定すれば境界を正しく扱える。
+const MAX_MEMBERS: usize = 2000;
 
 /// GitHub API 1 リクエストのタイムアウト。
 ///
@@ -88,8 +93,10 @@ pub enum Error {
     Status(reqwest::StatusCode),
     /// 直前の取得が失敗していて、まだ再取得の時期ではない
     CachedFailure,
-    /// ページ上限を超えた。一部だけ返すと通知が静かに欠けるのでエラーにする
+    /// メンバー数の上限を超えた。一部だけ返すと通知が静かに欠けるのでエラーにする
     TooManyMembers,
+    /// 展開に使える時間を使い切った
+    BudgetExceeded,
 }
 
 impl std::fmt::Display for Error {
@@ -99,9 +106,8 @@ impl std::fmt::Display for Error {
             Self::Request(e) => write!(f, "request failed: {e}"),
             Self::Status(s) => write!(f, "unexpected status: {s}"),
             Self::CachedFailure => write!(f, "previous lookup failed (cached)"),
-            Self::TooManyMembers => {
-                write!(f, "team has more than {} members", PER_PAGE * MAX_PAGES)
-            }
+            Self::TooManyMembers => write!(f, "team has more than {MAX_MEMBERS} members"),
+            Self::BudgetExceeded => write!(f, "expansion budget exceeded"),
         }
     }
 }
@@ -117,6 +123,8 @@ impl From<reqwest::Error> for Error {
 pub struct TeamResolver {
     client: reqwest::Client,
     token: Option<String>,
+    /// GitHub API の base URL。テストで差し替える。
+    base_url: String,
     /// `@org/team` を拾う。org / team slug に使える文字は英数と `-`、
     /// team slug には `_` と `.` も入りうる。
     mention: Regex,
@@ -125,6 +133,10 @@ pub struct TeamResolver {
 
 impl TeamResolver {
     pub fn new(token: Option<String>) -> Self {
+        Self::with_base_url(token, "https://api.github.com".to_string())
+    }
+
+    fn with_base_url(token: Option<String>, base_url: String) -> Self {
         // docker-compose などで `GITHUB_TOKEN=${GITHUB_TOKEN}` と書くと、
         // 未設定でも空文字が入って Some("") になる。空 token で API を叩いても
         // 401 になるだけなので、未設定として扱う。
@@ -143,6 +155,7 @@ impl TeamResolver {
                 .build()
                 .expect("could not build http client"),
             token,
+            base_url,
             mention: Regex::new(r"@([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)")
                 .expect("invalid team mention regex"),
             cache: RwLock::new(HashMap::new()),
@@ -167,12 +180,12 @@ impl TeamResolver {
             return String::new();
         }
 
-        let started = Instant::now();
+        let deadline = Instant::now() + TOTAL_EXPAND_BUDGET;
 
         let mut mentions: Vec<String> = Vec::new();
         for (i, (org, slug)) in teams.iter().enumerate() {
-            // 直列に引くので、全体の経過時間で打ち切る
-            if started.elapsed() >= TOTAL_EXPAND_BUDGET {
+            // 直列に引くので、全体の残り時間で打ち切る
+            if Instant::now() >= deadline {
                 let msg = format!(
                     "team expansion budget exceeded; {} team(s) left unexpanded",
                     teams.len() - i
@@ -182,15 +195,12 @@ impl TeamResolver {
                 break;
             }
 
-            match self.members(org, slug).await {
+            match self.members(org, slug, deadline).await {
                 Ok(members) => {
                     debug!("expanded @{org}/{slug} to {} member(s)", members.len());
-                    for m in members {
-                        let mention = format!("@{m}");
-                        if !mentions.contains(&mention) {
-                            mentions.push(mention);
-                        }
-                    }
+                    // 重複判定を contains でやると人数の 2 乗になる
+                    // (8 team × 2000 人で 1 億回規模の比較)。あとで一括で潰す。
+                    mentions.extend(members.into_iter().map(|m| format!("@{m}")));
                 }
                 // 失敗はキャッシュしてあるので、同じ内容を Sentry に積み続けない
                 Err(Error::CachedFailure) => {
@@ -204,6 +214,11 @@ impl TeamResolver {
                 }
             }
         }
+
+        // team 間で重複する人を潰す。順序は照合結果に影響しないが、
+        // テストが安定するように sort してから dedup する。
+        mentions.sort_unstable();
+        mentions.dedup();
 
         mentions.join(" ")
     }
@@ -232,7 +247,12 @@ impl TeamResolver {
     }
 
     /// team のメンバーの login。キャッシュがあればそれを返す。
-    async fn members(&self, org: &str, slug: &str) -> Result<Vec<String>, Error> {
+    async fn members(
+        &self,
+        org: &str,
+        slug: &str,
+        deadline: Instant,
+    ) -> Result<Vec<String>, Error> {
         let key = format!("{org}/{slug}");
 
         // await をまたいでロックを持たないように、スコープを切って読む
@@ -245,7 +265,7 @@ impl TeamResolver {
             }
         }
 
-        let result = self.fetch_members(org, slug).await;
+        let result = self.fetch_members(org, slug, deadline).await;
 
         // token 未設定は team ごとの失敗ではないのでキャッシュしない
         if !matches!(result, Err(Error::NoToken)) {
@@ -278,7 +298,12 @@ impl TeamResolver {
         );
     }
 
-    async fn fetch_members(&self, org: &str, slug: &str) -> Result<Vec<String>, Error> {
+    async fn fetch_members(
+        &self,
+        org: &str,
+        slug: &str,
+        deadline: Instant,
+    ) -> Result<Vec<String>, Error> {
         let token = self.token.as_deref().ok_or(Error::NoToken)?;
 
         let mut members = Vec::new();
@@ -287,9 +312,15 @@ impl TeamResolver {
         // メンバーが PER_PAGE を超える team もあるので、最後のページまで辿る。
         // 途中で打ち切ると、その人には通知が飛ばなくなる。
         loop {
+            // 1 リクエストごとのタイムアウトだけでは、ページ数だけ合計が伸びる。
+            // ページを進める前に全体の残り時間を見る。
+            if Instant::now() >= deadline {
+                return Err(Error::BudgetExceeded);
+            }
+
             let url = format!(
-                "https://api.github.com/orgs/{org}/teams/{slug}/members\
-                 ?per_page={PER_PAGE}&page={page}"
+                "{base}/orgs/{org}/teams/{slug}/members?per_page={PER_PAGE}&page={page}",
+                base = self.base_url
             );
 
             let res = self
@@ -310,17 +341,18 @@ impl TeamResolver {
             let n = batch.len();
             members.extend(batch.into_iter().map(|m| m.login));
 
+            // 一部だけ返してキャッシュすると、載らなかった人に通知が飛ばず、
+            // しかも 10 分そのままなので静かに壊れる。
+            // 部分的な結果は返さず、エラーにして気付けるようにする。
+            if members.len() > MAX_MEMBERS {
+                return Err(Error::TooManyMembers);
+            }
+
             if n < PER_PAGE {
                 break;
             }
 
             page += 1;
-            if page > MAX_PAGES {
-                // 一部だけ返してキャッシュすると、載らなかった人に通知が
-                // 飛ばなくなる。しかも 10 分そのままなので静かに壊れる。
-                // 部分的な結果は返さず、エラーにして気づけるようにする。
-                return Err(Error::TooManyMembers);
-            }
         }
 
         info!("fetched {} member(s) of @{org}/{slug}", members.len());
@@ -335,6 +367,151 @@ mod tests {
 
     fn resolver() -> TeamResolver {
         TeamResolver::new(None)
+    }
+
+    /// `GET /orgs/{org}/teams/{slug}/members` を返すテスト用サーバを立て、
+    /// base URL を返す。`page_sizes` は各ページで返す件数。
+    ///
+    /// HTTP パスを実際に通さないと、pagination や非 2xx 時の fail-open が
+    /// 壊れても気付けない (実際どちらも一度壊している)。
+    fn spawn_api(page_sizes: Vec<usize>, status: u16) -> String {
+        use actix_web::{App, HttpResponse, HttpServer, web};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let sizes = Arc::new(page_sizes);
+
+        let srv = HttpServer::new(move || {
+            let sizes = sizes.clone();
+            App::new().route(
+                "/orgs/{org}/teams/{slug}/members",
+                web::get().to(move |q: web::Query<HashMap<String, String>>| {
+                    let sizes = sizes.clone();
+                    async move {
+                        if status != 200 {
+                            return HttpResponse::build(
+                                actix_web::http::StatusCode::from_u16(status).unwrap(),
+                            )
+                            .finish();
+                        }
+
+                        let page: usize = q.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+                        let n = sizes.get(page - 1).copied().unwrap_or(0);
+                        let body: Vec<serde_json::Value> = (0..n)
+                            .map(|i| serde_json::json!({ "login": format!("u{page}_{i}") }))
+                            .collect();
+
+                        HttpResponse::Ok().json(body)
+                    }
+                }),
+            )
+        })
+        .bind("127.0.0.1:0")
+        .expect("could not bind test server");
+
+        let addr = srv.addrs()[0];
+        actix_web::rt::spawn(srv.run());
+
+        format!("http://{addr}")
+    }
+
+    fn api_resolver(base: String) -> TeamResolver {
+        TeamResolver::with_base_url(Some("dummy-token".to_string()), base)
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    /// 最後の (満杯でない) ページまで辿ること。
+    #[actix_web::test]
+    async fn paginates_until_short_page() {
+        let r = api_resolver(spawn_api(vec![PER_PAGE, PER_PAGE, 7], 200));
+        let members = r
+            .members("arkedge", "sat-sw", far_deadline())
+            .await
+            .expect("取得できるべき");
+
+        assert_eq!(members.len(), PER_PAGE * 2 + 7);
+    }
+
+    /// ちょうど上限ぴったりの team は受け入れること。
+    ///
+    /// ページ数で判定していた頃は、満杯のページが続いた時点で
+    /// 「上限超え」と誤判定して弾いていた。
+    #[actix_web::test]
+    async fn exactly_max_members_is_accepted() {
+        let mut sizes = vec![PER_PAGE; MAX_MEMBERS / PER_PAGE];
+        sizes.push(0); // 満杯の次は空ページ
+        let r = api_resolver(spawn_api(sizes, 200));
+
+        let members = r
+            .members("arkedge", "sat-sw", far_deadline())
+            .await
+            .expect("ちょうど上限なら受け入れるべき");
+
+        assert_eq!(members.len(), MAX_MEMBERS);
+    }
+
+    /// 上限を超える team はエラーにすること (一部だけ返さない)。
+    #[actix_web::test]
+    async fn more_than_max_members_is_an_error() {
+        let sizes = vec![PER_PAGE; MAX_MEMBERS / PER_PAGE + 1];
+        let r = api_resolver(spawn_api(sizes, 200));
+
+        let err = r
+            .members("arkedge", "sat-sw", far_deadline())
+            .await
+            .expect_err("上限超えはエラーにするべき");
+
+        assert!(matches!(err, Error::TooManyMembers), "{err}");
+    }
+
+    /// 非 2xx のときは展開せずに空文字を返すこと (fail-open)。
+    #[actix_web::test]
+    async fn non_success_status_fails_open() {
+        let r = api_resolver(spawn_api(vec![], 403));
+        assert_eq!(r.expand_mentions("@arkedge/sat-sw おねがい").await, "");
+    }
+
+    /// 取得できた team メンバーが @login として展開されること。
+    #[actix_web::test]
+    async fn members_are_expanded_as_mentions() {
+        let r = api_resolver(spawn_api(vec![2], 200));
+        let expanded = r.expand_mentions("@arkedge/sat-sw おねがい").await;
+
+        assert_eq!(expanded, "@u1_0 @u1_1");
+    }
+
+    /// 予算を使い切っていたら API を叩かずエラーにすること。
+    #[actix_web::test]
+    async fn exhausted_budget_stops_before_request() {
+        let r = api_resolver(spawn_api(vec![1], 200));
+        let past = Instant::now() - Duration::from_secs(1);
+
+        let err = r
+            .members("arkedge", "sat-sw", past)
+            .await
+            .expect_err("予算切れならエラーにするべき");
+
+        assert!(matches!(err, Error::BudgetExceeded), "{err}");
+    }
+
+    /// 2 回目は API を叩かずキャッシュから返すこと。
+    #[actix_web::test]
+    async fn second_lookup_hits_cache() {
+        let r = api_resolver(spawn_api(vec![3], 200));
+
+        let first = r
+            .members("arkedge", "sat-sw", far_deadline())
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 3);
+
+        // キャッシュに載っているので、予算切れでも返る
+        let past = Instant::now() - Duration::from_secs(1);
+        let second = r.members("arkedge", "sat-sw", past).await.unwrap();
+        assert_eq!(second, first);
     }
 
     /// body から team メンションだけを拾えること。
