@@ -26,6 +26,9 @@ const MAX_MARKDOWN_CHARS: usize = 11_000;
 /// 切り詰めたことを示す印。
 const TRUNCATION_MARK: &str = "\n\n_(truncated)_";
 
+/// 開いたままのコードフェンスを閉じるための文字列。
+const FENCE_CLOSE: &str = "\n```";
+
 #[derive(Debug)]
 pub struct Message {
     pub text: String,
@@ -96,10 +99,16 @@ impl Block {
         let room = MAX_MARKDOWN_CHARS.saturating_sub(suffix_len);
 
         let text = if body.chars().count() > room {
-            let head: String = body
-                .chars()
-                .take(room.saturating_sub(TRUNCATION_MARK.chars().count()))
-                .collect();
+            let reserve = TRUNCATION_MARK.chars().count() + FENCE_CLOSE.chars().count();
+            let mut head: String = body.chars().take(room.saturating_sub(reserve)).collect();
+
+            // フェンスの途中で切ると閉じ記号が失われ、後続の印と suffix が
+            // 未終了のコードブロックに飲まれる。せっかく suffix の場所を
+            // 確保しても、リンクがただの文字列として表示されてしまう。
+            if head.matches("```").count() % 2 == 1 {
+                head.push_str(FENCE_CLOSE);
+            }
+
             format!("{head}{TRUNCATION_MARK}{suffix}")
         } else {
             format!("{body}{suffix}")
@@ -240,6 +249,30 @@ mod tests {
         assert!(block.text().ends_with(suffix), "末尾が消えている");
         assert!(
             block.text().chars().count() <= MAX_MARKDOWN_CHARS,
+            "上限を超えている"
+        );
+    }
+
+    /// フェンスの途中で切っても、後続が飲まれないこと。
+    ///
+    /// 閉じ記号が失われると、印と suffix が未終了のコードブロックの中身に
+    /// なってしまい、Assignees のリンクがただの文字列として表示される。
+    #[test]
+    fn truncation_closes_an_open_code_fence() {
+        let body = format!("```\n{}", "a".repeat(MAX_MARKDOWN_CHARS));
+        let suffix = "\n\n**Assignees**: sksat";
+        let block = Block::markdown(&body, suffix).unwrap();
+        let text = block.text();
+
+        assert_eq!(
+            text.matches("```").count() % 2,
+            0,
+            "フェンスが閉じていない: {}",
+            &text[text.len().saturating_sub(80)..]
+        );
+        assert!(text.ends_with(suffix), "末尾が消えている");
+        assert!(
+            text.chars().count() <= MAX_MARKDOWN_CHARS,
             "上限を超えている"
         );
     }
