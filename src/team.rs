@@ -337,8 +337,18 @@ impl TeamResolver {
 
         let result = self.fetch_members(org, slug, deadline).await;
 
-        // token 未設定は team ごとの失敗ではないのでキャッシュしない
-        if !matches!(result, Err(Error::NoToken)) {
+        // team ごとの失敗ではないものはキャッシュしない。覚えてしまうと、
+        // 次の webhook が新しい予算を持っていても 60 秒間その team を諦める。
+        //
+        // - token 未設定: 設定の問題であって team の問題ではない
+        // - 予算を使い切った状態での失敗: リクエストのタイムアウトは残り予算で
+        //   切り詰めているので、失敗の原因がこちらの都合である可能性が高い
+        //   (BudgetExceeded だけでなく、切り詰めたタイムアウトによる
+        //   Request エラーも同じ性質)
+        let out_of_budget = Instant::now() >= deadline;
+        let ours = matches!(result, Err(Error::NoToken)) || (result.is_err() && out_of_budget);
+
+        if !ours {
             self.remember(key, result.as_ref().ok().cloned());
         }
 
@@ -688,6 +698,39 @@ mod tests {
             1,
             "同じ team を複数回引いている"
         );
+    }
+
+    /// 予算を使い切った状態での失敗は、team の失敗としてキャッシュしないこと。
+    ///
+    /// リクエストのタイムアウトは残り予算で切り詰めているので、その失敗は
+    /// こちらの都合である可能性が高い。team の失敗として覚えると、次の
+    /// webhook が新しい予算を持っていても 60 秒間その team を諦めてしまう。
+    #[actix_web::test]
+    async fn failure_while_out_of_budget_is_not_negative_cached() {
+        // 応答が予算より遅いサーバ
+        let base = spawn_api_with_delay(vec![1], 200, Duration::from_millis(300));
+        let r = api_resolver(base);
+
+        // 入口の予算チェックは通るが、リクエスト中に使い切る長さ
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(
+            r.members("octocoders", "octo-team", deadline)
+                .await
+                .is_err(),
+            "予算内に返らないのでエラーになるべき"
+        );
+
+        assert!(
+            r.cache.read().unwrap().is_empty(),
+            "予算切れによる失敗がキャッシュされている"
+        );
+
+        // 新しい予算なら取得できること (諦めたままにならない)
+        let members = r
+            .members("octocoders", "octo-team", far_deadline())
+            .await
+            .expect("新しい予算では取得できるべき");
+        assert_eq!(members.len(), 1);
     }
 
     /// 2 回目は API を叩かずキャッシュから返すこと。
