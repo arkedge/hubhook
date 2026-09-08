@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Slack への 1 リクエストのタイムアウト。
 ///
@@ -10,29 +10,67 @@ use tracing::{debug, error};
 /// 応答しない Slack を無制限に待たない。
 pub const POST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// markdown ブロックに入れる本文の上限 (**文字数**)。
-///
-/// Slack の上限は payload 全体で 12,000 文字。GitHub の本文は 65,536 文字まで
-/// あるので、超える分は切る。
-///
-/// バイト数で測ってはいけない。日本語は 1 文字 3 バイトなので、
-/// 4,000 文字で 12,000 バイトに達し、Slack の上限より遥かに手前で
-/// 切ってしまう。
-///
-/// Assignees など別のブロックの分を残して、payload 全体の上限より
-/// 少なく取ってある。
-const MAX_MARKDOWN_CHARS: usize = 11_000;
-
-/// 切り詰めたことを示す印。
-const TRUNCATION_MARK: &str = "\n\n_(truncated)_";
-
-/// 開いたままのコードフェンスを閉じるための文字列。
-const FENCE_CLOSE: &str = "\n```";
-
 #[derive(Debug)]
 pub struct Message {
     pub text: String,
     pub attachments: Option<Vec<Attachment>>,
+}
+
+/// `chat.postMessage` の失敗。
+#[derive(Debug)]
+enum PostError {
+    /// リクエスト自体が失敗した (タイムアウトなど)
+    Request(String),
+    /// Slack が API エラーを返した (HTTP 200 + `ok: false`)
+    Api(String),
+}
+
+impl std::fmt::Display for PostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(e) => write!(f, "request failed: {e}"),
+            Self::Api(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// `chat.postMessage` の応答。
+///
+/// Slack は API エラーも HTTP 200 で返し、本文の `ok` で示す。
+/// ステータスだけ見ていると `invalid_blocks` などに気付けない。
+#[derive(Debug, Deserialize)]
+struct PostResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
+async fn post(
+    client: &reqwest::Client,
+    token: &str,
+    payload: &MessagePayload,
+) -> Result<(), PostError> {
+    let res = client
+        .post("https://slack.com/api/chat.postMessage")
+        .bearer_auth(token)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| PostError::Request(e.to_string()))?;
+
+    let body: PostResponse = res
+        .json()
+        .await
+        .map_err(|e| PostError::Request(format!("could not read response: {e}")))?;
+
+    debug!("{body:?}");
+
+    if body.ok {
+        Ok(())
+    } else {
+        Err(PostError::Api(
+            body.error.unwrap_or_else(|| "unknown error".to_string()),
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -50,6 +88,9 @@ pub struct Attachment {
     pub title_link: Option<url::Url>,
     pub fallback: String,
     pub color: Option<Color>,
+    /// 本文の退避先。markdown ブロックが拒否されたときだけ使う。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     /// 本文。markdown ブロックとして入れる。
     ///
     /// 本文が無いときは空にする。空の `text` を持つブロックを送ると
@@ -73,48 +114,56 @@ pub enum Block {
     Markdown { text: String },
 }
 
+impl MessagePayload {
+    /// blocks をやめて、本文を attachment の `text` に戻した payload。
+    ///
+    /// markdown ブロックが受け付けられない場合の退避先。従来の表現なので、
+    /// 長い本文は Slack 側で畳まれる。
+    fn into_text_fallback(mut self) -> Self {
+        for a in self.attachments.iter_mut().flatten() {
+            if a.blocks.is_empty() {
+                continue;
+            }
+
+            a.text = Some(
+                a.blocks
+                    .iter()
+                    .map(Block::text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            a.blocks.clear();
+        }
+
+        self
+    }
+}
+
 impl Block {
-    /// ブロックの本文。テストで中身を確認するために使う。
-    #[cfg(test)]
+    /// ブロックの本文。
     pub fn text(&self) -> &str {
         match self {
             Self::Markdown { text } => text,
         }
     }
 
-    /// 本文と、**必ず残したい末尾** (Assignees など) からブロックを作る。
+    /// 本文と末尾 (Assignees など) からブロックを作る。
     ///
-    /// - 全体が空なら `None`。空の `text` は `invalid_blocks` で拒否される
-    ///   (= 通知が飛ばなくなる) ので、ブロックそのものを作らない
-    /// - 上限を超える場合は、末尾の分を先に確保して**本文だけ**を切る。
-    ///   単純に連結してから切ると、本文が長いときに末尾が消える
-    /// - 上限は文字数で数える。バイト数で測ると、日本語は 1 文字 3 バイト
-    ///   なので上限の 1/3 の文字数で切られてしまう
+    /// 全体が空なら `None`。空の `text` は `invalid_blocks` で拒否され、
+    /// 通知そのものが飛ばなくなる。
+    ///
+    /// 長さは切らない。markdown ブロックには payload 全体で 12,000 文字の
+    /// 上限があるが、超えた場合は Slack に拒否させて `text` へ退避する
+    /// ([`MessagePayload::into_text_fallback`])。退避先では従来どおり
+    /// Slack が長い本文を「Show more」で畳む。
     pub fn markdown(body: &str, suffix: &str) -> Option<Self> {
         if body.trim().is_empty() && suffix.trim().is_empty() {
             return None;
         }
 
-        let suffix_len = suffix.chars().count();
-        let room = MAX_MARKDOWN_CHARS.saturating_sub(suffix_len);
-
-        let text = if body.chars().count() > room {
-            let reserve = TRUNCATION_MARK.chars().count() + FENCE_CLOSE.chars().count();
-            let mut head: String = body.chars().take(room.saturating_sub(reserve)).collect();
-
-            // フェンスの途中で切ると閉じ記号が失われ、後続の印と suffix が
-            // 未終了のコードブロックに飲まれる。せっかく suffix の場所を
-            // 確保しても、リンクがただの文字列として表示されてしまう。
-            if head.matches("```").count() % 2 == 1 {
-                head.push_str(FENCE_CLOSE);
-            }
-
-            format!("{head}{TRUNCATION_MARK}{suffix}")
-        } else {
-            format!("{body}{suffix}")
-        };
-
-        Some(Self::Markdown { text })
+        Some(Self::Markdown {
+            text: format!("{body}{suffix}"),
+        })
     }
 }
 
@@ -147,6 +196,13 @@ impl Message {
     }
 
     pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
+        // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
+        // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
+        let client = reqwest::Client::builder()
+            .timeout(POST_TIMEOUT)
+            .build()
+            .expect("could not build http client");
+
         let payload = MessagePayload {
             channel: channel.to_string(),
             username: username.map(|u| u.to_string()),
@@ -155,25 +211,25 @@ impl Message {
             attachments: self.attachments,
         };
 
-        // post
-        //
-        // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
-        // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
-        let client = reqwest::Client::builder()
-            .timeout(POST_TIMEOUT)
-            .build()
-            .expect("could not build http client");
-        let r = client
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(token)
-            .json(&payload)
-            .send()
-            .await;
+        match post(&client, token, &payload).await {
+            Ok(()) => return,
+            // リクエスト自体の失敗は payload を変えても直らない。
+            // 再送すると待ち時間も倍になるので諦める。
+            Err(PostError::Request(e)) => {
+                error!("POST: {e}");
+                return;
+            }
+            Err(PostError::Api(e)) => {
+                // markdown ブロックが attachment 内で使えるか、本文が上限を
+                // 超えたかはこちらで判定できない。拒否されたら従来の表現
+                // (attachment の text) に退避して再送する。
+                warn!("POST rejected ({e}); retrying without markdown blocks");
+            }
+        }
 
-        debug!("{:?}", &r);
-
-        if r.is_err() {
-            error!("POST: {:?}", r.err().unwrap());
+        let fallback = payload.into_text_fallback();
+        if let Err(e) = post(&client, token, &fallback).await {
+            error!("POST (fallback): {e}");
         }
     }
 }
@@ -188,6 +244,17 @@ impl Message {
 mod tests {
     use super::*;
 
+    fn attachment(blocks: Vec<Block>) -> Attachment {
+        Attachment {
+            title: None,
+            title_link: None,
+            fallback: "fallback".to_string(),
+            color: None,
+            text: None,
+            blocks,
+        }
+    }
+
     #[test]
     fn short_markdown_is_passed_through() {
         let md = "## 概要\n\n**重要** な `code` と [link](https://example.com)";
@@ -198,33 +265,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn long_markdown_is_truncated() {
-        let md = "a".repeat(MAX_MARKDOWN_CHARS + 100);
-        let block = Block::markdown(&md, "").unwrap();
-
-        assert!(
-            block.text().chars().count() <= MAX_MARKDOWN_CHARS,
-            "上限を超えている"
-        );
-        assert!(block.text().ends_with("_(truncated)_"), "印が無い");
-    }
-
-    /// 上限は文字数で数えること。
+    /// 長さは切らないこと。
     ///
-    /// バイト数で測ると、日本語は 1 文字 3 バイトなので上限の 1/3 の
-    /// 文字数で切られてしまう。
+    /// 上限を超えた場合は Slack に拒否させて text へ退避する。
+    /// こちらで切ると、切り方を誤って Markdown を壊す危険がある。
     #[test]
-    fn limit_is_counted_in_characters_not_bytes() {
-        // 上限ぴったりの文字数 (バイト数では 3 倍になる)
-        let md = "あ".repeat(MAX_MARKDOWN_CHARS);
-        let block = Block::markdown(&md, "").unwrap();
-
-        assert_eq!(block.text(), md, "文字数は上限内なので切ってはいけない");
-        assert!(
-            md.len() > MAX_MARKDOWN_CHARS,
-            "テストの前提: バイト数は超える"
-        );
+    fn long_markdown_is_not_truncated() {
+        let md = "a".repeat(20_000);
+        assert_eq!(Block::markdown(&md, "").unwrap().text(), md);
     }
 
     /// 空の本文ではブロックを作らないこと。
@@ -237,50 +285,48 @@ mod tests {
         assert!(Block::markdown("   \n  ", "").is_none());
     }
 
-    /// 末尾は本文が長くても消えないこと。
-    ///
-    /// 連結してから切ると、本文が上限に達した時点で末尾が失われる。
-    #[test]
-    fn suffix_survives_truncation() {
-        let body = "a".repeat(MAX_MARKDOWN_CHARS * 2);
-        let suffix = "\n**Assignees**\nsksat";
-        let block = Block::markdown(&body, suffix).unwrap();
-
-        assert!(block.text().ends_with(suffix), "末尾が消えている");
-        assert!(
-            block.text().chars().count() <= MAX_MARKDOWN_CHARS,
-            "上限を超えている"
-        );
-    }
-
-    /// フェンスの途中で切っても、後続が飲まれないこと。
-    ///
-    /// 閉じ記号が失われると、印と suffix が未終了のコードブロックの中身に
-    /// なってしまい、Assignees のリンクがただの文字列として表示される。
-    #[test]
-    fn truncation_closes_an_open_code_fence() {
-        let body = format!("```\n{}", "a".repeat(MAX_MARKDOWN_CHARS));
-        let suffix = "\n\n**Assignees**: sksat";
-        let block = Block::markdown(&body, suffix).unwrap();
-        let text = block.text();
-
-        assert_eq!(
-            text.matches("```").count() % 2,
-            0,
-            "フェンスが閉じていない: {}",
-            &text[text.len().saturating_sub(80)..]
-        );
-        assert!(text.ends_with(suffix), "末尾が消えている");
-        assert!(
-            text.chars().count() <= MAX_MARKDOWN_CHARS,
-            "上限を超えている"
-        );
-    }
-
     /// 本文が無くても末尾だけでブロックを作れること (assigned イベント)。
     #[test]
     fn suffix_only_makes_a_block() {
-        let block = Block::markdown("", "**Assignees**\nsksat").unwrap();
-        assert_eq!(block.text(), "**Assignees**\nsksat");
+        let block = Block::markdown("", "**Assignees**: sksat").unwrap();
+        assert_eq!(block.text(), "**Assignees**: sksat");
+    }
+
+    /// 退避すると、ブロックの本文が attachment の text に移ること。
+    #[test]
+    fn fallback_moves_blocks_into_text() {
+        let payload = MessagePayload {
+            channel: "c".to_string(),
+            username: None,
+            text: "summary".to_string(),
+            fallback: None,
+            attachments: Some(vec![attachment(vec![
+                Block::markdown("## body", "").unwrap(),
+            ])]),
+        };
+
+        let payload = payload.into_text_fallback();
+        let a = &payload.attachments.as_ref().unwrap()[0];
+
+        assert_eq!(a.text.as_deref(), Some("## body"));
+        assert!(a.blocks.is_empty(), "blocks が残っている");
+    }
+
+    /// ブロックが無い attachment は退避しても変わらないこと
+    /// (本文なしのイベントで text を空文字にしないため)。
+    #[test]
+    fn fallback_leaves_blockless_attachments_alone() {
+        let payload = MessagePayload {
+            channel: "c".to_string(),
+            username: None,
+            text: "summary".to_string(),
+            fallback: None,
+            attachments: Some(vec![attachment(vec![])]),
+        };
+
+        let payload = payload.into_text_fallback();
+        let a = &payload.attachments.as_ref().unwrap()[0];
+
+        assert!(a.text.is_none(), "text が付いている");
     }
 }

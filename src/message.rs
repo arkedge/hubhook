@@ -112,6 +112,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
+                        text: None,
                         blocks: body_blocks(issue.body.as_deref().unwrap_or(""), &issue.assignees),
                         color,
                     }
@@ -153,6 +154,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
+                        text: None,
                         blocks: body_blocks("", assignees),
                         color,
                     }
@@ -197,6 +199,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback,
+                        text: None,
                         blocks: body_blocks(body, &pr.assignees),
                         color,
                     }
@@ -236,6 +239,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
+                        text: None,
                         blocks: body_blocks(pr.body.as_deref().unwrap_or(""), &[]),
                         // 「対応してほしい」通知なので opened / assigned とは色を変える
                         color: Some(slack::Color::Warning),
@@ -272,6 +276,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
+                        text: None,
                         blocks: body_blocks("", assignees),
                         color,
                     }
@@ -314,6 +319,7 @@ impl TryFrom<&github::IssueComment> for slack::Message {
                     title: None,
                     title_link: None,
                     fallback: comment.body.clone(),
+                    text: None,
                     blocks: body_blocks(&comment.body, &[]),
                     color,
                 };
@@ -377,6 +383,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
             title: None,
             title_link: None,
             fallback: attach_text.clone(),
+            text: None,
             blocks: body_blocks(&attach_text, &[]),
             color: Some(color),
         };
@@ -421,6 +428,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
             title: Some(comment.path.clone()),
             title_link: Some(comment.html_url.clone()),
             fallback: comment.body.clone(),
+            text: None,
             blocks: body_blocks(&comment.body, &[]),
             color: Some(slack::Color::Comment),
         };
