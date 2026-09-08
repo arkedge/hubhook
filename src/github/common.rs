@@ -1,5 +1,11 @@
-use serde::de::IgnoredAny;
+// GitHub webhook の payload schema をそのまま写した型定義。
+// octokit/webhooks の payload-schemas と突き合わせられることを優先し、
+// 現時点で読んでいないフィールドもスキーマの記述として残しているため、
+// このモジュールでは dead_code を許可する。
+#![allow(dead_code)]
+
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -300,8 +306,11 @@ impl<'a> From<&'a Label> for &'a str {
     }
 }
 
-impl ToString for &Label {
-    fn to_string(&self) -> String {
-        self.name.to_string()
+// Rule::match_query_vec の `T: ToString` 境界に &Label を渡すために必要。
+// Display を実装しておけば std のブランケット実装経由で
+// &Label: Display -> &Label: ToString が成り立つ。
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
     }
 }

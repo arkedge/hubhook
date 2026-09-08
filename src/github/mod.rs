@@ -45,6 +45,8 @@ impl std::error::Error for DeserializeError {
     }
 }
 
+// payload schema の写しなので、読んでいないフィールドも残す
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Issues {
     pub action: IssuesAction,
@@ -55,6 +57,8 @@ pub struct Issues {
     pub installation: common::InstallationLite,
 }
 
+// payload schema の写しなので、読んでいないフィールドも残す
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct PullRequest {
     pub action: PullRequestAction,
@@ -67,6 +71,8 @@ pub struct PullRequest {
 }
 
 // Issue Comment & Pull-Request Comment
+// payload schema の写しなので、読んでいないフィールドも残す
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct IssueComment {
     pub action: IssueCommentAction,
@@ -79,6 +85,8 @@ pub struct IssueComment {
 }
 
 impl IssueComment {
+    // issue_comment と PR comment の区別に使う想定で残している
+    #[allow(dead_code)]
     pub fn is_pull_request(&self) -> bool {
         self.issue.is_pull_request()
     }
