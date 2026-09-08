@@ -127,23 +127,16 @@ pub enum Block {
 }
 
 impl MessagePayload {
-    /// blocks をやめて、本文を attachment の `text` に戻した payload。
+    /// blocks をやめて、`text` だけにした payload。
     ///
-    /// markdown ブロックが受け付けられない場合の退避先。従来の表現なので、
-    /// 長い本文は Slack 側で畳まれる。
+    /// markdown ブロックが受け付けられない場合の退避先。`text` は構築時に
+    /// mrkdwn で作ってあるので、ここでは blocks を落とすだけでよい。
+    /// ブロックの Markdown を流用すると、`**太字**` や `[name](url)` が
+    /// 解釈されず従来より悪い表示になる (方言が違う)。
+    ///
+    /// 従来の表現なので、長い本文は Slack 側で畳まれる。
     fn into_text_fallback(mut self) -> Self {
         for a in self.attachments.iter_mut().flatten() {
-            if a.blocks.is_empty() {
-                continue;
-            }
-
-            a.text = Some(
-                a.blocks
-                    .iter()
-                    .map(Block::text)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
             a.blocks.clear();
         }
 
@@ -152,7 +145,8 @@ impl MessagePayload {
 }
 
 impl Block {
-    /// ブロックの本文。
+    /// ブロックの本文。テストで中身を確認するために使う。
+    #[cfg(test)]
     pub fn text(&self) -> &str {
         match self {
             Self::Markdown { text } => text,
@@ -334,41 +328,29 @@ mod tests {
         }
     }
 
-    /// 退避すると、ブロックの本文が attachment の text に移ること。
+    /// 退避すると blocks が落ち、構築時に作った text が残ること。
+    ///
+    /// text はブロックの Markdown を流用せず、mrkdwn で別に作ってある。
     #[test]
-    fn fallback_moves_blocks_into_text() {
+    fn fallback_drops_blocks_and_keeps_text() {
+        let mut a = attachment(vec![Block::markdown("## body", "").unwrap()]);
+        a.text = Some("## body\n*Assignees*\n<https://github.com/sksat|sksat>".to_string());
+
         let payload = MessagePayload {
             channel: "c".to_string(),
             username: None,
             text: "summary".to_string(),
             fallback: None,
-            attachments: Some(vec![attachment(vec![
-                Block::markdown("## body", "").unwrap(),
-            ])]),
+            attachments: Some(vec![a]),
         };
 
         let payload = payload.into_text_fallback();
         let a = &payload.attachments.as_ref().unwrap()[0];
 
-        assert_eq!(a.text.as_deref(), Some("## body"));
         assert!(a.blocks.is_empty(), "blocks が残っている");
-    }
-
-    /// ブロックが無い attachment は退避しても変わらないこと
-    /// (本文なしのイベントで text を空文字にしないため)。
-    #[test]
-    fn fallback_leaves_blockless_attachments_alone() {
-        let payload = MessagePayload {
-            channel: "c".to_string(),
-            username: None,
-            text: "summary".to_string(),
-            fallback: None,
-            attachments: Some(vec![attachment(vec![])]),
-        };
-
-        let payload = payload.into_text_fallback();
-        let a = &payload.attachments.as_ref().unwrap()[0];
-
-        assert!(a.text.is_none(), "text が付いている");
+        assert!(
+            a.text.as_deref().unwrap().contains("*Assignees*"),
+            "text が失われている"
+        );
     }
 }

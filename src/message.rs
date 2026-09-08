@@ -39,15 +39,59 @@ impl TryFrom<&github::Payload> for slack::Message {
 /// 1 つのブロックにまとめるが、Assignees は「必ず残したい末尾」として渡す。
 /// 連結してから切ると、本文が長いときに Assignees が消える。
 /// 本文も Assignees も無ければブロックを作らない (空の text は拒否される)。
+/// リンクの記法。同じ内容でも、入れる場所によって解釈される方言が違う。
+///
+/// - markdown ブロック: `[text](url)`
+/// - attachment の `text` (mrkdwn): `<url|text>`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkStyle {
+    Mrkdwn,
+    Markdown,
+}
+
+impl LinkStyle {
+    fn link(self, text: &str, url: &str) -> String {
+        match self {
+            Self::Mrkdwn => format!("<{url}|{text}>"),
+            Self::Markdown => format!("[{text}]({url})"),
+        }
+    }
+}
+
+/// Assignees の行。入れる場所の方言に合わせて作る。
+fn assignees_suffix(assignees: &[github::common::User], style: LinkStyle, bold: &str) -> String {
+    users2str(assignees, "\n", Some(style))
+        .map(|a| format!("\n{bold}Assignees{bold}\n{a}"))
+        .unwrap_or_default()
+}
+
+/// attachment の本文 (markdown ブロック)。
 fn body_blocks(body: &str, assignees: &[github::common::User]) -> Vec<slack::Block> {
-    let suffix = users2str(assignees, "\n", true)
-        .map(|a| format!("\n**Assignees**\n{a}"))
-        .unwrap_or_default();
+    let suffix = assignees_suffix(assignees, LinkStyle::Markdown, "**");
 
     slack::Block::markdown(body, &suffix).into_iter().collect()
 }
 
-fn users2str(assignees: &[github::common::User], delimiter: &str, to_link: bool) -> Option<String> {
+/// ブロックが拒否されたときの退避先 (mrkdwn)。
+///
+/// ブロックの Markdown をそのまま `text` に入れると、`**太字**` や
+/// `[name](url)` が解釈されず、従来より悪い表示になる。方言が違うので
+/// 使い回せない。本文は元から生のままだったので、Assignees だけ作り直す。
+fn body_text(body: &str, assignees: &[github::common::User]) -> Option<String> {
+    let suffix = assignees_suffix(assignees, LinkStyle::Mrkdwn, "*");
+
+    if body.trim().is_empty() && suffix.trim().is_empty() {
+        return None;
+    }
+
+    Some(format!("{body}{suffix}"))
+}
+
+fn users2str(
+    assignees: &[github::common::User],
+    delimiter: &str,
+    style: Option<LinkStyle>,
+) -> Option<String> {
     if assignees.is_empty() {
         return None;
     }
@@ -55,14 +99,9 @@ fn users2str(assignees: &[github::common::User], delimiter: &str, to_link: bool)
     Some(
         assignees
             .iter()
-            .map(|a| a.login.to_string())
-            .map(|a| {
-                if to_link {
-                    // attachment の本文は markdown ブロックなので Markdown 記法
-                    format!("[{a}](https://github.com/{a})")
-                } else {
-                    a
-                }
+            .map(|a| match style {
+                Some(style) => style.link(&a.login, a.html_url.as_str()),
+                None => a.login.clone(),
             })
             .collect::<Vec<String>>()
             .join(delimiter),
@@ -112,7 +151,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
-                        text: None,
+                        text: body_text(issue.body.as_deref().unwrap_or(""), &issue.assignees),
                         blocks: body_blocks(issue.body.as_deref().unwrap_or(""), &issue.assignees),
                         color,
                     }
@@ -137,7 +176,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                 let text = format!(
                     "[{}] Issue assigned to {}",
                     repo.full_name,
-                    users2str(assignees, ",", false).expect("no assignees on issue assigned event")
+                    users2str(assignees, ", ", None).expect("no assignees on issue assigned event")
                 );
 
                 let attach = {
@@ -154,7 +193,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
-                        text: None,
+                        text: body_text("", assignees),
                         blocks: body_blocks("", assignees),
                         color,
                     }
@@ -199,7 +238,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback,
-                        text: None,
+                        text: body_text(body, &pr.assignees),
                         blocks: body_blocks(body, &pr.assignees),
                         color,
                     }
@@ -239,7 +278,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
-                        text: None,
+                        text: body_text(pr.body.as_deref().unwrap_or(""), &[]),
                         blocks: body_blocks(pr.body.as_deref().unwrap_or(""), &[]),
                         // 「対応してほしい」通知なので opened / assigned とは色を変える
                         color: Some(slack::Color::Warning),
@@ -258,7 +297,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
 
                 let text = {
                     let repo = &repo.full_name;
-                    let assignees = users2str(assignees, ",", false)
+                    let assignees = users2str(assignees, ", ", None)
                         .expect("no assignees on issue assigned event");
                     format!("[{repo}] Pull Request assigned to {assignees}",)
                 };
@@ -276,7 +315,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
-                        text: None,
+                        text: body_text("", assignees),
                         blocks: body_blocks("", assignees),
                         color,
                     }
@@ -319,7 +358,7 @@ impl TryFrom<&github::IssueComment> for slack::Message {
                     title: None,
                     title_link: None,
                     fallback: comment.body.clone(),
-                    text: None,
+                    text: body_text(&comment.body, &[]),
                     blocks: body_blocks(&comment.body, &[]),
                     color,
                 };
@@ -383,7 +422,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
             title: None,
             title_link: None,
             fallback: attach_text.clone(),
-            text: None,
+            text: body_text(&attach_text, &[]),
             blocks: body_blocks(&attach_text, &[]),
             color: Some(color),
         };
@@ -428,7 +467,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
             title: Some(comment.path.clone()),
             title_link: Some(comment.html_url.clone()),
             fallback: comment.body.clone(),
-            text: None,
+            text: body_text(&comment.body, &[]),
             blocks: body_blocks(&comment.body, &[]),
             color: Some(slack::Color::Comment),
         };
@@ -583,6 +622,40 @@ mod tests {
         assert!(
             body.contains("[Codertocat](https://github.com/Codertocat)"),
             "リンクが Markdown でない: {body}"
+        );
+    }
+
+    /// 主となるブロックは Markdown、退避先は mrkdwn になること。
+    ///
+    /// 退避時にブロックの Markdown をそのまま `text` に入れると、
+    /// `**太字**` や `[name](url)` が解釈されず、従来より悪い表示になる。
+    #[test]
+    fn block_is_markdown_and_fallback_is_mrkdwn() {
+        let msg = message(
+            "pull_request",
+            "pull_request.assigned.with-organization.json",
+        )
+        .expect("通知されるべき");
+        let a = &msg.attachments.as_ref().unwrap()[0];
+
+        // 主: markdown ブロック
+        let block = a.blocks[0].text();
+        assert!(block.contains("**Assignees**"), "block = {block}");
+        assert!(
+            block.contains("[Codertocat](https://github.com/Codertocat)"),
+            "block = {block}"
+        );
+
+        // 退避: mrkdwn
+        let text = a.text.as_deref().expect("退避先が無い");
+        assert!(
+            !text.contains("**Assignees**"),
+            "Markdown のままになっている: {text}"
+        );
+        assert!(text.contains("*Assignees*"), "text = {text}");
+        assert!(
+            text.contains("<https://github.com/Codertocat|Codertocat>"),
+            "mrkdwn のリンクになっていない: {text}"
         );
     }
 
