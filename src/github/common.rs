@@ -118,7 +118,9 @@ pub struct Repository {
     pub disabled: bool,
     pub open_issues_count: usize,
     pub license: Option<License>,
-    pub allow_forking: bool,
+    // octokit/webhooks の payload-examples には無い。必須にしておくと、
+    // GitHub が送ってこない場合に deserialize が失敗して通知が止まるので Option にする
+    pub allow_forking: Option<bool>,
     pub is_template: bool,
     pub topics: Vec<String>, // octkit/webhooksになさそう
     pub visibility: String,
@@ -259,6 +261,109 @@ pub struct IssueComment {
     pub body: String,
     pub reactions: Reactions,
     pub performed_via_github_app: Option<IgnoredAny>,
+}
+
+/// `pull_request_review` / `pull_request_review_comment` に埋め込まれている PR オブジェクト。
+///
+/// `pull_request` イベントの [`PullRequest`] とは別物で、`mergeable_state` や `commits`、
+/// `additions` などを持たない (octokit の payload-schemas で言う `simple_pull_request`)。
+/// [`PullRequest`] を使い回すと必須フィールドが足りず deserialize に失敗し、
+/// 通知が飛ばなくなるため型を分けている。
+#[derive(Debug, Deserialize)]
+pub struct SimplePullRequest {
+    pub url: Url,
+    pub id: usize,
+    pub node_id: String,
+    pub html_url: Url,
+    pub diff_url: Url,
+    pub patch_url: Url,
+    pub issue_url: Url,
+    pub number: usize,
+    pub state: String,
+    pub locked: bool,
+    pub title: String,
+    pub user: User,
+    pub body: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_at: Option<String>,
+    pub merge_commit_sha: Option<String>,
+    pub assignee: Option<User>,
+    pub assignees: Vec<User>,
+    pub requested_reviewers: Option<IgnoredAny>,
+    pub requested_teams: Option<IgnoredAny>,
+    pub labels: Vec<Label>,
+    pub milestone: Option<IgnoredAny>,
+    /// `pull_request_review_comment` の payload には無い
+    pub draft: Option<bool>,
+    pub commits_url: Url,
+    pub review_comments_url: Url,
+    pub review_comment_url: Url,
+    pub comments_url: Url,
+    pub statuses_url: Url,
+    pub head: PullRequestHead,
+    pub base: PullRequestBase,
+    #[serde(rename = "_links")]
+    pub links: PullRequestLinks,
+    pub author_association: String,
+    pub active_lock_reason: Option<IgnoredAny>,
+}
+
+/// `pull_request_review` の `review`。
+#[derive(Debug, Deserialize)]
+pub struct Review {
+    pub id: usize,
+    pub node_id: String,
+    pub user: User,
+    /// approve にメッセージを付けなかった場合は null になる (#285)
+    pub body: Option<String>,
+    pub commit_id: String,
+    pub submitted_at: Option<String>,
+    /// `approved` / `changes_requested` / `commented` / `dismissed`。
+    /// GitHub 側が値を増やしても deserialize に失敗しないよう、
+    /// [`PullRequest::state`] と同じく String のまま持つ。
+    pub state: String,
+    pub html_url: Url,
+    pub pull_request_url: Url,
+    pub author_association: String,
+    #[serde(rename = "_links")]
+    pub links: Option<IgnoredAny>,
+}
+
+/// `pull_request_review_comment` の `comment`。diff 上の 1 コメント。
+#[derive(Debug, Deserialize)]
+pub struct ReviewComment {
+    pub url: Url,
+    pub pull_request_review_id: Option<usize>,
+    pub id: usize,
+    pub node_id: String,
+    pub diff_hunk: String,
+    pub path: String,
+    pub commit_id: String,
+    pub original_commit_id: String,
+    pub user: User,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Url,
+    pub pull_request_url: Url,
+    pub author_association: String,
+    #[serde(rename = "_links")]
+    pub links: Option<IgnoredAny>,
+    pub reactions: Option<Reactions>,
+    /// レビューコメントへの返信のときだけ入る。
+    /// 通常のレビューコメントでは **キー自体が存在しない** (#122)。
+    pub in_reply_to_id: Option<usize>,
+    pub position: Option<usize>,
+    pub original_position: Option<usize>,
+    pub line: Option<usize>,
+    pub original_line: Option<usize>,
+    pub start_line: Option<usize>,
+    pub original_start_line: Option<usize>,
+    pub side: Option<String>,
+    pub start_side: Option<String>,
+    pub subject_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

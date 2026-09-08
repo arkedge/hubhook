@@ -21,8 +21,20 @@ Edit config.json.
 |topic|repository topic|
 |user|event sender|
 |title|Issue title|
-|body|Issue/Issue Comment body|
+|body|Issue / Issue Comment / review / review comment の本文|
 |label|Issue label|
+|review_state|`pull_request_review` の state (`approved` / `changes_requested` / `commented`)|
+
+### Notified events
+
+`X-GitHub-Event` のうち以下を扱う。
+GitHub App / Webhook 側でこれらのイベントを購読していないと通知は飛ばない。
+
+- `issues`
+- `issue_comment`
+- `pull_request`
+- `pull_request_review` (approve / changes requested / コメント付き review)
+- `pull_request_review_comment` (diff 上のコメントとその返信)
 
 ### Example
 ```json
