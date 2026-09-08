@@ -27,6 +27,20 @@ Edit config.json.
 |reviewer|review を依頼された user の login、または team の slug|
 |review_state|`pull_request_review` の state (`approved` / `changes_requested` / `commented`)|
 
+### Message appearance
+
+本文は Slack の **markdown ブロック**として送る。attachment の `text` は
+mrkdwn (Slack 独自記法) なので、GitHub の本文をそのまま貼ると `##` が
+そのまま表示され、`*x*` の強調も入れ替わる (GitHub は斜体、Slack は太字)。
+markdown ブロックは本物の Markdown を解釈するので、見出し・表・タスクリスト・
+コードブロックまでそのまま渡せる。色バーを残すため attachment の中に置いている。
+
+GFM 固有の参照記法 (`#123` の issue リンク、`@user`、コミット SHA) は
+Markdown の仕様外なのでリンクにはならない。
+
+本文は payload 全体で 12,000 文字までなので、超える分は切って
+`_(truncated)_` を付ける。
+
 ### Notified events
 
 `X-GitHub-Event` のうち以下を扱う。
