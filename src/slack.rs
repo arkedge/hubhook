@@ -255,22 +255,22 @@ impl Block {
         }
     }
 
-    /// 本文と末尾 (Assignees など) からブロックを作る。
+    /// 本文からブロックを作る。
     ///
-    /// 全体が空なら `None`。空の `text` は `invalid_blocks` で拒否され、
+    /// 空なら `None`。空の `text` は `invalid_blocks` で拒否され、
     /// 通知そのものが飛ばなくなる。
     ///
     /// 長さは切らない。markdown ブロックには payload 全体で 12,000 文字の
     /// 上限があるが、超えた場合は Slack に拒否させて `text` へ退避する
     /// ([`MessagePayload::into_text_fallback`])。退避先では従来どおり
     /// Slack が長い本文を「Show more」で畳む。
-    pub fn markdown(body: &str, suffix: &str) -> Option<Self> {
-        if body.trim().is_empty() && suffix.trim().is_empty() {
+    pub fn markdown(text: &str) -> Option<Self> {
+        if text.trim().is_empty() {
             return None;
         }
 
         Some(Self::Markdown {
-            text: format!("{body}{suffix}"),
+            text: text.to_string(),
         })
     }
 }
@@ -385,7 +385,7 @@ mod tests {
 
     fn blocks(md: &str, mrkdwn: Option<&str>) -> Body {
         Body::new(
-            vec![Block::markdown(md, "").expect("ブロックが作られない")],
+            vec![Block::markdown(md).expect("ブロックが作られない")],
             mrkdwn.map(str::to_string),
         )
     }
@@ -394,7 +394,7 @@ mod tests {
     fn short_markdown_is_passed_through() {
         let md = "## 概要\n\n**重要** な `code` と [link](https://example.com)";
         assert_eq!(
-            Block::markdown(md, "").unwrap().text(),
+            Block::markdown(md).unwrap().text(),
             md,
             "変換せずそのまま渡す"
         );
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn long_markdown_is_not_truncated() {
         let md = "a".repeat(20_000);
-        assert_eq!(Block::markdown(&md, "").unwrap().text(), md);
+        assert_eq!(Block::markdown(&md).unwrap().text(), md);
     }
 
     /// 空の本文ではブロックを作らないこと。
@@ -416,15 +416,8 @@ mod tests {
     /// 通知そのものが飛ばなくなる。
     #[test]
     fn empty_body_makes_no_block() {
-        assert!(Block::markdown("", "").is_none());
-        assert!(Block::markdown("   \n  ", "").is_none());
-    }
-
-    /// 本文が無くても末尾だけでブロックを作れること (assigned イベント)。
-    #[test]
-    fn suffix_only_makes_a_block() {
-        let block = Block::markdown("", "**Assignees**: sksat").unwrap();
-        assert_eq!(block.text(), "**Assignees**: sksat");
+        assert!(Block::markdown("").is_none());
+        assert!(Block::markdown("   \n  ").is_none());
     }
 
     /// blocks 由来のエラーだけ再送すること。

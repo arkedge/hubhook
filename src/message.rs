@@ -34,11 +34,6 @@ impl TryFrom<&github::Payload> for slack::Message {
     }
 }
 
-/// 本文と Assignees から attachment の blocks を作る。
-///
-/// 1 つのブロックにまとめるが、Assignees は「必ず残したい末尾」として渡す。
-/// 連結してから切ると、本文が長いときに Assignees が消える。
-/// 本文も Assignees も無ければブロックを作らない (空の text は拒否される)。
 /// リンクの記法。同じ内容でも、入れる場所によって解釈される方言が違う。
 ///
 /// - markdown ブロック: `[text](url)`
@@ -59,17 +54,36 @@ impl LinkStyle {
 }
 
 /// Assignees の行。入れる場所の方言に合わせて作る。
-fn assignees_suffix(assignees: &[github::common::User], style: LinkStyle, bold: &str) -> String {
-    users2str(assignees, "\n", Some(style))
-        .map(|a| format!("\n{bold}Assignees{bold}\n{a}"))
-        .unwrap_or_default()
+fn assignees_line(
+    assignees: &[github::common::User],
+    style: LinkStyle,
+    bold: &str,
+) -> Option<String> {
+    users2str(assignees, "\n", Some(style)).map(|a| format!("{bold}Assignees{bold}\n{a}"))
+}
+
+/// 本文の後ろに Assignees を足す。
+///
+/// 空行で区切る。Markdown では改行 1 つだと同じ段落として連結され、本文の
+/// 末尾に `**Assignees**` がくっついて表示されてしまう。
+/// 本文が無いときは区切りを入れない (先頭が空行になり、その分だけ縦に伸びる)。
+fn with_assignees(body: &str, line: Option<String>) -> String {
+    let Some(line) = line else {
+        return body.to_string();
+    };
+
+    if body.trim().is_empty() {
+        return line;
+    }
+
+    format!("{body}\n\n{line}")
 }
 
 /// attachment の本文 (markdown ブロック)。
 fn body_blocks(body: &str, assignees: &[github::common::User]) -> Vec<slack::Block> {
-    let suffix = assignees_suffix(assignees, LinkStyle::Markdown, "**");
+    let body = with_assignees(body, assignees_line(assignees, LinkStyle::Markdown, "**"));
 
-    slack::Block::markdown(body, &suffix).into_iter().collect()
+    slack::Block::markdown(&body).into_iter().collect()
 }
 
 /// ブロックが拒否されたときの退避先 (mrkdwn)。
@@ -78,13 +92,9 @@ fn body_blocks(body: &str, assignees: &[github::common::User]) -> Vec<slack::Blo
 /// `[name](url)` が解釈されず、従来より悪い表示になる。方言が違うので
 /// 使い回せない。本文は元から生のままだったので、Assignees だけ作り直す。
 fn body_text(body: &str, assignees: &[github::common::User]) -> Option<String> {
-    let suffix = assignees_suffix(assignees, LinkStyle::Mrkdwn, "*");
+    let text = with_assignees(body, assignees_line(assignees, LinkStyle::Mrkdwn, "*"));
 
-    if body.trim().is_empty() && suffix.trim().is_empty() {
-        return None;
-    }
-
-    Some(format!("{body}{suffix}"))
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// attachment の本文。markdown ブロックと、退避用の mrkdwn を組にする。
@@ -478,6 +488,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
 
 #[cfg(test)]
 mod tests {
+    use super::with_assignees;
     use crate::github::testing::de;
     use crate::slack;
 
@@ -625,6 +636,43 @@ mod tests {
         );
     }
 
+    /// 本文が無いときに Assignees の前で空行を作らないこと。
+    ///
+    /// 空行の分だけ通知が縦に伸びる。assigned は本文を出さないので必ず通る。
+    #[test]
+    fn assignees_without_body_have_no_leading_blank_line() {
+        let msg = message(
+            "pull_request",
+            "pull_request.assigned.with-organization.json",
+        )
+        .expect("通知されるべき");
+        let a = &msg.attachments.as_ref().unwrap()[0];
+
+        for text in [
+            a.body.blocks()[0].text(),
+            a.body.mrkdwn().expect("退避先が無い"),
+        ] {
+            assert!(text.starts_with('*'), "空行から始まっている: {text:?}");
+        }
+    }
+
+    /// 本文と Assignees が空行で区切られること。
+    ///
+    /// Markdown では改行 1 つだと同じ段落として連結され、本文の末尾に
+    /// `**Assignees**` がくっついて表示される。
+    #[test]
+    fn assignees_are_separated_from_the_body_by_a_blank_line() {
+        assert_eq!(
+            with_assignees("本文", Some("**Assignees**\nsksat".to_string())),
+            "本文\n\n**Assignees**\nsksat"
+        );
+        assert_eq!(
+            with_assignees("本文", None),
+            "本文",
+            "余計な改行が付いている"
+        );
+    }
+
     /// 主となるブロックは Markdown、退避先は mrkdwn になること。
     ///
     /// 退避時にブロックの Markdown をそのまま `text` に入れると、
@@ -683,19 +731,6 @@ mod tests {
             "text = {}",
             msg.text
         );
-    }
-
-    /// 本文が長くても Assignees が消えないこと。
-    #[test]
-    fn assignees_survive_a_long_body() {
-        let msg = message(
-            "pull_request",
-            "pull_request.assigned.with-organization.json",
-        )
-        .expect("通知されるべき");
-
-        let body = msg.attachments.as_ref().unwrap()[0].body.blocks()[0].text();
-        assert!(body.contains("**Assignees**"), "Assignees が無い: {body}");
     }
 
     /// #87: review request が通知されること。
