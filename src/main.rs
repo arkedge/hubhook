@@ -23,6 +23,7 @@ type HmacSha256 = Hmac<Sha256>;
 mod github;
 mod message;
 mod slack;
+mod team;
 
 #[derive(Debug, Clone, StructOpt)]
 #[structopt(name = "hubhook")]
@@ -39,6 +40,11 @@ struct Opt {
 
     #[structopt(long, env)]
     sentry_dsn: String,
+
+    /// team メンションを展開するための GitHub token (#286)。
+    /// 未設定でも動くが、team メンションは展開されない。
+    #[structopt(long, env)]
+    github_token: Option<String>,
 
     #[structopt(long)]
     debug: bool,
@@ -219,11 +225,15 @@ async fn main() -> std::io::Result<()> {
         res.unwrap()
     };
 
+    // キャッシュを worker 間で共有するため、closure の外で 1 つだけ作る
+    let teams = Arc::new(team::TeamResolver::new(opt.github_token.clone()));
+
     HttpServer::new(move || {
         App::new()
             .wrap(sentry_actix::Sentry::new())
             .app_data(web::Data::new(Arc::new(cfg.clone()))) // memo: https://github.com/actix/actix-web/issues/1454#issuecomment-867897725
             .app_data(web::Data::new(Arc::new(opt.clone())))
+            .app_data(web::Data::new(teams.clone()))
             .service(web::resource("/webhook").route(web::post().to(webhook)))
             .service(web::resource("/healthcheck").route(web::get().to(HttpResponse::Ok)))
     })
@@ -235,6 +245,7 @@ async fn main() -> std::io::Result<()> {
 async fn webhook(
     opt: web::Data<Arc<Opt>>,
     cfg: web::Data<Arc<Config>>,
+    teams: web::Data<Arc<team::TeamResolver>>,
     data: Data,
 ) -> Result<HttpResponse> {
     // 扱わないイベントは何もしない
@@ -244,8 +255,11 @@ async fn webhook(
 
     //post_test(&opt, &payload).await;
 
+    // team メンションをメンバーの @login に展開してから照合する (#286)
+    let extra_mentions = teams.expand_mentions(payload.body()).await;
+
     // match rule
-    let matches = payload.match_rules(&cfg.rule);
+    let matches = payload.match_rules(&cfg.rule, &extra_mentions);
 
     for (channel, m) in matches {
         let msg: Result<slack::Message, _> = (&payload).try_into();
@@ -265,11 +279,14 @@ async fn webhook(
 }
 
 impl Rule {
-    fn check_match(&self, payload: &github::Payload) -> bool {
-        let include_query_result = Rule::match_results(&self.query, payload).iter().all(|&r| r);
+    /// `body` は team メンションを展開したあとの本文 (#286)。
+    fn check_match(&self, payload: &github::Payload, body: &str) -> bool {
+        let include_query_result = Rule::match_results(&self.query, payload, body)
+            .iter()
+            .all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
-            let exclude_query_result = Rule::match_results(exclude_query, payload)
+            let exclude_query_result = Rule::match_results(exclude_query, payload, body)
                 .iter()
                 .any(|&r| r);
             include_query_result && !exclude_query_result
@@ -278,7 +295,7 @@ impl Rule {
         }
     }
 
-    fn match_results(query: &Query, payload: &github::Payload) -> Vec<bool> {
+    fn match_results(query: &Query, payload: &github::Payload, body: &str) -> Vec<bool> {
         let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
 
         let topics = &payload.repo().topics;
@@ -287,7 +304,7 @@ impl Rule {
 
         let r_sender = Rule::match_query(query.user.as_ref(), &payload.sender().login);
         let r_title = Rule::match_query(query.title.as_ref(), payload.title());
-        let r_body = Rule::match_query(query.body.as_ref(), payload.body());
+        let r_body = Rule::match_query(query.body.as_ref(), body);
 
         let labels = payload.labels().iter().collect();
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);

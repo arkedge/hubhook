@@ -348,12 +348,25 @@ impl Payload {
         }
     }
 
-    pub fn match_rules(&self, rules: &[Rule]) -> HashMap<String, RuleMatchResult> {
+    /// `extra_mentions` は team メンションを展開した `@login` の列 (#286)。
+    /// body クエリの照合対象に足す。空なら本文そのままを使う。
+    pub fn match_rules(
+        &self,
+        rules: &[Rule],
+        extra_mentions: &str,
+    ) -> HashMap<String, RuleMatchResult> {
+        // rule ごとに組み立てないよう、ここで 1 回だけ作る
+        let body = if extra_mentions.is_empty() {
+            std::borrow::Cow::Borrowed(self.body())
+        } else {
+            std::borrow::Cow::Owned(format!("{body}\n{extra_mentions}", body = self.body()))
+        };
+
         let mut v = HashMap::<String, RuleMatchResult>::new();
 
         for r in rules {
             // not match
-            if !r.check_match(self) {
+            if !r.check_match(self, &body) {
                 continue;
             }
 
@@ -648,6 +661,35 @@ mod tests {
             "pull_request_review.approved.derived.json",
         );
         assert!(p.requested_reviewers().is_empty());
+    }
+
+    /// #286: team メンションを展開すると、個人のルールにマッチすること。
+    /// 展開前 (extra_mentions が空) ではマッチしないことも確認する。
+    #[test]
+    fn expanded_team_mention_matches_personal_rule() {
+        let rule: crate::Rule = serde_json::from_str(
+            r#"{"channel":"test","display_name":"sksat","query":{"body":"@sksat"}}"#,
+        )
+        .unwrap();
+        let rules = vec![rule];
+
+        // body には team メンションだけが書かれている payload
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention.derived.json",
+        );
+        assert!(p.body().contains("@arkedge/sat-sw"));
+        assert!(!p.body().contains("@sksat"));
+
+        // 展開前: team メンションのままなので個人のルールには当たらない
+        assert!(
+            p.match_rules(&rules, "").is_empty(),
+            "展開前にマッチしてはいけない"
+        );
+
+        // 展開後: メンバーの @login が body に足されるのでマッチする
+        let matched = p.match_rules(&rules, "@sksat @meltingrabbit");
+        assert!(matched.contains_key("test"), "展開後はマッチするべき");
     }
 
     /// #122: レビューコメント (と返信) の本文が body として取れること。

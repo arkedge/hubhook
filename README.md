@@ -38,6 +38,19 @@ GitHub App / Webhook 側でこれらのイベントを購読していないと�
 - `pull_request_review` (approve / changes requested / コメント付き review)
 - `pull_request_review_comment` (diff 上のコメントとその返信)
 
+### Team mention
+
+`body` に team メンション (`@org/team`) が書かれている場合、
+GitHub API で team のメンバーを引いて `@login` に展開してから照合する (#286)。
+`@arkedge/sat-sw` へのメンションで、`body` に `@sksat` を指定している
+個人のルールにもマッチするようになる。
+
+展開には `GITHUB_TOKEN` が必要 (org の team を読める権限)。
+未設定の場合は展開されず、team メンションは team メンションのままとして扱う。
+
+メンバーは 10 分キャッシュする。取得に失敗した場合は展開せずに処理を続け、
+log と Sentry に記録する (他のルールの通知は止めない)。
+
 ### Example
 ```json
 {
