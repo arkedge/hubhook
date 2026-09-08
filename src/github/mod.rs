@@ -433,6 +433,70 @@ mod tests {
         assert_actions::<IssueCommentAction>(&["created", "deleted", "edited"]);
     }
 
+    /// #122: レビューコメントへの**返信**が deserialize でき、
+    /// `in_reply_to_id` と本文が取れること。
+    /// 通常のレビューコメントには `in_reply_to_id` のキー自体が無いので、
+    /// 返信の payload は別に用意して検証する。
+    #[test]
+    fn de_review_comment_reply() {
+        let p = de(
+            "pull_request_review_comment",
+            "pull_request_review_comment.reply.derived.json",
+        );
+
+        let Payload::PullRequestReviewComment(rc) = &p else {
+            panic!("not a review comment: {p:?}");
+        };
+        assert!(
+            rc.comment.in_reply_to_id.is_some(),
+            "返信なので in_reply_to_id が入っているべき"
+        );
+        assert!(p.body().contains("@sksat"), "body = {:?}", p.body());
+
+        // 通常のレビューコメント側は None であること
+        let p = de(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.with-organization.json",
+        );
+        let Payload::PullRequestReviewComment(rc) = &p else {
+            panic!("not a review comment");
+        };
+        assert!(rc.comment.in_reply_to_id.is_none());
+    }
+
+    /// `review_state` を指定した rule が review 以外のイベントにマッチしないこと。
+    ///
+    /// query は正規表現なので、以前のように空文字を照合対象にしていると
+    /// `.*` や `^$` のようなパターンが review 以外のイベントにもマッチしてしまう。
+    #[test]
+    fn review_state_query_never_matches_non_review_events() {
+        let rule: crate::Rule = serde_json::from_str(
+            r#"{"channel":"test","display_name":"x","query":{"review_state":".*"}}"#,
+        )
+        .unwrap();
+        let rules = vec![rule];
+
+        // review イベントには当たる
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.approved.derived.json",
+        );
+        assert!(
+            !p.match_rules(&rules).is_empty(),
+            "review にはマッチするべき"
+        );
+
+        // review_state を持たないイベントには当たらない
+        let p = de(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.with-organization.json",
+        );
+        assert!(
+            p.match_rules(&rules).is_empty(),
+            "review_state を持たないイベントにマッチしてはいけない"
+        );
+    }
+
     #[test]
     fn pull_request_review_actions() {
         assert_actions::<PullRequestReviewAction>(&["dismissed", "edited", "submitted"]);

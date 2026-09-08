@@ -329,16 +329,19 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
             title = pr.title,
         );
 
+        // approve にメッセージを付けない運用もある。その場合 text が空だと
+        // Slack の添付がほぼ空表示になるので、PR タイトルを出す
+        let attach_text = if body.is_empty() {
+            pr.title.clone()
+        } else {
+            body.to_string()
+        };
+
         let attach = slack::Attachment {
             title: None,
             title_link: None,
-            // approve にメッセージを付けない運用もあるので、その場合は PR タイトルを出す
-            fallback: if body.is_empty() {
-                pr.title.clone()
-            } else {
-                body.to_string()
-            },
-            text: body.to_string(),
+            fallback: attach_text.clone(),
+            text: attach_text,
             color: Some(color),
         };
 
@@ -431,6 +434,54 @@ mod tests {
     fn dismissed_review_is_not_notified() {
         let msg = message("pull_request_review", "pull_request_review.dismissed.json");
         assert!(msg.is_err(), "dismissed は通知しない");
+    }
+
+    /// #122: レビューコメントへの返信が "New reply" として通知され、
+    /// 本文が保たれること。
+    #[test]
+    fn review_comment_reply_notifies_as_reply() {
+        let msg = message(
+            "pull_request_review_comment",
+            "pull_request_review_comment.reply.derived.json",
+        )
+        .expect("返信も通知されるべき");
+
+        assert!(msg.text.contains("New reply"), "text = {}", msg.text);
+
+        let attach = &msg.attachments.as_ref().unwrap()[0];
+        assert!(attach.text.contains("@sksat"), "attach = {}", attach.text);
+    }
+
+    /// 通常のレビューコメントは "New review comment" になること。
+    #[test]
+    fn plain_review_comment_is_not_labeled_as_reply() {
+        let msg = message(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.with-organization.json",
+        )
+        .expect("レビューコメントは通知されるべき");
+
+        assert!(
+            msg.text.contains("New review comment"),
+            "text = {}",
+            msg.text
+        );
+        assert!(!msg.text.contains("New reply"), "text = {}", msg.text);
+    }
+
+    /// #285: approve にメッセージを付けない場合、attachment の本文が
+    /// 空にならず PR タイトルが入ること。
+    #[test]
+    fn approved_review_without_body_falls_back_to_title() {
+        let msg = message(
+            "pull_request_review",
+            "pull_request_review.approved.no-body.derived.json",
+        )
+        .expect("メッセージ無しの approve も通知されるべき");
+
+        let attach = &msg.attachments.as_ref().unwrap()[0];
+        assert!(!attach.text.is_empty(), "attachment の本文が空");
+        assert_eq!(attach.text, attach.fallback);
     }
 
     /// #122: レビューコメントが本文付きで通知されること。

@@ -288,12 +288,15 @@ impl Rule {
         let labels = payload.labels().iter().collect();
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);
 
-        // review_state を持たないイベントは空文字と照合するので、
-        // review_state を指定した rule は review 以外にマッチしない
-        let r_review_state = Rule::match_query(
-            query.review_state.as_ref(),
-            payload.review_state().unwrap_or(""),
-        );
+        // review_state を持たないイベントには、query が指定されていれば必ず不一致を返す。
+        // 空文字を照合対象にすると、query は正規表現なので `.*` や `^$` のような
+        // パターンがマッチしてしまい、review 以外のイベントまで通知されてしまう
+        // (exclude_query 側では逆に、意図しない抑制になる)。
+        let r_review_state = match (query.review_state.as_ref(), payload.review_state()) {
+            (None, _) => None,
+            (Some(_), None) => Some(false),
+            (Some(query), Some(state)) => Some(Rule::match_query_impl(query, state)),
+        };
 
         vec![
             r_repo,
