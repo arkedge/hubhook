@@ -8,7 +8,7 @@ use serde::Deserialize;
 use regex::RegexBuilder;
 
 use actix_web::error::ErrorBadRequest;
-use actix_web::{web, App, Error, FromRequest, HttpRequest, HttpResponse, HttpServer, Result};
+use actix_web::{App, Error, FromRequest, HttpRequest, HttpResponse, HttpServer, Result, web};
 
 use futures::future::{Future, FutureExt};
 use futures::stream::TryStreamExt;
@@ -163,6 +163,12 @@ impl FromRequest for Data {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // SAFETY: actix のランタイムはカレントスレッド上で動いており、この時点では
+    // まだワーカースレッドも sentry の転送スレッドも生成されていないため、
+    // 環境変数の書き込みが他スレッドの読み取りと競合することはない。
+    // sentry::init はスレッドを立てるので、必ずそれより前に置くこと。
+    unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+
     let opt = Opt::from_args();
 
     let _guard = sentry::init((
@@ -172,7 +178,6 @@ async fn main() -> std::io::Result<()> {
             ..Default::default()
         },
     ));
-    std::env::set_var("RUST_BACKTRACE", "1");
 
     let port = opt.hubhook_port;
 
