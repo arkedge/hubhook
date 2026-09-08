@@ -27,8 +27,22 @@ const MAX_PAGES: usize = 20;
 /// reqwest にはデフォルトのタイムアウトが無い。API が応答しないと webhook の
 /// レスポンスを返せず、GitHub 側が再送してしまうので必ず入れる
 /// (fail-open にするには「有限時間で失敗する」ことが前提)。
-const API_TIMEOUT: Duration = Duration::from_secs(5);
+const API_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// team 展開全体に使える時間。
+///
+/// 1 リクエストにタイムアウトを付けても、team を直列に引く以上、合計は
+/// team 数 × ページ数だけ伸びる。GitHub の webhook 配信タイムアウト (10 秒)
+/// を超えると再送されるうえ、この後に Slack へ POST する時間も要るので、
+/// 展開全体を短く打ち切る。
+const TOTAL_EXPAND_BUDGET: Duration = Duration::from_secs(5);
+
+/// キャッシュに載せる team の上限。
+///
+/// key は body に書かれた任意の文字列なので、上限が無いと存在しない team の
+/// 分だけ際限なく増える。
+const MAX_CACHE_ENTRIES: usize = 1024;
 
 /// 1 つの body で展開する team の上限。
 ///
@@ -53,6 +67,18 @@ struct CacheEntry {
     fetched_at: Instant,
 }
 
+impl CacheEntry {
+    /// まだ使えるか。失敗のキャッシュは短めに切る。
+    fn is_fresh(&self) -> bool {
+        let ttl = if self.members.is_some() {
+            CACHE_TTL
+        } else {
+            NEGATIVE_CACHE_TTL
+        };
+        self.fetched_at.elapsed() < ttl
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     /// token が設定されていないので API を叩けない
@@ -62,6 +88,8 @@ pub enum Error {
     Status(reqwest::StatusCode),
     /// 直前の取得が失敗していて、まだ再取得の時期ではない
     CachedFailure,
+    /// ページ上限を超えた。一部だけ返すと通知が静かに欠けるのでエラーにする
+    TooManyMembers,
 }
 
 impl std::fmt::Display for Error {
@@ -71,6 +99,9 @@ impl std::fmt::Display for Error {
             Self::Request(e) => write!(f, "request failed: {e}"),
             Self::Status(s) => write!(f, "unexpected status: {s}"),
             Self::CachedFailure => write!(f, "previous lookup failed (cached)"),
+            Self::TooManyMembers => {
+                write!(f, "team has more than {} members", PER_PAGE * MAX_PAGES)
+            }
         }
     }
 }
@@ -124,13 +155,33 @@ impl TeamResolver {
     /// 展開に失敗しても、他のルールの判定は続けたいので空文字を返す
     /// (fail-open)。失敗は log と sentry に出す。
     pub async fn expand_mentions(&self, body: &str) -> String {
+        // token が無いときはここで諦める。イベントごとに warn と Sentry を
+        // 出すと「省略可・設定しなければ静かに無効」という設計と矛盾するので、
+        // 通知は起動時の warn 1 回だけにする。
+        if self.token.is_none() {
+            return String::new();
+        }
+
         let teams = self.teams_in(body);
         if teams.is_empty() {
             return String::new();
         }
 
+        let started = Instant::now();
+
         let mut mentions: Vec<String> = Vec::new();
-        for (org, slug) in &teams {
+        for (i, (org, slug)) in teams.iter().enumerate() {
+            // 直列に引くので、全体の経過時間で打ち切る
+            if started.elapsed() >= TOTAL_EXPAND_BUDGET {
+                let msg = format!(
+                    "team expansion budget exceeded; {} team(s) left unexpanded",
+                    teams.len() - i
+                );
+                warn!("{msg}");
+                sentry::capture_message(&msg, sentry::Level::Warning);
+                break;
+            }
+
             match self.members(org, slug).await {
                 Ok(members) => {
                     debug!("expanded @{org}/{slug} to {} member(s)", members.len());
@@ -187,15 +238,10 @@ impl TeamResolver {
         // await をまたいでロックを持たないように、スコープを切って読む
         {
             let cache = self.cache.read().expect("team cache lock poisoned");
-            if let Some(entry) = cache.get(&key) {
-                let ttl = if entry.members.is_some() {
-                    CACHE_TTL
-                } else {
-                    NEGATIVE_CACHE_TTL
-                };
-                if entry.fetched_at.elapsed() < ttl {
-                    return entry.members.clone().ok_or(Error::CachedFailure);
-                }
+            if let Some(entry) = cache.get(&key)
+                && entry.is_fresh()
+            {
+                return entry.members.clone().ok_or(Error::CachedFailure);
             }
         }
 
@@ -203,17 +249,33 @@ impl TeamResolver {
 
         // token 未設定は team ごとの失敗ではないのでキャッシュしない
         if !matches!(result, Err(Error::NoToken)) {
-            let mut cache = self.cache.write().expect("team cache lock poisoned");
-            cache.insert(
-                key,
-                CacheEntry {
-                    members: result.as_ref().ok().cloned(),
-                    fetched_at: Instant::now(),
-                },
-            );
+            self.remember(key, result.as_ref().ok().cloned());
         }
 
         result
+    }
+
+    /// キャッシュに載せる。期限切れを掃除し、上限を超えていたら載せない。
+    ///
+    /// key は body に書かれた任意の文字列なので、掃除しないと存在しない team の
+    /// 分だけプロセスの寿命だけ増え続ける。
+    fn remember(&self, key: String, members: Option<Vec<String>>) {
+        let mut cache = self.cache.write().expect("team cache lock poisoned");
+
+        cache.retain(|_, entry| entry.is_fresh());
+
+        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&key) {
+            warn!("team cache is full ({MAX_CACHE_ENTRIES}); not caching {key}");
+            return;
+        }
+
+        cache.insert(
+            key,
+            CacheEntry {
+                members,
+                fetched_at: Instant::now(),
+            },
+        );
     }
 
     async fn fetch_members(&self, org: &str, slug: &str) -> Result<Vec<String>, Error> {
@@ -254,11 +316,10 @@ impl TeamResolver {
 
             page += 1;
             if page > MAX_PAGES {
-                warn!(
-                    "@{org}/{slug} has more than {} members; truncating",
-                    PER_PAGE * MAX_PAGES
-                );
-                break;
+                // 一部だけ返してキャッシュすると、載らなかった人に通知が
+                // 飛ばなくなる。しかも 10 分そのままなので静かに壊れる。
+                // 部分的な結果は返さず、エラーにして気づけるようにする。
+                return Err(Error::TooManyMembers);
             }
         }
 
@@ -340,7 +401,60 @@ mod tests {
         assert!(r.token.is_none());
     }
 
-    /// token が無いときは展開できないが、panic せず空文字で返ること。
+    /// 期限切れのエントリが insert 時に掃除されること。
+    /// key は body 由来の任意文字列なので、掃除しないと際限なく増える。
+    #[test]
+    fn expired_cache_entries_are_pruned() {
+        let r = resolver();
+
+        {
+            let mut cache = r.cache.write().unwrap();
+            cache.insert(
+                "old/team".to_string(),
+                CacheEntry {
+                    members: Some(vec!["a".to_string()]),
+                    fetched_at: Instant::now() - CACHE_TTL - Duration::from_secs(1),
+                },
+            );
+        }
+
+        r.remember("new/team".to_string(), Some(vec!["b".to_string()]));
+
+        let cache = r.cache.read().unwrap();
+        assert!(!cache.contains_key("old/team"), "期限切れが残っている");
+        assert!(cache.contains_key("new/team"));
+    }
+
+    /// 失敗のキャッシュは成功より短い TTL で切れること。
+    /// 存在しない team を毎回引かず、かつ一時的な失敗からは早く復帰させる。
+    #[test]
+    fn negative_cache_expires_sooner_than_positive() {
+        let elapsed = NEGATIVE_CACHE_TTL + Duration::from_secs(1);
+
+        let failed = CacheEntry {
+            members: None,
+            fetched_at: Instant::now() - elapsed,
+        };
+        assert!(!failed.is_fresh(), "失敗のキャッシュは切れているべき");
+
+        let ok = CacheEntry {
+            members: Some(vec![]),
+            fetched_at: Instant::now() - elapsed,
+        };
+        assert!(ok.is_fresh(), "成功のキャッシュはまだ有効であるべき");
+    }
+
+    /// 展開全体の予算は GitHub の webhook 配信タイムアウト (10 秒) より
+    /// 十分短くしておく。展開のあとに Slack への POST も要る。
+    #[test]
+    fn expand_budget_is_shorter_than_webhook_timeout() {
+        assert!(TOTAL_EXPAND_BUDGET < Duration::from_secs(10));
+        // 1 リクエストのタイムアウトが予算より長いと予算が意味を持たない
+        assert!(API_TIMEOUT <= TOTAL_EXPAND_BUDGET);
+    }
+
+    /// token が無いときは API を叩かず、静かに展開なしで返ること。
+    /// イベントごとに warn / Sentry を出さない (起動時の warn だけ)。
     #[actix_web::test]
     async fn missing_token_fails_open() {
         let r = resolver();
