@@ -5,7 +5,7 @@
 //! team のメンバーは payload に入っていないため GitHub API で引く。
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -125,6 +125,12 @@ pub struct TeamResolver {
     token: Option<String>,
     /// GitHub API の base URL。テストで差し替える。
     base_url: String,
+    /// team ごとの取得中ロック。
+    ///
+    /// キャッシュが空の瞬間に同じ team のリクエストが同時に来ると、全員が
+    /// キャッシュミスして各自 API を叩く (cache stampede)。キャッシュだけでは
+    /// 防げないので、team ごとにロックを取って取得を 1 本にまとめる。
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// `@org/team` を拾う。org / team slug に使える文字は英数と `-`、
     /// team slug には `_` と `.` も入りうる。
     mention: Regex,
@@ -156,6 +162,7 @@ impl TeamResolver {
                 .expect("could not build http client"),
             token,
             base_url,
+            inflight: Mutex::new(HashMap::new()),
             mention: Regex::new(r"@([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)")
                 .expect("invalid team mention regex"),
             cache: RwLock::new(HashMap::new()),
@@ -255,14 +262,18 @@ impl TeamResolver {
     ) -> Result<Vec<String>, Error> {
         let key = format!("{org}/{slug}");
 
-        // await をまたいでロックを持たないように、スコープを切って読む
-        {
-            let cache = self.cache.read().expect("team cache lock poisoned");
-            if let Some(entry) = cache.get(&key)
-                && entry.is_fresh()
-            {
-                return entry.members.clone().ok_or(Error::CachedFailure);
-            }
+        // 速い経路。await をまたいでロックを持たないよう、スコープを切って読む
+        if let Some(cached) = self.cached(&key) {
+            return cached;
+        }
+
+        // この team の取得権を取る。同じ team を同時に引かないようにする
+        let lock = self.inflight_lock(&key);
+        let _guard = lock.lock().await;
+
+        // 待っている間に、先に取得した人がキャッシュを埋めているかもしれない
+        if let Some(cached) = self.cached(&key) {
+            return cached;
         }
 
         let result = self.fetch_members(org, slug, deadline).await;
@@ -273,6 +284,31 @@ impl TeamResolver {
         }
 
         result
+    }
+
+    /// キャッシュに使える値があればそれを返す。
+    fn cached(&self, key: &str) -> Option<Result<Vec<String>, Error>> {
+        let cache = self.cache.read().expect("team cache lock poisoned");
+        let entry = cache.get(key)?;
+        if !entry.is_fresh() {
+            return None;
+        }
+        Some(entry.members.clone().ok_or(Error::CachedFailure))
+    }
+
+    /// team ごとの取得中ロックを取り出す (無ければ作る)。
+    ///
+    /// 使い終わったものは、他に持っている人がいなければ捨てる。
+    /// key は body 由来の任意文字列なので、放置すると増え続ける。
+    fn inflight_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut inflight = self.inflight.lock().expect("inflight lock poisoned");
+
+        inflight.retain(|_, lock| Arc::strong_count(lock) > 1);
+
+        inflight
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// キャッシュに載せる。期限切れを掃除し、上限を超えていたら載せない。
@@ -386,19 +422,34 @@ mod tests {
     }
 
     fn spawn_api_with_delay(page_sizes: Vec<usize>, status: u16, delay: Duration) -> String {
+        spawn_api_counting(page_sizes, status, delay).0
+    }
+
+    /// 受けたリクエスト数を数えるテスト用サーバ。
+    fn spawn_api_counting(
+        page_sizes: Vec<usize>,
+        status: u16,
+        delay: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use actix_web::{App, HttpResponse, HttpServer, web};
         use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let sizes = Arc::new(page_sizes);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
 
         let srv = HttpServer::new(move || {
             let sizes = sizes.clone();
+            let hits = hits_srv.clone();
             App::new().route(
                 "/orgs/{org}/teams/{slug}/members",
                 web::get().to(move |q: web::Query<HashMap<String, String>>| {
                     let sizes = sizes.clone();
+                    let hits = hits.clone();
                     async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+
                         if !delay.is_zero() {
                             actix_web::rt::time::sleep(delay).await;
                         }
@@ -427,7 +478,7 @@ mod tests {
         let addr = srv.addrs()[0];
         actix_web::rt::spawn(srv.run());
 
-        format!("http://{addr}")
+        (format!("http://{addr}"), hits)
     }
 
     fn api_resolver(base: String) -> TeamResolver {
@@ -533,6 +584,38 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "残り予算 (0.5 秒) ではなく API_TIMEOUT ({API_TIMEOUT:?}) まで待っている: {elapsed:?}"
+        );
+    }
+
+    /// 同じ team に同時にリクエストが来ても、API は 1 回しか叩かないこと。
+    ///
+    /// キャッシュが空の瞬間は全員がミスするので、キャッシュだけでは防げない
+    /// (cache stampede)。team ごとのロックで 1 本にまとめている。
+    #[actix_web::test]
+    async fn concurrent_lookups_share_one_request() {
+        use std::sync::atomic::Ordering;
+
+        // 全員がキャッシュミスを踏めるよう、応答を少し遅らせる
+        let (base, hits) = spawn_api_counting(vec![2], 200, Duration::from_millis(200));
+        let r = Arc::new(api_resolver(base));
+
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let r = r.clone();
+            tasks.push(actix_web::rt::spawn(async move {
+                r.members("arkedge", "sat-sw", far_deadline()).await
+            }));
+        }
+
+        for t in tasks {
+            let members = t.await.expect("task panicked").expect("取得できるべき");
+            assert_eq!(members.len(), 2);
+        }
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "同じ team を複数回引いている"
         );
     }
 

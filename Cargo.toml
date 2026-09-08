@@ -24,6 +24,9 @@ serde = "1.0.200"
 serde_json = "1.0.116"
 serde_path_to_error = "0.1.20"
 structopt = "0.3.26"
+# team ごとの取得を 1 本にまとめるための非同期 Mutex だけを使う。
+# actix / reqwest 経由ですでに依存ツリーに入っている。
+tokio = { version = "1.53.1", features = ["sync"] }
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 url = { version = "2.5.0", features = ["serde"]}
