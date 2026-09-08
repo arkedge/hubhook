@@ -87,6 +87,11 @@ fn body_text(body: &str, assignees: &[github::common::User]) -> Option<String> {
     Some(format!("{body}{suffix}"))
 }
 
+/// attachment の本文。markdown ブロックと、退避用の mrkdwn を組にする。
+fn body_content(body: &str, assignees: &[github::common::User]) -> slack::Body {
+    slack::Body::new(body_blocks(body, assignees), body_text(body, assignees))
+}
+
 fn users2str(
     assignees: &[github::common::User],
     delimiter: &str,
@@ -151,8 +156,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
-                        text: body_text(issue.body.as_deref().unwrap_or(""), &issue.assignees),
-                        blocks: body_blocks(issue.body.as_deref().unwrap_or(""), &issue.assignees),
+                        body: body_content(issue.body.as_deref().unwrap_or(""), &issue.assignees),
                         color,
                     }
                 };
@@ -193,8 +197,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
-                        text: body_text("", assignees),
-                        blocks: body_blocks("", assignees),
+                        body: body_content("", assignees),
                         color,
                     }
                 };
@@ -238,8 +241,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback,
-                        text: body_text(body, &pr.assignees),
-                        blocks: body_blocks(body, &pr.assignees),
+                        body: body_content(body, &pr.assignees),
                         color,
                     }
                 };
@@ -278,8 +280,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
-                        text: body_text(pr.body.as_deref().unwrap_or(""), &[]),
-                        blocks: body_blocks(pr.body.as_deref().unwrap_or(""), &[]),
+                        body: body_content(pr.body.as_deref().unwrap_or(""), &[]),
                         // 「対応してほしい」通知なので opened / assigned とは色を変える
                         color: Some(slack::Color::Warning),
                     }
@@ -315,8 +316,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
-                        text: body_text("", assignees),
-                        blocks: body_blocks("", assignees),
+                        body: body_content("", assignees),
                         color,
                     }
                 };
@@ -358,8 +358,7 @@ impl TryFrom<&github::IssueComment> for slack::Message {
                     title: None,
                     title_link: None,
                     fallback: comment.body.clone(),
-                    text: body_text(&comment.body, &[]),
-                    blocks: body_blocks(&comment.body, &[]),
+                    body: body_content(&comment.body, &[]),
                     color,
                 };
                 let attachments = Some(vec![attach]);
@@ -422,8 +421,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
             title: None,
             title_link: None,
             fallback: attach_text.clone(),
-            text: body_text(&attach_text, &[]),
-            blocks: body_blocks(&attach_text, &[]),
+            body: body_content(&attach_text, &[]),
             color: Some(color),
         };
 
@@ -467,8 +465,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
             title: Some(comment.path.clone()),
             title_link: Some(comment.html_url.clone()),
             fallback: comment.body.clone(),
-            text: body_text(&comment.body, &[]),
-            blocks: body_blocks(&comment.body, &[]),
+            body: body_content(&comment.body, &[]),
             color: Some(slack::Color::Comment),
         };
 
@@ -502,9 +499,9 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            attach.blocks[0].text().contains("@sksat"),
+            attach.body.blocks()[0].text().contains("@sksat"),
             "attach = {}",
-            attach.blocks[0].text()
+            attach.body.blocks()[0].text()
         );
     }
 
@@ -537,9 +534,9 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            attach.blocks[0].text().contains("@sksat"),
+            attach.body.blocks()[0].text().contains("@sksat"),
             "attach = {}",
-            attach.blocks[0].text()
+            attach.body.blocks()[0].text()
         );
     }
 
@@ -571,8 +568,11 @@ mod tests {
         .expect("メッセージ無しの approve も通知されるべき");
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
-        assert!(!attach.blocks[0].text().is_empty(), "attachment の本文が空");
-        assert_eq!(attach.blocks[0].text(), attach.fallback);
+        assert!(
+            !attach.body.blocks()[0].text().is_empty(),
+            "attachment の本文が空"
+        );
+        assert_eq!(attach.body.blocks()[0].text(), attach.fallback);
     }
 
     /// 本文を markdown ブロックとして、変換せずそのまま渡すこと。
@@ -589,7 +589,7 @@ mod tests {
         .expect("通知されるべき");
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
-        assert_eq!(attach.blocks.len(), 1, "markdown ブロックが 1 つ");
+        assert_eq!(attach.body.blocks().len(), 1, "markdown ブロックが 1 つ");
 
         // fixture の review 本文がそのまま入っていること
         let crate::github::Payload::PullRequestReview(review) = &de(
@@ -599,7 +599,7 @@ mod tests {
             panic!("not a review");
         };
         let body = review.review.body.as_deref().unwrap();
-        assert_eq!(attach.blocks[0].text(), body, "加工されている");
+        assert_eq!(attach.body.blocks()[0].text(), body, "加工されている");
     }
 
     /// attachment 本文の Assignees が Markdown 記法になること。
@@ -614,7 +614,7 @@ mod tests {
         )
         .expect("通知されるべき");
 
-        let body = msg.attachments.as_ref().unwrap()[0].blocks[0].text();
+        let body = msg.attachments.as_ref().unwrap()[0].body.blocks()[0].text();
         assert!(
             body.contains("**Assignees**"),
             "太字が Markdown でない: {body}"
@@ -639,7 +639,7 @@ mod tests {
         let a = &msg.attachments.as_ref().unwrap()[0];
 
         // 主: markdown ブロック
-        let block = a.blocks[0].text();
+        let block = a.body.blocks()[0].text();
         assert!(block.contains("**Assignees**"), "block = {block}");
         assert!(
             block.contains("[Codertocat](https://github.com/Codertocat)"),
@@ -647,7 +647,7 @@ mod tests {
         );
 
         // 退避: mrkdwn
-        let text = a.text.as_deref().expect("退避先が無い");
+        let text = a.body.mrkdwn().expect("退避先が無い");
         assert!(
             !text.contains("**Assignees**"),
             "Markdown のままになっている: {text}"
@@ -673,9 +673,9 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            attach.blocks.is_empty(),
+            attach.body.blocks().is_empty(),
             "空のブロックを作っている: {:?}",
-            attach.blocks
+            attach.body.blocks()
         );
         // 本文が無くても要約行は出る
         assert!(
@@ -694,7 +694,7 @@ mod tests {
         )
         .expect("通知されるべき");
 
-        let body = msg.attachments.as_ref().unwrap()[0].blocks[0].text();
+        let body = msg.attachments.as_ref().unwrap()[0].body.blocks()[0].text();
         assert!(body.contains("**Assignees**"), "Assignees が無い: {body}");
     }
 
@@ -736,7 +736,7 @@ mod tests {
         .expect("レビューコメントは通知されるべき");
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
-        assert!(!attach.blocks[0].text().is_empty(), "本文が空");
+        assert!(!attach.body.blocks()[0].text().is_empty(), "本文が空");
         // どのファイルへのコメントかが分かること
         assert!(attach.title.is_some(), "path が入っていない");
     }

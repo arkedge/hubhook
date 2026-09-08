@@ -100,21 +100,93 @@ pub struct Attachment {
     pub title_link: Option<url::Url>,
     pub fallback: String,
     pub color: Option<Color>,
-    /// 本文の退避先。markdown ブロックが拒否されたときだけ使う。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// 本文。markdown ブロックとして入れる。
-    ///
-    /// 本文が無いときは空にする。空の `text` を持つブロックを送ると
-    /// `invalid_blocks` で拒否され、通知が飛ばなくなる。
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(flatten)]
+    pub body: Body,
+}
+
+/// attachment の本文。
+///
+/// `blocks` と `text` の**どちらか一方**しか送らない。両方入れると Slack が
+/// 両方を描画して本文が二重に出るので、型で片方に限っている
+/// (`skip_serializing_if` は自分の値しか見られず、兄弟フィールドの有無では
+/// 分岐できない)。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum Body {
+    /// markdown ブロックとして送る。
     ///
     /// attachment の `text` は mrkdwn (Slack 独自記法) なので、GitHub の本文を
     /// そのまま貼ると崩れる (`##` がそのまま出る、`*x*` の強調が入れ替わる)。
     /// markdown ブロックは **本物の Markdown** を解釈するので、見出しや表、
     /// タスクリストまでそのまま渡せる。
     /// 色バーを残したいので、トップレベルではなく attachment の中に置く。
-    pub blocks: Vec<Block>,
+    Blocks {
+        blocks: Vec<Block>,
+        /// 拒否されたときの退避先 (mrkdwn)。リクエストには含めない。
+        #[serde(skip)]
+        mrkdwn: Option<String>,
+    },
+    /// 従来どおり attachment の `text` として送る (退避先)。
+    Text { text: String },
+    /// 本文が無い。
+    ///
+    /// 空の `text` を持つブロックは `invalid_blocks` で拒否され、通知そのものが
+    /// 飛ばなくなるので、空なら何も入れない。
+    Empty {},
+}
+
+impl Body {
+    /// markdown ブロックと、拒否されたとき用の mrkdwn から作る。
+    pub fn new(blocks: Vec<Block>, mrkdwn: Option<String>) -> Self {
+        if !blocks.is_empty() {
+            return Self::Blocks { blocks, mrkdwn };
+        }
+
+        match mrkdwn {
+            Some(text) => Self::Text { text },
+            None => Self::Empty {},
+        }
+    }
+
+    /// blocks をやめて退避先に変える。
+    fn fall_back(&mut self) {
+        let Self::Blocks { mrkdwn, .. } = self else {
+            return;
+        };
+
+        let mrkdwn = mrkdwn.take();
+        *self = match mrkdwn {
+            Some(text) => Self::Text { text },
+            None => Self::Empty {},
+        };
+    }
+
+    /// 中の blocks。テストで中身を確認するために使う。
+    #[cfg(test)]
+    pub fn blocks(&self) -> &[Block] {
+        match self {
+            Self::Blocks { blocks, .. } => blocks,
+            _ => &[],
+        }
+    }
+
+    /// 送る `text`。テストで中身を確認するために使う。
+    #[cfg(test)]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// 退避用に用意しておいた mrkdwn。テストで中身を確認するために使う。
+    #[cfg(test)]
+    pub fn mrkdwn(&self) -> Option<&str> {
+        match self {
+            Self::Blocks { mrkdwn, .. } => mrkdwn.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Block Kit のブロック。今は markdown だけ使う。
@@ -129,15 +201,15 @@ pub enum Block {
 impl MessagePayload {
     /// blocks をやめて、`text` だけにした payload。
     ///
-    /// markdown ブロックが受け付けられない場合の退避先。`text` は構築時に
-    /// mrkdwn で作ってあるので、ここでは blocks を落とすだけでよい。
-    /// ブロックの Markdown を流用すると、`**太字**` や `[name](url)` が
-    /// 解釈されず従来より悪い表示になる (方言が違う)。
+    /// markdown ブロックが受け付けられない場合の退避先。用意しておいた
+    /// mrkdwn の本文を `text` に移す。ブロックの Markdown を流用すると
+    /// `**太字**` や `[name](url)` が解釈されず、従来より悪い表示になる
+    /// (方言が違う)。
     ///
     /// 従来の表現なので、長い本文は Slack 側で畳まれる。
     fn into_text_fallback(mut self) -> Self {
         for a in self.attachments.iter_mut().flatten() {
-            a.blocks.clear();
+            a.body.fall_back();
         }
 
         self
@@ -255,15 +327,27 @@ impl Message {
 mod tests {
     use super::*;
 
-    fn attachment(blocks: Vec<Block>) -> Attachment {
-        Attachment {
-            title: None,
-            title_link: None,
-            fallback: "fallback".to_string(),
-            color: None,
-            text: None,
-            blocks,
+    fn payload(body: Body) -> MessagePayload {
+        MessagePayload {
+            channel: "c".to_string(),
+            username: None,
+            text: "summary".to_string(),
+            fallback: None,
+            attachments: Some(vec![Attachment {
+                title: None,
+                title_link: None,
+                fallback: "fallback".to_string(),
+                color: None,
+                body,
+            }]),
         }
+    }
+
+    fn blocks(md: &str, mrkdwn: Option<&str>) -> Body {
+        Body::new(
+            vec![Block::markdown(md, "").expect("ブロックが作られない")],
+            mrkdwn.map(str::to_string),
+        )
     }
 
     #[test]
@@ -328,29 +412,56 @@ mod tests {
         }
     }
 
-    /// 退避すると blocks が落ち、構築時に作った text が残ること。
+    /// **初回のリクエストに `text` を入れないこと。**
     ///
-    /// text はブロックの Markdown を流用せず、mrkdwn で別に作ってある。
+    /// Slack は attachment の `text` と blocks を両方描画するので、一緒に送ると
+    /// 成功時に本文が二重に出る。退避用の mrkdwn は持っていても送らない。
     #[test]
-    fn fallback_drops_blocks_and_keeps_text() {
-        let mut a = attachment(vec![Block::markdown("## body", "").unwrap()]);
-        a.text = Some("## body\n*Assignees*\n<https://github.com/sksat|sksat>".to_string());
+    fn first_request_sends_blocks_without_text() {
+        let payload = payload(blocks("## body", Some("## body\n*Assignees*")));
+        let json = serde_json::to_value(&payload).expect("直列化に失敗");
+        let a = &json["attachments"][0];
 
-        let payload = MessagePayload {
-            channel: "c".to_string(),
-            username: None,
-            text: "summary".to_string(),
-            fallback: None,
-            attachments: Some(vec![a]),
-        };
+        assert!(a["blocks"].is_array(), "blocks が無い: {a}");
+        assert!(a.get("text").is_none(), "text が同送されている: {a}");
+    }
 
-        let payload = payload.into_text_fallback();
-        let a = &payload.attachments.as_ref().unwrap()[0];
+    /// 退避後は `text` だけになること。
+    ///
+    /// 用意しておいた mrkdwn が入る。ブロックの Markdown を流用すると
+    /// `**太字**` や `[name](url)` が解釈されず、従来より悪い表示になる。
+    #[test]
+    fn fallback_request_sends_text_without_blocks() {
+        let mrkdwn = "## body\n*Assignees*\n<https://github.com/sksat|sksat>";
+        let payload = payload(blocks("## body", Some(mrkdwn))).into_text_fallback();
+        let json = serde_json::to_value(&payload).expect("直列化に失敗");
+        let a = &json["attachments"][0];
 
-        assert!(a.blocks.is_empty(), "blocks が残っている");
-        assert!(
-            a.text.as_deref().unwrap().contains("*Assignees*"),
-            "text が失われている"
-        );
+        assert_eq!(a["text"], mrkdwn, "mrkdwn の text になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
+    /// 本文が無いときは `text` も `blocks` も送らないこと。
+    ///
+    /// 空の `text` を持つブロックは `invalid_blocks` で拒否される。
+    #[test]
+    fn bodyless_attachment_sends_neither() {
+        let json = serde_json::to_value(payload(Body::new(vec![], None))).expect("直列化に失敗");
+        let a = &json["attachments"][0];
+
+        assert!(a.get("text").is_none(), "text が入っている: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が入っている: {a}");
+    }
+
+    /// ブロックの無い本文は退避しても変わらないこと。
+    #[test]
+    fn fallback_leaves_blockless_bodies_alone() {
+        let mut empty = Body::new(vec![], None);
+        empty.fall_back();
+        assert!(matches!(empty, Body::Empty {}), "{empty:?}");
+
+        let mut text = Body::new(vec![], Some("body".to_string()));
+        text.fall_back();
+        assert_eq!(text.text(), Some("body"));
     }
 }
