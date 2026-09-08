@@ -296,23 +296,31 @@ impl Rule {
                 .is_some_and(|q| q.body.is_some())
     }
 
-    /// `mentions` は team メンションを展開した `@login` の列 (#286)。
-    fn check_match(&self, payload: &github::Payload, mentions: &str) -> bool {
-        let include_query_result = Rule::match_results(&self.query, payload, mentions)
+    /// `mentions` は team メンションを展開した `@login` の列、
+    /// `combined` は「元の本文 + `mentions`」を組み立てたもの (#286)。
+    /// どちらも webhook ごとに 1 回作って rule 間で使い回す。
+    fn check_match(&self, payload: &github::Payload, mentions: &str, combined: &str) -> bool {
+        let include_query_result = Rule::match_results(&self.query, payload, mentions, combined)
             .iter()
             .all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
-            let exclude_query_result = Rule::match_results(exclude_query, payload, mentions)
-                .iter()
-                .any(|&r| r);
+            let exclude_query_result =
+                Rule::match_results(exclude_query, payload, mentions, combined)
+                    .iter()
+                    .any(|&r| r);
             include_query_result && !exclude_query_result
         } else {
             include_query_result
         }
     }
 
-    fn match_results(query: &Query, payload: &github::Payload, mentions: &str) -> Vec<bool> {
+    fn match_results(
+        query: &Query,
+        payload: &github::Payload,
+        mentions: &str,
+        combined: &str,
+    ) -> Vec<bool> {
         let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
 
         let topics = &payload.repo().topics;
@@ -342,7 +350,8 @@ impl Rule {
             // 2. 元の本文 + 展開結果。本文の文脈と組み合わせたパターン
             //    (`レビュー.*@sksat` など) を拾う。区切りは改行ではなく空白
             //    (正規表現の `.` は既定で改行に一致しない)。
-            if re.is_match(&format!("{body} {mentions}")) {
+            //    組み立て済みのものを受け取るので、rule ごとには確保しない。
+            if re.is_match(combined) {
                 return true;
             }
 

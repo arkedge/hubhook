@@ -358,11 +358,20 @@ impl Payload {
         rules: &[Rule],
         extra_mentions: &str,
     ) -> HashMap<String, RuleMatchResult> {
+        // 「本文 + 展開結果」は rule ごとに使うので、ここで 1 回だけ組み立てる。
+        // rule ごとに format! すると、展開結果が大きいときに rule 数だけ
+        // 確保と走査を繰り返すことになる。
+        let combined = if extra_mentions.is_empty() {
+            String::new()
+        } else {
+            format!("{body} {extra_mentions}", body = self.body())
+        };
+
         let mut v = HashMap::<String, RuleMatchResult>::new();
 
         for r in rules {
             // not match
-            if !r.check_match(self, extra_mentions) {
+            if !r.check_match(self, extra_mentions, &combined) {
                 continue;
             }
 
