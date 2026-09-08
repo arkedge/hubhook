@@ -538,7 +538,7 @@ mod tests {
             "pull_request_review.approved.derived.json",
         );
         assert!(
-            !p.match_rules(&rules).is_empty(),
+            !p.match_rules(&rules, "").is_empty(),
             "review にはマッチするべき"
         );
 
@@ -548,7 +548,7 @@ mod tests {
             "pull_request_review_comment.created.with-organization.json",
         );
         assert!(
-            p.match_rules(&rules).is_empty(),
+            p.match_rules(&rules, "").is_empty(),
             "review_state を持たないイベントにマッチしてはいけない"
         );
     }
