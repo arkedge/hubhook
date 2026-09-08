@@ -43,6 +43,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 展開全体を短く打ち切る。
 const TOTAL_EXPAND_BUDGET: Duration = Duration::from_secs(5);
 
+/// GitHub の org / user 名の最大長。
+const MAX_ORG_LEN: usize = 39;
+
+/// team slug の最大長 (team 名の上限 255 文字から生成される)。
+const MAX_SLUG_LEN: usize = 255;
+
 /// キャッシュに載せる team の上限。
 ///
 /// key は body に書かれた任意の文字列なので、上限が無いと存在しない team の
@@ -243,7 +249,22 @@ impl TeamResolver {
         let mut seen: HashSet<(String, String)> = HashSet::new();
 
         for cap in self.mention.captures_iter(body) {
-            let team = (cap[1].to_string(), cap[2].to_string());
+            let (org, slug) = (&cap[1], &cap[2]);
+
+            // body は誰でも書けるので、GitHub の識別子として妥当な長さを
+            // 超えたものは捨てる。切り詰めるのではなく捨てるのは、
+            // 途中まで一致した別 team を引いてしまわないため。
+            // ここは &str のままなので、捨てる分は確保しない。
+            if org.len() > MAX_ORG_LEN || slug.len() > MAX_SLUG_LEN {
+                warn!(
+                    "skipping overlong team mention (org {} chars, slug {} chars)",
+                    org.len(),
+                    slug.len()
+                );
+                continue;
+            }
+
+            let team = (org.to_string(), slug.to_string());
 
             // Vec::contains で重複を見ると、mention 風の文字列を大量に
             // 書かれたときに件数の 2 乗になる
@@ -704,6 +725,34 @@ mod tests {
         assert_eq!(
             r.teams_in("@arkedge/sat.sw_v2"),
             vec![("arkedge".to_string(), "sat.sw_v2".to_string())]
+        );
+    }
+
+    /// 長すぎる org / slug は捨てること。
+    ///
+    /// body は誰でも書けるので、上限が無いと超長い文字列が
+    /// cache key や URL、Sentry イベントに載ってしまう。
+    #[test]
+    fn overlong_mentions_are_skipped() {
+        let r = resolver();
+
+        let long_org = "a".repeat(MAX_ORG_LEN + 1);
+        assert!(
+            r.teams_in(&format!("@{long_org}/sat-sw")).is_empty(),
+            "長い org を拾ってしまっている"
+        );
+
+        let long_slug = "b".repeat(MAX_SLUG_LEN + 1);
+        assert!(
+            r.teams_in(&format!("@arkedge/{long_slug}")).is_empty(),
+            "長い slug を拾ってしまっている"
+        );
+
+        // 上限ぴったりは通す
+        let ok_org = "c".repeat(MAX_ORG_LEN);
+        assert_eq!(
+            r.teams_in(&format!("@{ok_org}/sat-sw")),
+            vec![(ok_org, "sat-sw".to_string())]
         );
     }
 

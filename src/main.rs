@@ -279,14 +279,14 @@ async fn webhook(
 }
 
 impl Rule {
-    /// `body` は team メンションを展開したあとの本文 (#286)。
-    fn check_match(&self, payload: &github::Payload, body: &str) -> bool {
-        let include_query_result = Rule::match_results(&self.query, payload, body)
+    /// `mentions` は team メンションを展開した `@login` の列 (#286)。
+    fn check_match(&self, payload: &github::Payload, mentions: &str) -> bool {
+        let include_query_result = Rule::match_results(&self.query, payload, mentions)
             .iter()
             .all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
-            let exclude_query_result = Rule::match_results(exclude_query, payload, body)
+            let exclude_query_result = Rule::match_results(exclude_query, payload, mentions)
                 .iter()
                 .any(|&r| r);
             include_query_result && !exclude_query_result
@@ -295,7 +295,7 @@ impl Rule {
         }
     }
 
-    fn match_results(query: &Query, payload: &github::Payload, body: &str) -> Vec<bool> {
+    fn match_results(query: &Query, payload: &github::Payload, mentions: &str) -> Vec<bool> {
         let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
 
         let topics = &payload.repo().topics;
@@ -304,7 +304,12 @@ impl Rule {
 
         let r_sender = Rule::match_query(query.user.as_ref(), &payload.sender().login);
         let r_title = Rule::match_query(query.title.as_ref(), payload.title());
-        let r_body = Rule::match_query(query.body.as_ref(), body);
+        // body クエリは「元の本文」と「team 展開結果」に別々に当てて OR を取る。
+        // 1 つの文字列に連結すると、アンカー付きの既存ルールの意味が変わる。
+        let r_body = query.body.as_ref().map(|q| {
+            Rule::match_query_impl(q, payload.body())
+                || (!mentions.is_empty() && Rule::match_query_impl(q, mentions))
+        });
 
         let labels = payload.labels().iter().collect();
         let r_labels = Rule::match_query_vec(query.label.as_ref(), labels);

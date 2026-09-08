@@ -41,9 +41,14 @@ GitHub App / Webhook 側でこれらのイベントを購読していないと�
 ### Team mention
 
 `body` に team メンション (`@org/team`) が書かれている場合、
-GitHub API で team のメンバーを引いて `@login` に展開してから照合する (#286)。
+GitHub API で team のメンバーを引いて `@login` に展開する (#286)。
 `@arkedge/sat-sw` へのメンションで、`body` に `@sksat` を指定している
 個人のルールにもマッチするようになる。
+
+`body` クエリは「元の本文」と「展開結果」に別々に当てて、どちらかが
+一致すればマッチとする。1 つの文字列に連結すると、`@org/team$` のような
+アンカー付きの既存ルールの意味が変わってしまうため
+(exclude_query 側では、除外されるべきものが除外されなくなる)。
 
 展開には `GITHUB_TOKEN` が必要 (org の team を読める権限)。
 未設定の場合は展開されず、team メンションは team メンションのままとして扱う。

@@ -349,24 +349,20 @@ impl Payload {
     }
 
     /// `extra_mentions` は team メンションを展開した `@login` の列 (#286)。
-    /// body クエリの照合対象に足す。空なら本文そのままを使う。
+    ///
+    /// 本文と連結せずにそのまま渡す。連結すると、`$` などのアンカーを使う
+    /// 既存ルールの意味が変わってしまう (`@org/team$` が末尾に一致しなくなる、
+    /// exclude_query 側では除外されるべきものが除外されなくなる)。
     pub fn match_rules(
         &self,
         rules: &[Rule],
         extra_mentions: &str,
     ) -> HashMap<String, RuleMatchResult> {
-        // rule ごとに組み立てないよう、ここで 1 回だけ作る
-        let body = if extra_mentions.is_empty() {
-            std::borrow::Cow::Borrowed(self.body())
-        } else {
-            std::borrow::Cow::Owned(format!("{body}\n{extra_mentions}", body = self.body()))
-        };
-
         let mut v = HashMap::<String, RuleMatchResult>::new();
 
         for r in rules {
             // not match
-            if !r.check_match(self, &body) {
+            if !r.check_match(self, extra_mentions) {
                 continue;
             }
 
@@ -690,6 +686,49 @@ mod tests {
         // 展開後: メンバーの @login が body に足されるのでマッチする
         let matched = p.match_rules(&rules, "@sksat @meltingrabbit");
         assert!(matched.contains_key("test"), "展開後はマッチするべき");
+    }
+
+    /// #286: team 展開を足しても、アンカー付きの既存ルールの意味が変わらないこと。
+    ///
+    /// 本文と展開結果を連結すると `@org/team$` が末尾に一致しなくなり、
+    /// exclude_query 側では「除外されるべきものが除外されない」= 余計な通知が飛ぶ。
+    #[test]
+    fn expansion_does_not_break_anchored_rules() {
+        let p = de(
+            "pull_request_review",
+            "pull_request_review.team_mention_only.derived.json",
+        );
+        assert_eq!(
+            p.body(),
+            "@arkedge/sat-sw",
+            "末尾アンカーの検証に使う fixture"
+        );
+
+        // include: 末尾アンカーが展開後も効くこと
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"anchored","display_name":"x","query":{"body":"@arkedge/sat-sw$"}}"#,
+            )
+            .unwrap(),
+        ];
+        assert!(!p.match_rules(&rules, "").is_empty(), "展開前はマッチする");
+        assert!(
+            !p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            "展開すると末尾アンカーが効かなくなっている"
+        );
+
+        // exclude: 末尾アンカーによる除外が展開後も効くこと
+        let rules = vec![
+            serde_json::from_str::<crate::Rule>(
+                r#"{"channel":"excluded","display_name":"x","query":{"body":"sat-sw"},"exclude_query":{"body":"@arkedge/sat-sw$"}}"#,
+            )
+            .unwrap(),
+        ];
+        assert!(p.match_rules(&rules, "").is_empty(), "展開前は除外される");
+        assert!(
+            p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            "展開すると除外が効かなくなっている"
+        );
     }
 
     /// #122: レビューコメント (と返信) の本文が body として取れること。
