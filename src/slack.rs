@@ -11,6 +11,9 @@ use tracing::{debug, error, warn};
 /// 再送で予算が倍になってしまうので、締め切りを 1 つ決めて分け合う。
 pub const POST_BUDGET: Duration = Duration::from_secs(5);
 
+/// Slack API のベース URL。テストでモックに向けるために分けてある。
+const API_BASE: &str = "https://slack.com";
+
 /// 締め切りまでの残り時間。使い切っていれば `None`。
 fn remaining(deadline: Instant, now: Instant) -> Option<Duration> {
     let left = deadline.saturating_duration_since(now);
@@ -44,13 +47,25 @@ impl std::fmt::Display for PostError {
 
 /// blocks が原因と考えられるエラーか。
 ///
+/// コードは `chat.postMessage` の Errors に載っているものだけを書く
+/// (<https://docs.slack.dev/reference/methods/chat.postMessage>)。
+/// それらしい名前でも実在しないコードを書くと、その分岐は永久に通らない。
+/// `invalid_attachments` は無く、長さの上限は `msg_too_long` ではなく
+/// `msg_blocks_too_long`。
+///
 /// `invalid_auth` や `channel_not_found` は blocks を外しても直らないので、
 /// 再送しても 2 回目が無駄に失敗し、レート制限を悪化させるだけ。
 /// ここに無いエラーが blocks 由来だった場合はログに残るので、後から足せる。
+///
+/// `invalid_arguments` は blocks 以外が原因でも返る汎用のエラーだが、あえて
+/// 含めている。attachment の中で markdown ブロックが使えるかはドキュメントに
+/// 記載が無く、拒否されるとしてどのエラーで返るかも分からない。外して汎用の
+/// エラーで返っていた場合、本文のある通知が全部無言で落ちる。含めた場合の
+/// 損は API 1 回分で、しかも [`POST_BUDGET`] の中に収まる。
 fn is_blocks_problem(error: &str) -> bool {
     matches!(
         error,
-        "invalid_blocks" | "invalid_blocks_format" | "invalid_arguments" | "msg_too_long"
+        "invalid_blocks" | "invalid_blocks_format" | "msg_blocks_too_long" | "invalid_arguments"
     )
 }
 
@@ -75,12 +90,13 @@ struct PostResponse {
 
 async fn post(
     client: &reqwest::Client,
+    base: &str,
     token: &str,
     payload: &MessagePayload,
     timeout: Duration,
 ) -> Result<(), PostError> {
     let res = client
-        .post("https://slack.com/api/chat.postMessage")
+        .post(format!("{base}/api/chat.postMessage"))
         .timeout(timeout)
         .bearer_auth(token)
         .json(payload)
@@ -304,6 +320,11 @@ impl Message {
     }
 
     pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
+        self.post_message_to(API_BASE, token, channel, username)
+            .await
+    }
+
+    async fn post_message_to(self, base: &str, token: &str, channel: &str, username: Option<&str>) {
         // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
         // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
         // リクエストごとに残り時間を渡すが、渡し忘れの上限としても入れておく。
@@ -322,7 +343,7 @@ impl Message {
             attachments: self.attachments,
         };
 
-        match post(&client, token, &payload, POST_BUDGET).await {
+        match post(&client, base, token, &payload, POST_BUDGET).await {
             Ok(()) => return,
             // リクエスト自体の失敗は payload を変えても直らない。
             // 再送すると待ち時間も倍になるので諦める。
@@ -351,7 +372,7 @@ impl Message {
         };
 
         let fallback = payload.into_text_fallback();
-        if let Err(e) = post(&client, token, &fallback, left).await {
+        if let Err(e) = post(&client, base, token, &fallback, left).await {
             error!("POST (fallback): {e}");
         }
     }
@@ -367,20 +388,87 @@ impl Message {
 mod tests {
     use super::*;
 
+    fn attachment(body: Body) -> Attachment {
+        Attachment {
+            title: None,
+            title_link: None,
+            fallback: "fallback".to_string(),
+            color: None,
+            body,
+        }
+    }
+
     fn payload(body: Body) -> MessagePayload {
         MessagePayload {
             channel: "c".to_string(),
             username: None,
             text: "summary".to_string(),
             fallback: None,
-            attachments: Some(vec![Attachment {
-                title: None,
-                title_link: None,
-                fallback: "fallback".to_string(),
-                color: None,
-                body,
-            }]),
+            attachments: Some(vec![attachment(body)]),
         }
+    }
+
+    fn message(body: Body) -> Message {
+        Message {
+            text: "summary".to_string(),
+            attachments: Some(vec![attachment(body)]),
+        }
+    }
+
+    /// `chat.postMessage` を受けるテスト用サーバを立て、base URL と受け取った
+    /// payload を返す。`replies` を順に返し、尽きたら成功を返す。
+    ///
+    /// 再送は「1 回目の応答を読んで 2 回目を投げる」という手順そのものが本体な
+    /// ので、HTTP を実際に通さないと壊れても気付けない。
+    fn spawn_slack(
+        replies: Vec<serde_json::Value>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use actix_web::{App, HttpResponse, HttpServer, web};
+        use std::sync::{Arc, Mutex};
+
+        let got: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let replies = Arc::new(Mutex::new(replies));
+        let got_srv = got.clone();
+
+        let srv = HttpServer::new(move || {
+            let got = got_srv.clone();
+            let replies = replies.clone();
+
+            App::new().route(
+                "/api/chat.postMessage",
+                web::post().to(move |body: web::Json<serde_json::Value>| {
+                    let got = got.clone();
+                    let replies = replies.clone();
+
+                    async move {
+                        got.lock().unwrap().push(body.into_inner());
+
+                        let mut replies = replies.lock().unwrap();
+                        let reply = if replies.is_empty() {
+                            serde_json::json!({ "ok": true })
+                        } else {
+                            replies.remove(0)
+                        };
+
+                        HttpResponse::Ok().json(reply)
+                    }
+                }),
+            )
+        })
+        .bind("127.0.0.1:0")
+        .expect("could not bind test server");
+
+        let addr = srv.addrs()[0];
+        actix_web::rt::spawn(srv.run());
+
+        (format!("http://{addr}"), got)
+    }
+
+    fn rejected(error: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "ok": false, "error": error })]
     }
 
     fn blocks(md: &str, mrkdwn: Option<&str>) -> Body {
@@ -429,8 +517,8 @@ mod tests {
         for e in [
             "invalid_blocks",
             "invalid_blocks_format",
+            "msg_blocks_too_long",
             "invalid_arguments",
-            "msg_too_long",
         ] {
             assert!(is_blocks_problem(e), "{e} は再送すべき");
         }
@@ -530,6 +618,68 @@ mod tests {
             None,
             "超過したのに再送される"
         );
+    }
+
+    /// 通ったら 1 回で終わること。
+    #[actix_web::test]
+    async fn success_posts_once() {
+        let (base, got) = spawn_slack(vec![]);
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 1, "余計に送っている");
+        assert!(
+            got[0]["attachments"][0]["blocks"].is_array(),
+            "blocks で送っていない: {}",
+            got[0]
+        );
+    }
+
+    /// blocks 由来のエラーなら、従来の表現で再送すること。
+    #[actix_web::test]
+    async fn block_error_is_retried_as_text() {
+        let (base, got) = spawn_slack(rejected("invalid_blocks"));
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "再送していない");
+
+        let a = &got[1]["attachments"][0];
+        assert_eq!(
+            a["text"], "*Assignees*: sksat",
+            "mrkdwn になっていない: {a}"
+        );
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
+    /// blocks 由来でないエラーでは再送しないこと。
+    #[actix_web::test]
+    async fn other_errors_are_not_retried() {
+        let (base, got) = spawn_slack(rejected("invalid_auth"));
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
+    }
+
+    /// blocks を持たない payload では再送しないこと。
+    #[actix_web::test]
+    async fn blockless_payloads_are_not_retried() {
+        let (base, got) = spawn_slack(rejected("invalid_blocks"));
+
+        message(Body::new(vec![], None))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
     }
 
     /// ブロックの無い本文は退避しても変わらないこと。
