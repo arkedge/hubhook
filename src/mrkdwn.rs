@@ -85,6 +85,17 @@ fn strip_tags(html: &str) -> String {
     }
 }
 
+/// mrkdwn のリンク。
+///
+/// ラベルが無いときは URL だけ出す。`<url|>` は空ラベルになって何も見えない。
+fn link(url: &str, label: &str) -> String {
+    if label.trim().is_empty() {
+        format!("<{}>", escape_url(url))
+    } else {
+        format!("<{}|{}>", escape_url(url), label)
+    }
+}
+
 /// 変換したものを組み立てる。
 ///
 /// リンクのラベルや表のセルは「中身を全部読んでから」出力を決めるので、
@@ -357,14 +368,23 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             }
         }
         TagEnd::Item => r.newline(),
-        TagEnd::Link | TagEnd::Image => {
+        TagEnd::Link => {
             let label = r.close();
             let url = r.links.pop().unwrap_or_default();
-            // ラベルが無いリンクは URL だけ出す。`<url|>` は空ラベルになる
-            if label.trim().is_empty() {
-                r.push(&format!("<{}>", escape_url(&url)));
+            r.push(&link(&url, &label));
+        }
+        TagEnd::Image => {
+            let alt = r.close();
+            let url = r.links.pop().unwrap_or_default();
+
+            // リンクの中の画像 (`[![CI](badge)](build)` のようなバッジ) を
+            // そのままリンクにすると `<build|<badge|CI>>` になる。mrkdwn の
+            // リンク記法は入れ子を扱えず、内側の `>` で外側が閉じてしまう。
+            // 外側のリンクが開いているなら alt だけ置く。
+            if r.links.is_empty() {
+                r.push(&link(&url, &alt));
             } else {
-                r.push(&format!("<{}|{}>", escape_url(&url), label));
+                r.push(&alt);
             }
         }
         TagEnd::TableCell => {
@@ -580,6 +600,27 @@ mod tests {
         assert_eq!(
             from_markdown("[x](https://example.com/a>b)"),
             "<https://example.com/a%3Eb|x>"
+        );
+    }
+
+    /// リンクの中の画像を入れ子にしないこと。
+    ///
+    /// `[![CI](badge)](build)` のようなバッジは GitHub の本文でよく使われる。
+    /// 入れ子にすると内側の `>` で外側のリンクが閉じて崩れる。
+    #[test]
+    fn images_inside_links_are_not_nested() {
+        assert_eq!(
+            from_markdown("[![CI](https://example.com/badge.svg)](https://example.com/build)"),
+            "<https://example.com/build|CI>"
+        );
+    }
+
+    /// 単独の画像はリンクにすること。
+    #[test]
+    fn standalone_images_become_links() {
+        assert_eq!(
+            from_markdown("![alt](https://example.com/x.png)"),
+            "<https://example.com/x.png|alt>"
         );
     }
 

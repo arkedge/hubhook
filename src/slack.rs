@@ -372,53 +372,39 @@ impl Message {
             unfurl_media: false,
         };
 
-        // 1 通目が失敗したときの手は 2 つある。
+        // 処理前に断られただけなら同じものを送れば通る。予算と回数の両方で
+        // 打ち切る。予算だけだと、応答が速い相手に対して投げ続けてしまう。
         //
-        // - リトライ: 同じものを送る。処理前に断られただけのとき
-        // - 退避: ブロックを外して送る。ブロックが拒否されたとき
-        //
-        // 手を 1 つ選んで終わりにすると「断られた後に送り直したらブロックを
-        // 拒否された」のような組み合わせを取りこぼす。手がある限り続ける。
-        //
-        // 終わるのは、通ったとき / 打つ手が無いとき / 予算が尽きたとき /
-        // 同じものを送り直しすぎたとき。退避は blocks を消すので高々 1 回しか
-        // 成立せず、ループは必ず止まる。
-        let mut payload = payload;
-        let mut degraded = false;
-        let mut retries = 0;
-
-        loop {
+        // 表現が 1 つになったので退避は無く、送るのは常に同じ payload。
+        for _ in 0..=MAX_RETRIES {
             let Some(left) = remaining(deadline, Instant::now()) else {
                 error!(channel, link, "POST gave up: out of budget");
                 return;
-            }
-            // リクエスト自体の失敗は payload を変えても直らない。
-            // 再送すると待ち時間も倍になるので諦める。
-            Err(PostError::Request(e)) => {
-                error!(channel, error = %e, "POST failed");
-                return;
-            }
-            Err(PostError::Api(e)) => {
-                if !is_retriable(&e) {
+            };
+
+            match post(&client, base, token, &payload, left).await {
+                Ok(()) => {
+                    // どの表現で通ったかは、表現を変えたときの答え合わせに要る。
+                    info!(channel, body = payload.body_kind(), "POST ok");
+                    return;
+                }
+                // リクエスト自体の失敗は payload を変えても直らない。
+                // 送り直すと待ち時間も倍になるので諦める。
+                Err(PostError::Request(e)) => {
                     error!(channel, error = %e, "POST failed");
                     return;
                 }
+                Err(PostError::Api(e)) => {
+                    if !is_retriable(&e) {
+                        // 諦めるが無音にはしない。channel と link が残っていれば
+                        // 落ちた通知を後から追える。
+                        error!(channel, error = %e, "POST failed");
+                        return;
+                    }
 
-                warn!(channel, error = %e, "POST rejected; retrying");
+                    warn!(channel, error = %e, "POST failed; retrying");
+                }
             }
-        };
-
-        // 2 通目も予算の中で送る。取り直すと webhook の締め切りを超えて
-        // GitHub が再送し、通知が重複する
-        let Some(left) = remaining(deadline, Instant::now()) else {
-            error!(channel, "POST retry skipped: out of budget");
-            return;
-        };
-
-        match post(&client, base, token, &payload, left).await {
-            // 1 回目が落ちたこと自体が知りたい情報なので info には落とさない。
-            Ok(()) => warn!(channel, body = payload.body_kind(), "POST ok (retry)"),
-            Err(e) => error!(channel, error = %e, "POST failed (retry)"),
         }
     }
 }
@@ -677,7 +663,7 @@ mod tests {
         let (base, _got, ctypes) = spawn_slack(vec![]);
 
         message(text("*body*"))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let ctypes = ctypes.lock().unwrap();
@@ -695,7 +681,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(vec![]);
 
         message(text("*body*"))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -742,7 +728,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
 
         message(text("*body*"))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -756,7 +742,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_auth"));
 
         message(text("*body*"))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
