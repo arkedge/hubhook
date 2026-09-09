@@ -86,62 +86,74 @@ fn tag_separator(tag: &str) -> Option<char> {
 /// タグを外しただけの文字列には `&amp;` などが残っている。そのまま Slack 用に
 /// escape すると `&amp;amp;` になって、画面に `&amp;` と出てしまう。
 ///
-/// `&amp;` を最後に処理するのが要点。先に戻すと `&amp;lt;` が `<` になって、
-/// 書き手が意図した「`&lt;` という文字列」が消える。
+/// 1 回の走査で戻す。replace を並べると、戻した結果が次の replace に食われる
+/// (`&#38;lt;` が `&lt;` を経て `<` になる)。HTML としては `&lt;` という文字列
+/// なので、1 段だけ戻すのが正しい。
+///
+/// 名前付きの参照は全部持つには表か依存が要る。GitHub の本文で実際に見かける
+/// ものだけ並べ、残りはそのまま出す (生で見えるが消えはしない)。
 fn decode_refs(text: &str) -> String {
-    let text = decode_numeric(text);
+    const NAMED: &[(&str, char)] = &[
+        ("amp", '&'),
+        ("lt", '<'),
+        ("gt", '>'),
+        ("quot", '"'),
+        ("apos", '\''),
+        ("nbsp", ' '),
+        ("copy", '\u{a9}'),
+        ("reg", '\u{ae}'),
+        ("deg", '\u{b0}'),
+        ("middot", '\u{b7}'),
+        ("times", '\u{d7}'),
+        ("ndash", '\u{2013}'),
+        ("mdash", '\u{2014}'),
+        ("hellip", '\u{2026}'),
+        ("laquo", '\u{ab}'),
+        ("raquo", '\u{bb}'),
+    ];
 
-    // 全部の名前付き参照を持つには表か依存が要る。GitHub の本文で実際に
-    // 見かけるものだけ並べ、残りはそのまま出す (生で見えるが消えはしない)。
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&copy;", "\u{a9}")
-        .replace("&reg;", "\u{ae}")
-        .replace("&deg;", "\u{b0}")
-        .replace("&middot;", "\u{b7}")
-        .replace("&times;", "\u{d7}")
-        .replace("&ndash;", "\u{2013}")
-        .replace("&mdash;", "\u{2014}")
-        .replace("&hellip;", "\u{2026}")
-        .replace("&laquo;", "\u{ab}")
-        .replace("&raquo;", "\u{bb}")
-        // `&` は最後。先に戻すと `&amp;lt;` が `<` になって、書き手が意図した
-        // 「`&lt;` という文字列」が消える
-        .replace("&amp;", "&")
-}
-
-/// 数値文字参照を戻す。`&#8230;` と `&#x2026;` の両方。
-fn decode_numeric(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
 
-    while let Some(i) = rest.find("&#") {
+    while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
-        let after = &rest[i + 2..];
+        let after = &rest[i + 1..];
 
-        let (digits, radix) = match after.strip_prefix(['x', 'X']) {
-            Some(hex) => (hex, 16),
-            None => (after, 10),
-        };
-
-        let decoded = digits.find(';').filter(|end| *end > 0).and_then(|end| {
-            u32::from_str_radix(&digits[..end], radix)
-                .ok()
-                .and_then(char::from_u32)
-                .map(|c| (c, end))
+        // 数値参照。`&#8230;` と `&#x2026;` の両方
+        let numeric: Option<(char, &str)> = after.strip_prefix('#').and_then(|body| {
+            let (digits, radix) = match body.strip_prefix(['x', 'X']) {
+                Some(hex) => (hex, 16),
+                None => (body, 10),
+            };
+            let end = digits.find(';')?;
+            if end == 0 {
+                return None;
+            }
+            let code = u32::from_str_radix(&digits[..end], radix).ok()?;
+            Some((char::from_u32(code)?, &digits[end + 1..]))
         });
 
-        match decoded {
-            Some((c, end)) => {
+        if let Some((c, tail)) = numeric {
+            out.push(c);
+            rest = tail;
+            continue;
+        }
+
+        let named = NAMED.iter().find_map(|(name, c)| {
+            after
+                .strip_prefix(*name)
+                .and_then(|r| r.strip_prefix(';'))
+                .map(|r| (*c, r))
+        });
+
+        match named {
+            Some((c, tail)) => {
                 out.push(c);
-                rest = &digits[end + 1..];
+                rest = tail;
             }
-            // 参照になっていないのでそのまま出す
+            // 参照になっていないので、`&` はそのまま出す
             None => {
-                out.push_str("&#");
+                out.push('&');
                 rest = after;
             }
         }
@@ -149,6 +161,16 @@ fn decode_numeric(text: &str) -> String {
 
     out.push_str(rest);
     out
+}
+
+/// Slack のコードフェンスとして読まれるバックティックの連続を無効化する。
+///
+/// Slack のフェンスは ``` 固定で長さを変えられない。本文の中に ``` があると
+/// フェンスを開いてしまい、以降の本文や Assignees まで飲み込む。
+///
+/// 幅ゼロの文字を挟んで、見た目を保ったまま連続を切る。
+fn neutralize_fences(text: &str) -> String {
+    text.replace("```", "`\u{200b}`\u{200b}`")
 }
 
 /// mrkdwn のリンク。
@@ -452,9 +474,12 @@ pub fn from_markdown(md: &str) -> String {
                 r.push(&escaped);
             }
             Event::Code(t) => {
-                let escaped = escape(&t);
+                // 中の ``` を先に無効化する。素で出すとフェンスを開いて
+                // 以降の本文を飲み込む。
+                let escaped = neutralize_fences(&escape(&t));
+
                 // mrkdwn のコード span は ` で囲む以外に書き方が無いので、
-                // 中に ` があると区切りが壊れる。素のテキストとして出す。
+                // 中に ` が残っていると区切りが壊れる。素のテキストで出す。
                 if escaped.contains('`') {
                     r.push(&escaped);
                 } else {
@@ -587,7 +612,7 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             //
             // 見た目を保ったまま無効化する。バックティックの間に幅ゼロの文字を
             // 挟むと、Slack はフェンスとして読まない。
-            let code = code.replace("```", "`\u{200b}`\u{200b}`");
+            let code = neutralize_fences(code);
             r.push(&format!("```\n{code}\n```"));
             r.blank_line();
         }
@@ -926,6 +951,23 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// インラインコードの中の ``` でもフェンスを開かせないこと。
+    #[test]
+    fn inline_code_fences_are_neutralized() {
+        let out = from_markdown("``` ``` ```\n\nafter");
+
+        assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
+    }
+
+    /// 文字参照を 1 段だけ戻すこと。
+    ///
+    /// `&#38;lt;` は HTML としては `&lt;` という文字列。2 段戻して `<` に
+    /// してはいけない。
+    #[test]
+    fn character_references_are_decoded_once() {
+        assert_eq!(from_markdown("<b>&#38;lt;</b>"), "&amp;lt;");
     }
 
     /// 内側の ``` でフェンスを開かせないこと。
