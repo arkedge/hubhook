@@ -406,6 +406,8 @@ struct Renderer {
     pending_tag: Option<PendingTag>,
     /// 項目の 2 行目以降に付ける字下げ。入れ子の分だけ積む
     item_pads: Vec<String>,
+    /// 引用の中か。字下げは引用記法の外に付けるので、中では入れない
+    quote_depth: usize,
 }
 
 #[derive(Default)]
@@ -426,6 +428,7 @@ impl Renderer {
             after_marker: false,
             pending_tag: None,
             item_pads: Vec::new(),
+            quote_depth: 0,
         }
     }
 
@@ -486,6 +489,12 @@ impl Renderer {
     /// コードブロックからは呼ばない。フェンスや中身に空白を足すと、コード
     /// そのものが変わってしまう。
     fn line_pad(&mut self) {
+        // 引用の中身には入れない。引用記法の前に付けるので、中に入れると
+        // `> ` の後ろが空くだけになる
+        if self.quote_depth > 0 {
+            return;
+        }
+
         let cur = self.bufs.last().expect("書き込み先が無い");
         if !cur.ends_with('\n') {
             return;
@@ -688,7 +697,14 @@ pub fn from_markdown(md: &str) -> String {
             }
             // Slack に水平線は無い。段落の切れ目としてだけ扱う
             Event::Rule => r.block_start(),
-            Event::TaskListMarker(done) => r.push(if done { "☑ " } else { "☐ " }),
+            Event::TaskListMarker(done) => {
+                r.push(if done { "☑ " } else { "☐ " });
+
+                // 折り返した行を課題の文字に揃える。印の分だけ足す
+                if let Some(pad) = r.item_pads.last_mut() {
+                    pad.push_str("  ");
+                }
+            }
             // Slack に脚注は無いので、markdown の書き方をそのまま残す
             Event::FootnoteReference(label) => {
                 let escaped = escape(&label);
@@ -735,6 +751,7 @@ fn start(r: &mut Renderer, tag: Tag) {
             r.block_start();
             // 中身を組み立ててから各行に "> " を付ける
             r.open();
+            r.quote_depth += 1;
 
             // GitHub alerts (`> [!NOTE]` など)。種類はパーサが食べてしまうので、
             // 落とさずに見出しとして書き戻す
@@ -845,17 +862,26 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             r.blank_line();
         }
         TagEnd::BlockQuote(_) => {
+            r.quote_depth -= 1;
             let inner = r.close();
+
+            // 項目の中の引用は、字下げを引用記法の前に付ける。付けないと
+            // 2 行目以降の ">" が行頭に来て、項目の外の引用に見える
+            let pad = r.item_pads.last().cloned().unwrap_or_default();
+
             // 引用記法の ">" は生で置く。`&gt;` にすると Slack は引用として
             // 解釈せず、リテラルの ">" を表示する
             let quoted = inner
                 .trim_end()
                 .lines()
-                .map(|l| {
+                .enumerate()
+                .map(|(i, l)| {
+                    // 1 行目は印の直後なので字下げしない
+                    let pad = if i == 0 { "" } else { pad.as_str() };
                     if l.is_empty() {
-                        ">".to_string()
+                        format!("{pad}>")
                     } else {
-                        format!("> {l}")
+                        format!("{pad}> {l}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1016,6 +1042,29 @@ mod tests {
     #[test]
     fn ordered_lists_keep_their_numbers() {
         assert_eq!(from_markdown("1. a\n2. b"), "1. a\n2. b");
+    }
+
+    /// 課題の折り返しをチェックボックスの後ろに揃えること。
+    ///
+    /// 印の幅だけを見ていると、チェックボックスの下に続きが来る。
+    #[test]
+    fn a_task_items_continuation_clears_the_checkbox() {
+        assert_eq!(
+            from_markdown("- [x] task text\n  wrapped line"),
+            "• ☑ task text\n    wrapped line"
+        );
+    }
+
+    /// 項目の中の引用は、字下げを引用記法の前に付けること。
+    ///
+    /// 中に入れると `> ` の後ろが空くだけで、2 行目以降の `>` が行頭に来て
+    /// 項目の外の引用に見える。
+    #[test]
+    fn a_quote_in_an_item_keeps_the_item_indent() {
+        assert_eq!(
+            from_markdown("- > first\n  > second"),
+            "• > first\n  > second"
+        );
     }
 
     /// 折り返した行を項目の中に見せること。
