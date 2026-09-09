@@ -215,12 +215,22 @@ fn decode_refs(text: &str) -> String {
                 Some(hex) => (hex, 16),
                 None => (body, 10),
             };
-            let end = digits.find(';')?;
+            // 数字の並びが参照。`;` は付いていれば取るが、無くても参照になる
+            let end = digits
+                .find(|c: char| !c.is_digit(radix))
+                .unwrap_or(digits.len());
             if end == 0 {
                 return None;
             }
-            let code = u32::from_str_radix(&digits[..end], radix).ok()?;
-            Some((from_code(code), &digits[end + 1..]))
+
+            let c = match u32::from_str_radix(&digits[..end], radix) {
+                Ok(code) => from_code(code),
+                // u32 に収まらない番号は必ず範囲外
+                Err(_) => '\u{fffd}',
+            };
+            let rest = &digits[end..];
+
+            Some((c, rest.strip_prefix(';').unwrap_or(rest)))
         });
 
         if let Some((c, tail)) = numeric {
@@ -1237,6 +1247,16 @@ mod tests {
         let out = from_markdown("``` ``` ```\n\nafter");
 
         assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
+    }
+
+    /// `;` が無い数値参照も戻すこと。
+    ///
+    /// HTML では数字の並びが参照で、`;` は付いていれば取る。数字でない文字は
+    /// 参照の外なのでそのまま残る。
+    #[test]
+    fn numeric_references_without_a_semicolon_are_decoded() {
+        assert_eq!(from_markdown("<div>&#8230</div>"), "…");
+        assert_eq!(from_markdown("<div>&#65foo;</div>"), "Afoo;");
     }
 
     /// 数値参照を HTML の規則で戻すこと。
