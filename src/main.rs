@@ -189,12 +189,30 @@ async fn main() -> std::io::Result<()> {
 
     let port = opt.hubhook_port;
 
-    let level = if opt.debug {
-        tracing::Level::DEBUG
-    } else {
-        tracing::Level::WARN
+    // レベルを固定すると、後から「なぜ通知が飛ばなかったか」を追うために
+    // 再起動が要る。RUST_LOG で上書きできるようにしておく。
+    // 既定は info。warn 止めだと通知が飛んだこと自体が残らない。
+    let default = if opt.debug { "debug" } else { "info" };
+    let filter = match std::env::var("RUST_LOG") {
+        // 壊れた RUST_LOG で黙って既定に落ちると、レベルを変えたつもりで
+        // 変わっていないことに気付けない。まだ subscriber が無いので stderr に出す。
+        // docker-compose で `RUST_LOG=${RUST_LOG}` と書くと、未設定でも空文字が
+        // 入って Some("") になる。空の EnvFilter は directive を持たないので
+        // 何も出なくなってしまう。未設定として扱う。
+        Ok(spec) if spec.is_empty() => tracing_subscriber::EnvFilter::new(default),
+        Ok(spec) => tracing_subscriber::EnvFilter::try_new(&spec).unwrap_or_else(|e| {
+            eprintln!("invalid RUST_LOG ({spec:?}), falling back to {default}: {e}");
+            tracing_subscriber::EnvFilter::new(default)
+        }),
+        // 未設定は既定でよい。設定されているのに読めない (NotUnicode) のは
+        // 設定ミスなので、黙って未設定と同じ扱いにしない。
+        Err(std::env::VarError::NotPresent) => tracing_subscriber::EnvFilter::new(default),
+        Err(e) => {
+            eprintln!("could not read RUST_LOG, falling back to {default}: {e}");
+            tracing_subscriber::EnvFilter::new(default)
+        }
     };
-    tracing_subscriber::fmt().with_max_level(level).init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cfg: Config = {
         use std::io::Read;
@@ -273,14 +291,16 @@ async fn webhook(
         Ok(msg) => Some(msg),
         Err(why) => {
             match &why {
-                // 通知対象にしていない action。error! で出すと本物の失敗が埋もれる。
+                // 通知対象にしていない action。error! で出すと本物の失敗が
+                // 埋もれるが、debug だと「なぜ飛ばなかったか」を後から追えない。
                 message::NotRendered::Skipped(_) => {
-                    debug!("not notified ({why}). link = {}", payload.url());
+                    info!(reason = %why, link = %payload.url(), "not notified");
                 }
                 message::NotRendered::Unexpected(_) => {
                     error!(
-                        "GitHub payload -> slack::Message failed ({why}). link = {}",
-                        payload.url()
+                        reason = %why,
+                        link = %payload.url(),
+                        "GitHub payload -> slack::Message failed"
                     );
                 }
             }

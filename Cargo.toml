@@ -30,5 +30,5 @@ structopt = "0.3.26"
 # actix / reqwest 経由ですでに依存ツリーに入っている。
 tokio = { version = "1.53.1", features = ["sync"] }
 tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url = { version = "2.5.0", features = ["serde"]}

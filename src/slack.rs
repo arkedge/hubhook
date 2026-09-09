@@ -86,6 +86,43 @@ fn should_retry(payload: &MessagePayload, error: &str) -> bool {
 struct PostResponse {
     ok: bool,
     error: Option<String>,
+    /// Slack は `ok: true` でも警告を返す。`missing_charset` のように
+    /// こちらの送り方の問題を指すものがあるので捨てない。
+    warning: Option<String>,
+    response_metadata: Option<ResponseMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseMetadata {
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+impl PostResponse {
+    /// `warning` と `response_metadata.warnings` を混ぜて返す。
+    ///
+    /// 同じ内容が両方に入ることがあるので重複は落とす。
+    fn warnings(&self) -> Vec<&str> {
+        let flat = self
+            .warning
+            .as_deref()
+            .into_iter()
+            .flat_map(|w| w.split(','))
+            .map(str::trim);
+        let listed = self
+            .response_metadata
+            .as_ref()
+            .into_iter()
+            .flat_map(|m| m.warnings.iter().map(String::as_str));
+
+        let mut out: Vec<&str> = Vec::new();
+        for w in flat.chain(listed) {
+            if !w.is_empty() && !out.contains(&w) {
+                out.push(w);
+            }
+        }
+        out
+    }
 }
 
 async fn post(
@@ -117,6 +154,19 @@ async fn post(
         .map_err(|e| PostError::Request(format!("could not read response: {e}")))?;
 
     debug!("{body:?}");
+
+    // ok: true でも返ってくる。こちらの送り方の問題を教えてくれるので出す。
+    let warnings = body.warnings();
+    if !warnings.is_empty() {
+        // channel ごとに投稿するので、どの宛先の警告か分からないと追えない。
+        // join せず配列のまま出す。確保が増えるし、構造も失われる
+        warn!(
+            channel = %payload.channel,
+            ok = body.ok,
+            warnings = ?warnings,
+            "Slack returned warnings"
+        );
+    }
 
     if body.ok {
         Ok(())
@@ -394,40 +444,41 @@ impl Message {
 
         match post(&client, base, token, &payload, POST_BUDGET).await {
             Ok(()) => {
-                debug!("POST ok ({})", payload.body_kind());
+                // どの表現で通ったかは、表現を変えたときの答え合わせに要る。
+                info!(channel, body = payload.body_kind(), "POST ok");
                 return;
             }
             // リクエスト自体の失敗は payload を変えても直らない。
             // 再送すると待ち時間も倍になるので諦める。
             Err(PostError::Request(e)) => {
-                error!("POST to {channel}: {e}");
+                error!(channel, error = %e, "POST failed");
                 return;
             }
             Err(PostError::Api(e)) => {
                 if !should_retry(&payload, &e) {
-                    error!("POST to {channel}: {e}");
+                    error!(channel, error = %e, "POST failed");
                     return;
                 }
 
                 // markdown ブロックが attachment 内で使えるか、本文が上限を
                 // 超えたかはこちらで判定できない。blocks 由来と思われる
                 // エラーなら、従来の表現 (attachment の text) で再送する。
-                warn!("POST to {channel} rejected ({e}); retrying without markdown blocks");
+                warn!(channel, error = %e, "POST rejected; retrying without markdown blocks");
             }
         }
 
         // 再送も予算の中で行う。取り直すと webhook の締め切りを超えて
         // GitHub が再送し、通知が重複する
         let Some(left) = remaining(deadline, Instant::now()) else {
-            error!("POST to {channel} (fallback): out of budget");
+            error!(channel, "POST fallback skipped: out of budget");
             return;
         };
 
         let fallback = payload.into_text_fallback();
         match post(&client, base, token, &fallback, left).await {
-            // 退避が起きたこと自体が知りたい情報なので debug では埋もれる
-            Ok(()) => info!("POST ok (fallback: {})", fallback.body_kind()),
-            Err(e) => error!("POST to {channel} (fallback): {e}"),
+            // 届いてはいるが本来の表現が拒否された、という degraded success。
+            Ok(()) => warn!(channel, body = fallback.body_kind(), "POST ok (fallback)"),
+            Err(e) => error!(channel, error = %e, "POST failed (fallback)"),
         }
     }
 }
@@ -787,6 +838,35 @@ mod tests {
             "blocks で送っていない: {}",
             got[0]
         );
+    }
+
+    /// Slack の警告を取りこぼさないこと。
+    ///
+    /// `warning` と `response_metadata.warnings` の両方に返ることがあり、
+    /// 同じ内容が重複する。
+    #[test]
+    fn warnings_are_merged_and_deduped() {
+        let res: PostResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "warning": "missing_charset,superfluous_charset",
+            "response_metadata": { "warnings": ["missing_charset"] }
+        }))
+        .expect("deserialize できない");
+
+        assert_eq!(res.warnings(), ["missing_charset", "superfluous_charset"]);
+    }
+
+    /// 警告が無い応答も読めること。
+    ///
+    /// `warning` を必須にすると、正常な応答で deserialize が落ちて
+    /// 投稿できたのに失敗扱いになる。
+    #[test]
+    fn response_without_warnings_is_accepted() {
+        let res: PostResponse = serde_json::from_value(serde_json::json!({ "ok": true }))
+            .expect("deserialize できない");
+
+        assert!(res.ok);
+        assert!(res.warnings().is_empty(), "{:?}", res.warnings());
     }
 
     /// blocks 由来のエラーなら、従来の表現で再送すること。
