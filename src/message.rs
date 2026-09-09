@@ -110,6 +110,17 @@ fn body_text(body: &str, assignees: &[github::common::User]) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// 誰の操作かを footer に出す (#289)。
+///
+/// アイコンも添えると一目で分かる。footer は mrkdwn が効かないので、
+/// login をそのまま置く (リンクにはできない)。
+fn sender_footer(sender: &github::common::User) -> slack::Footer {
+    slack::Footer {
+        footer: sender.login.clone(),
+        footer_icon: Some(sender.avatar_url.clone()),
+    }
+}
+
 /// attachment の本文。markdown ブロックと、退避用の mrkdwn を組にする。
 fn body_content(body: &str, assignees: &[github::common::User]) -> slack::Body {
     slack::Body::new(body_blocks(body, assignees), body_text(body, assignees))
@@ -180,6 +191,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
+                        footer: Some(sender_footer(&issues.sender)),
                         body: body_content(issue.body.as_deref().unwrap_or(""), &issue.assignees),
                         color,
                     }
@@ -222,6 +234,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         title,
                         title_link,
                         fallback,
+                        footer: Some(sender_footer(&issues.sender)),
                         body: body_content("", assignees),
                         color,
                     }
@@ -266,6 +279,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback,
+                        footer: Some(sender_footer(&pull_request.sender)),
                         body: body_content(body, &pr.assignees),
                         color,
                     }
@@ -309,6 +323,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
+                        footer: Some(sender_footer(&pull_request.sender)),
                         body: body_content(pr.body.as_deref().unwrap_or(""), &[]),
                         // 「対応してほしい」通知なので opened / assigned とは色を変える
                         color: Some(slack::Color::Warning),
@@ -345,6 +360,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         title,
                         title_link,
                         fallback: pr.title.to_string(),
+                        footer: Some(sender_footer(&pull_request.sender)),
                         body: body_content("", assignees),
                         color,
                     }
@@ -387,6 +403,7 @@ impl TryFrom<&github::IssueComment> for slack::Message {
                     title: None,
                     title_link: None,
                     fallback: comment.body.clone(),
+                    footer: Some(sender_footer(&issue_comment.sender)),
                     body: body_content(&comment.body, &[]),
                     color,
                 };
@@ -450,6 +467,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
             title: None,
             title_link: None,
             fallback: attach_text.clone(),
+            footer: Some(sender_footer(&review.sender)),
             body: body_content(&attach_text, &[]),
             color: Some(color),
         };
@@ -494,6 +512,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
             title: Some(comment.path.clone()),
             title_link: Some(comment.html_url.clone()),
             fallback: comment.body.clone(),
+            footer: Some(sender_footer(&review_comment.sender)),
             body: body_content(&comment.body, &[]),
             color: Some(slack::Color::Comment),
         };
@@ -653,6 +672,28 @@ mod tests {
             body.contains("[Codertocat](https://github.com/Codertocat)"),
             "リンクが Markdown でない: {body}"
         );
+    }
+
+    /// footer に sender と avatar が出ること (#289)。
+    ///
+    /// issue の作成者ではなく**操作した人**を出す。comment なら
+    /// コメントした人で、issue の作者とは別人になる。
+    #[test]
+    fn footer_shows_the_sender() {
+        let payload = de(
+            "pull_request_review_comment",
+            "pull_request_review_comment.created.with-organization.json",
+        );
+        let sender = payload.sender().login.clone();
+
+        let msg = slack::Message::try_from(&payload).expect("通知されるべき");
+        let footer = msg.attachments.as_ref().unwrap()[0]
+            .footer
+            .as_ref()
+            .expect("footer が無い");
+
+        assert_eq!(footer.footer, sender);
+        assert!(footer.footer_icon.is_some(), "avatar が無い");
     }
 
     /// 本文が無いときに Assignees の前で空行を作らないこと。
