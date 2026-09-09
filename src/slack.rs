@@ -97,6 +97,16 @@ fn is_hopeless(error: &str) -> bool {
     )
 }
 
+/// 一時的だとドキュメントが言っているエラー。
+///
+/// これらは payload の中身と無関係なので、同じものを送り直しても通り得る。
+fn is_transient(error: &str) -> bool {
+    matches!(
+        error,
+        "internal_error" | "fatal_error" | "request_timeout" | "service_unavailable"
+    )
+}
+
 /// 退避して再送すべきか。
 ///
 /// blocks が無ければ外しても何も変わらないので送り直さない。それ以外は
@@ -113,7 +123,12 @@ fn is_hopeless(error: &str) -> bool {
 /// error, likely due to a transient issue on our end." とされているので、
 /// まさに再送すべき側。
 fn should_retry(payload: &MessagePayload, error: &str) -> bool {
-    payload.has_blocks() && !is_hopeless(error)
+    // 再送する理由は 2 つあり、必要な条件が違う。
+    //
+    // - 一時的な失敗なら、同じものを送り直せば通る。payload によらない
+    // - blocks が受け付けられないなら、外して送れば通るかもしれない。
+    //   blocks を持たない payload では退避しても何も変わらない
+    is_transient(error) || (payload.has_blocks() && !is_hopeless(error))
 }
 
 /// `chat.postMessage` の応答。
@@ -973,6 +988,21 @@ mod tests {
         let a = &got[1]["attachments"][0];
         assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
         assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
+    /// 本文が無い payload でも、一時的なエラーなら再送すること。
+    ///
+    /// 退避しても payload は変わらないが、一時的な失敗なら同じものを
+    /// 送り直して通る。ここを落とすと本文の無い通知が消える。
+    #[actix_web::test]
+    async fn blockless_payloads_are_retried_on_transient_errors() {
+        let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
+
+        message(Body::new(vec![], None))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        assert_eq!(got.lock().unwrap().len(), 2, "再送していない");
     }
 
     /// blocks 由来でないエラーでは再送しないこと。
