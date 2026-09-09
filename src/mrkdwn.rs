@@ -651,6 +651,13 @@ fn start(r: &mut Renderer, tag: Tag) {
 
 fn end(r: &mut Renderer, tag: TagEnd) {
     match tag {
+        // HTML ブロックは空行で終わるので、そこで閉じていないタグやコメントは
+        // 閉じないまま終わる。持ち越したままだと、後から来た別のタグの頭に
+        // くっついて、そのタグの行き先まで落としてしまう
+        TagEnd::HtmlBlock => {
+            r.pending_tag = None;
+            r.in_html_comment = false;
+        }
         TagEnd::Paragraph => r.blank_line(),
         TagEnd::Heading(_) => {
             let inner = r.close();
@@ -1023,6 +1030,21 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 閉じていないタグをブロックの外まで持ち越さないこと。
+    ///
+    /// HTML ブロックは空行で終わる。持ち越すと、後の `<a href>` の頭に
+    /// くっついてリンク先が落ちる。
+    #[test]
+    fn an_unclosed_tag_does_not_leak_into_the_next_block() {
+        let out = from_markdown("<div\n\n<a href=\"https://example.com\">label</a>");
+
+        assert!(out.contains("label"), "ラベルが消えている: {out:?}");
+        assert!(
+            out.contains("https://example.com"),
+            "リンク先が消えている: {out:?}"
+        );
     }
 
     /// 複数行に分かれたタグの属性が本文に出ないこと。
