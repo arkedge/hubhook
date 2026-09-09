@@ -404,6 +404,8 @@ struct Renderer {
     after_marker: bool,
     /// 複数行に分かれたタグの、まだ閉じていない部分
     pending_tag: Option<PendingTag>,
+    /// 項目の 2 行目以降に付ける字下げ。入れ子の分だけ積む
+    item_pads: Vec<String>,
 }
 
 #[derive(Default)]
@@ -423,6 +425,7 @@ impl Renderer {
             in_html_comment: false,
             after_marker: false,
             pending_tag: None,
+            item_pads: Vec::new(),
         }
     }
 
@@ -469,6 +472,27 @@ impl Renderer {
             self.push("\n");
         } else {
             self.push("\n\n");
+        }
+    }
+
+    /// 行の頭なら、項目の字下げを入れる。
+    ///
+    /// 入れないと、折り返した行や 2 つめの段落が項目の外に見える
+    /// (`- first\n  continuation` が `• first\ncontinuation` になる)。
+    ///
+    /// 行の途中では何もしない。印を書いた直後は行の途中なので、印と中身の
+    /// 間に字下げが入ることはない。
+    ///
+    /// コードブロックからは呼ばない。フェンスや中身に空白を足すと、コード
+    /// そのものが変わってしまう。
+    fn line_pad(&mut self) {
+        let cur = self.bufs.last().expect("書き込み先が無い");
+        if !cur.ends_with('\n') {
+            return;
+        }
+
+        if let Some(pad) = self.item_pads.last().cloned() {
+            self.push(&pad);
         }
     }
 
@@ -654,7 +678,10 @@ pub fn from_markdown(md: &str) -> String {
                     r.push(&format!("`{escaped}`"));
                 }
             }
-            Event::SoftBreak | Event::HardBreak => r.push("\n"),
+            Event::SoftBreak | Event::HardBreak => {
+                r.push("\n");
+                r.line_pad();
+            }
             // Slack に水平線は無い。段落の切れ目としてだけ扱う
             Event::Rule => r.block_start(),
             Event::TaskListMarker(done) => r.push(if done { "☑ " } else { "☐ " }),
@@ -682,7 +709,11 @@ pub fn from_markdown(md: &str) -> String {
 
 fn start(r: &mut Renderer, tag: Tag) {
     match tag {
-        Tag::Paragraph => r.block_start(),
+        Tag::Paragraph => {
+            r.block_start();
+            // 項目の 2 つめの段落も項目の中に見せる
+            r.line_pad();
+        }
         // 見出しが無いので太字で代用する。中身を読んでから決めるので開く
         Tag::Heading { .. } => {
             r.block_start();
@@ -736,6 +767,10 @@ fn start(r: &mut Renderer, tag: Tag) {
                 _ => "• ".to_string(),
             };
             r.push(&format!("{indent}{marker}"));
+
+            // 2 行目以降を中身の頭に揃える
+            r.item_pads
+                .push(format!("{indent}{}", " ".repeat(marker.chars().count())));
             r.after_marker = true;
         }
         Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
@@ -833,7 +868,10 @@ fn end(r: &mut Renderer, tag: TagEnd) {
                 r.newline();
             }
         }
-        TagEnd::Item => r.newline(),
+        TagEnd::Item => {
+            r.item_pads.pop();
+            r.newline();
+        }
         TagEnd::Link => {
             let label = r.close();
             let url = r.links.pop().unwrap_or_default();
@@ -974,6 +1012,40 @@ mod tests {
     #[test]
     fn ordered_lists_keep_their_numbers() {
         assert_eq!(from_markdown("1. a\n2. b"), "1. a\n2. b");
+    }
+
+    /// 折り返した行を項目の中に見せること。
+    ///
+    /// 字下げしないと `• first\ncontinuation` になって、続きが項目の外に
+    /// 見える。番号付きなら番号の幅だけ下げる。
+    #[test]
+    fn continuation_lines_stay_inside_the_item() {
+        assert_eq!(
+            from_markdown("- first\n  continuation\n- next"),
+            "• first\n  continuation\n• next"
+        );
+        assert_eq!(
+            from_markdown("1. first\n   continuation\n2. next"),
+            "1. first\n   continuation\n2. next"
+        );
+    }
+
+    /// 項目の 2 つめの段落も項目の中に見せること。
+    #[test]
+    fn a_second_paragraph_stays_inside_the_item() {
+        assert_eq!(
+            from_markdown("- a\n\n  second\n\n- b"),
+            "• a\n\n  second\n\n• b"
+        );
+    }
+
+    /// 入れ子の項目の折り返しは、内側の中身の頭に揃えること。
+    #[test]
+    fn a_nested_items_continuation_follows_the_inner_marker() {
+        assert_eq!(
+            from_markdown("- outer\n  - inner\n    continuation"),
+            "• outer\n    • inner\n      continuation"
+        );
     }
 
     /// 入れ子は字下げで表す。項目の間に空行を挟まないこと。
