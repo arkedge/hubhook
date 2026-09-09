@@ -97,8 +97,7 @@ fn assignees_line(
 
 /// 本文の後ろに Assignees を足す。
 ///
-/// 空行で区切る。Markdown では改行 1 つだと同じ段落として連結され、本文の
-/// 末尾に `**Assignees**` がくっついて表示されてしまう。
+/// 空行で区切る。1 行だけだと本文の続きに見えて、どこまでが本文か分からない。
 /// 本文が無いときは区切りを入れない (先頭が空行になり、その分だけ縦に伸びる)。
 fn with_assignees(body: &str, line: Option<String>) -> String {
     let Some(line) = line else {
@@ -682,8 +681,6 @@ mod tests {
         assert_eq!(attach.body.text().expect("本文が無い"), attach.fallback);
     }
 
-    /// 本文を markdown ブロックとして、変換せずそのまま渡すこと。
-    ///
     /// 本文が mrkdwn に変換されて入ること。
     ///
     /// GitHub の本文をそのまま入れると `##` や `**` が生で出る。attachment の
@@ -770,23 +767,18 @@ mod tests {
         .expect("通知されるべき");
         let a = &msg.attachments.as_ref().unwrap()[0];
 
-        for text in [
-            a.body.text().expect("本文が無い"),
-            a.body.text().expect("本文が無い"),
-        ] {
-            assert!(text.starts_with('*'), "空行から始まっている: {text:?}");
-        }
+        let text = a.body.text().expect("本文が無い");
+        assert!(text.starts_with('*'), "空行から始まっている: {text:?}");
     }
 
     /// 本文と Assignees が空行で区切られること。
     ///
-    /// Markdown では改行 1 つだと同じ段落として連結され、本文の末尾に
-    /// `**Assignees**` がくっついて表示される。
+    /// 1 行だけだと本文の続きに見えて、どこまでが本文か分からない。
     #[test]
     fn assignees_are_separated_from_the_body_by_a_blank_line() {
         assert_eq!(
-            with_assignees("本文", Some("**Assignees**: sksat".to_string())),
-            "本文\n\n**Assignees**: sksat"
+            with_assignees("本文", Some("*Assignees*: sksat".to_string())),
+            "本文\n\n*Assignees*: sksat"
         );
         assert_eq!(
             with_assignees("本文", None),
@@ -843,10 +835,10 @@ mod tests {
         );
     }
 
-    /// 本文が無い PR でもブロックを作らず、通知は飛ぶこと。
+    /// 本文が無い PR では本文を入れず、通知は飛ぶこと。
     ///
-    /// 空の `text` を持つ markdown ブロックを送ると `invalid_blocks` で
-    /// 拒否され、通知そのものが飛ばなくなる。本文なしの PR は珍しくない。
+    /// 空の `text` を送ると `no_text` で拒否され、通知そのものが飛ばなく
+    /// なる。本文なしの PR は珍しくない。
     #[test]
     fn bodyless_pull_request_sends_no_text() {
         let msg = message(

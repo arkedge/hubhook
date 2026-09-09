@@ -73,9 +73,11 @@ GitHub App / Webhook is subscribed to them.
 
 ## Message appearance
 
-Bodies are sent as Slack markdown blocks, so headings, tables, task lists and
-code blocks render as written. GFM-specific references (`#123`, `@user`, commit
-SHAs) are outside the Markdown spec and are not linked.
+Bodies are converted from GitHub Flavored Markdown to Slack mrkdwn, so bold,
+italics, strikethrough, links, lists, task lists, quotes and code blocks
+render. Slack has neither headings nor tables, so a heading becomes a bold line
+and each table row becomes one line. GFM-specific references (`#123`, `@user`,
+commit SHAs) are outside the Markdown spec and are not linked.
 
 Repository and account names are links. Assignees are put on a single line as
 `Assignees: a, b, c`. The attachment footer shows the login and avatar of
