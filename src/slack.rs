@@ -954,6 +954,27 @@ mod tests {
         assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
     }
 
+    /// 一時的なエラーでも退避して再送すること。
+    ///
+    /// 判定を反転させた狙いはここにある。`should_retry` の単体テストだけでは
+    /// 「1 回目の応答を読んで 2 回目を投げる」という手順自体が壊れても
+    /// 気付けないので、HTTP を通して確かめる。
+    #[actix_web::test]
+    async fn transient_error_is_retried_as_text() {
+        let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "再送していない");
+
+        let a = &got[1]["attachments"][0];
+        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
     /// blocks 由来でないエラーでは再送しないこと。
     #[actix_web::test]
     async fn other_errors_are_not_retried() {
