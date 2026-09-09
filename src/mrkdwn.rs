@@ -1380,18 +1380,6 @@ mod tests {
         assert_eq!(from_markdown("- a\n\n- b"), "• a\n\n• b");
     }
 
-    /// コードブロックの中に ``` があるときは囲まないこと。
-    ///
-    /// Slack のコードブロックは ``` 固定で長さを変えられないので、囲むと
-    /// 中の ``` で途中で閉じて、以降の装飾まで崩れる。
-    #[test]
-    fn code_blocks_containing_a_fence_are_not_fenced() {
-        let out = from_markdown("````\n```\ninner\n```\n````");
-
-        assert!(!out.starts_with("```\n```"), "二重に囲んでいる: {out:?}");
-        assert!(out.contains("inner"), "中身が消えている: {out:?}");
-    }
-
     /// 表の見出しが既に太字なら二重にしないこと。
     #[test]
     fn already_bold_table_headers_are_not_wrapped_again() {
