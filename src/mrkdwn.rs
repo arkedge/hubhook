@@ -19,7 +19,7 @@
 //! | `[text](url)` | `<url\|text>` |
 //! | `- 項目` | `• 項目` |
 //! | `1. 項目` | `1. 項目` (番号付きリストは無い) |
-//! | 表 | コードブロックに入れて桁を揃える |
+//! | 表 | 行として並べる (見出し行は太字) |
 
 use pulldown_cmark::{BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -35,6 +35,42 @@ fn escape(text: &str) -> String {
 /// リンクの URL 側。`<` `>` は区切りなので入れられないが、`&` は escape する。
 fn escape_url(url: &str) -> String {
     url.replace('&', "&amp;")
+}
+
+/// HTML のタグとコメントを落として、見える文字だけ返す。
+///
+/// issue のテンプレートは `<!-- 説明 -->` や `<details>` を含む。タグを
+/// そのまま出すと読めないが、イベントごと捨てると中の文字まで消える。
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+
+    loop {
+        // コメントは中身ごと落とす
+        if let Some(i) = rest.find("<!--") {
+            out.push_str(&rest[..i]);
+            match rest[i..].find("-->") {
+                Some(j) => rest = &rest[i + j + 3..],
+                None => return out.trim().to_string(),
+            }
+            continue;
+        }
+
+        match rest.find('<') {
+            None => {
+                out.push_str(rest);
+                return out.trim().to_string();
+            }
+            Some(i) => {
+                out.push_str(&rest[..i]);
+                match rest[i..].find('>') {
+                    Some(j) => rest = &rest[i + j + 1..],
+                    // 閉じていないので、以降はタグの途中とみなして捨てる
+                    None => return out.trim().to_string(),
+                }
+            }
+        }
+    }
 }
 
 /// 変換したものを組み立てる。
@@ -136,8 +172,15 @@ pub fn from_markdown(md: &str) -> String {
             // Slack に水平線は無い。段落の切れ目としてだけ扱う
             Event::Rule => r.blank_line(),
             Event::TaskListMarker(done) => r.push(if done { "☑ " } else { "☐ " }),
-            // 生の HTML は落とす。`<!-- -->` や `<details>` がそのまま出ると読めない
-            Event::Html(_) | Event::InlineHtml(_) => {}
+            // タグは落とすが中の文字は残す。pulldown-cmark は HTML ブロックを
+            // まとめて 1 つのイベントで渡すので、丸ごと捨てると本文が消える
+            Event::Html(h) | Event::InlineHtml(h) => {
+                let visible = strip_tags(&h);
+                if !visible.is_empty() {
+                    let escaped = escape(&visible);
+                    r.push(&escaped);
+                }
+            }
             _ => {}
         }
     }
@@ -291,48 +334,32 @@ fn end(r: &mut Renderer, tag: TagEnd) {
     }
 }
 
-/// 表はコードブロックに入れる。
+/// 表は行をそのまま並べる。
 ///
-/// mrkdwn に表は無く、`|` を並べただけでは桁が揃わずに読めない。
-/// 等幅で描画される場所に入れて、幅を揃える。
+/// mrkdwn に表は無い。等幅ブロックに入れて桁を揃える手もあるが、
+/// ブロックの中では mrkdwn が解釈されないので、セルの中のリンクや強調が
+/// 記法のまま見えてしまう。桁揃え自体も、日本語や絵文字では文字数と表示幅が
+/// 一致しないので守れない。揃えるのを諦めて、セルの中身を活かす。
+///
+/// 見出し行は太字にして、本体と見分けられるようにする。
 fn render_table(rows: &[Vec<String>]) -> String {
-    if rows.is_empty() {
-        return String::new();
-    }
+    let mut lines = Vec::new();
 
-    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let mut widths = vec![0usize; cols];
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
-        }
-    }
-
-    let line = |row: &Vec<String>| {
-        let cells: Vec<String> = (0..cols)
-            .map(|i| {
-                let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let pad = widths[i].saturating_sub(cell.chars().count());
-                format!("{cell}{}", " ".repeat(pad))
+    for (i, row) in rows.iter().enumerate() {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|c| {
+                if i == 0 && !c.is_empty() {
+                    format!("*{c}*")
+                } else {
+                    c.clone()
+                }
             })
             .collect();
-        format!("| {} |", cells.join(" | "))
-    };
-
-    let mut out = String::from("```\n");
-    out.push_str(&line(&rows[0]));
-    out.push('\n');
-
-    // 見出しと本体の区切り
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    out.push_str(&format!("| {} |\n", sep.join(" | ")));
-
-    for row in &rows[1..] {
-        out.push_str(&line(row));
-        out.push('\n');
+        lines.push(cells.join(" | "));
     }
-    out.push_str("```");
-    out
+
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -456,15 +483,52 @@ mod tests {
         );
     }
 
-    /// 表は等幅ブロックに入れて桁を揃えること。
+    /// 表は行として出すこと。
     ///
-    /// mrkdwn に表は無く、`|` を並べただけでは桁が揃わずに読めない。
+    /// 等幅ブロックに入れて桁を揃えると、ブロックの中では mrkdwn が解釈
+    /// されないので、セルのリンクや強調が記法のまま見えてしまう。
     #[test]
-    fn tables_are_aligned_in_a_code_block() {
+    fn tables_are_rendered_as_rows() {
         assert_eq!(
             from_markdown("| a | bb |\n| --- | --- |\n| 1 | 2 |"),
-            "```\n| a | bb |\n| - | -- |\n| 1 | 2  |\n```"
+            "*a* | *bb*\n1 | 2"
         );
+    }
+
+    /// 表のセルの中の書式が生きていること。
+    #[test]
+    fn table_cells_keep_their_formatting() {
+        let out = from_markdown(
+            "| name | link |\n| --- | --- |\n| **bold** | [text](https://example.com) |",
+        );
+
+        assert!(out.contains("*bold*"), "強調が消えている: {out}");
+        assert!(
+            out.contains("<https://example.com|text>"),
+            "リンクが消えている: {out}"
+        );
+    }
+
+    /// HTML のタグは落とすが、中の文字は残すこと。
+    ///
+    /// pulldown-cmark は HTML ブロックをまとめて 1 つのイベントで渡すので、
+    /// イベントごと捨てると本文まで消える。
+    #[test]
+    fn html_tags_are_stripped_but_text_is_kept() {
+        assert_eq!(from_markdown("<b>important</b>"), "important");
+        assert!(
+            from_markdown("<table><tr><td>important</td></tr></table>").contains("important"),
+            "HTML の表の中身が消えている"
+        );
+    }
+
+    /// HTML コメントは中身ごと落とすこと。
+    ///
+    /// issue テンプレートの説明文が通知に出ると邪魔になる。
+    #[test]
+    fn html_comments_are_dropped() {
+        assert!(from_markdown("<!-- 説明 -->").is_empty());
+        assert_eq!(from_markdown("<!-- 説明 -->text"), "text");
     }
 
     /// 装飾の無い本文は変えないこと。通知の大半はこれ。
