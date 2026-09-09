@@ -393,26 +393,26 @@ impl Message {
             // リクエスト自体の失敗は payload を変えても直らない。
             // 再送すると待ち時間も倍になるので諦める。
             Err(PostError::Request(e)) => {
-                error!("POST: {e}");
+                error!("POST to {channel}: {e}");
                 return;
             }
             Err(PostError::Api(e)) => {
                 if !should_retry(&payload, &e) {
-                    error!("POST: {e}");
+                    error!("POST to {channel}: {e}");
                     return;
                 }
 
                 // markdown ブロックが attachment 内で使えるか、本文が上限を
                 // 超えたかはこちらで判定できない。blocks 由来と思われる
                 // エラーなら、従来の表現 (attachment の text) で再送する。
-                warn!("POST rejected ({e}); retrying without markdown blocks");
+                warn!("POST to {channel} rejected ({e}); retrying without markdown blocks");
             }
         }
 
         // 再送も予算の中で行う。取り直すと webhook の締め切りを超えて
         // GitHub が再送し、通知が重複する
         let Some(left) = remaining(deadline, Instant::now()) else {
-            error!("POST (fallback): out of budget");
+            error!("POST to {channel} (fallback): out of budget");
             return;
         };
 
@@ -420,7 +420,7 @@ impl Message {
         match post(&client, base, token, &fallback, left).await {
             // 退避が起きたこと自体が知りたい情報なので debug では埋もれる
             Ok(()) => info!("POST ok (fallback: {})", fallback.body_kind()),
-            Err(e) => error!("POST (fallback): {e}"),
+            Err(e) => error!("POST to {channel} (fallback): {e}"),
         }
     }
 }
