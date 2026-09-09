@@ -106,47 +106,17 @@ fn is_hopeless(error: &str) -> bool {
     )
 }
 
-/// 同じ payload を送り直してよいエラー。
+/// 同じ payload で再送すべきか。
 ///
-/// `chat.postMessage` に冪等キーは無いので、既に投稿されている可能性がある
-/// なら送り直せない。`internal_error` と `fatal_error` はドキュメントに
-/// "It's possible some aspect of the operation succeeded before the error was
-/// raised." と書かれているので除く。送り直すと通知が重複する。
+/// [`is_hopeless`] に無いエラーは一時的なものの可能性があるので送り直す。
+/// `internal_error` はドキュメントで
+/// "The server could not complete your operation(s) without encountering an
+/// error, likely due to a transient issue on our end." とされている。
 ///
-/// `request_timeout` は名前に反して "the POST data was either missing or
-/// truncated" で、送った内容の不備なので送り直しても直らない。
-///
-/// 残るのは `service_unavailable` ("The service is temporarily unavailable")
-/// だけ。処理に入る前に断られているので、同じものを送ってよい。
-///
-/// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
-fn is_retriable(error: &str) -> bool {
-    matches!(error, "service_unavailable")
-}
-
-/// 退避すべきか。ブロックを外した別の payload を送る。
-///
-/// 拒否されたときは投稿されていないので、別のものを送っても重複しない。
-/// blocks を持たない payload は外しても変わらないので送らない。
-///
-/// どのエラーで拒否されるかはドキュメントに書かれていないので、[`is_hopeless`]
-/// に無いものは退避してみる。漏れたときの損は API 1 回分で、[`POST_BUDGET`]
-/// の中に収まる。
-///
-/// `internal_error` と `fatal_error` は "It's possible some aspect of the
-/// operation succeeded before the error was raised." とされているので、
-/// 厳密には投稿済みかどうか分からない。それでも退避する。
-///
-/// - attachment の中の markdown ブロックは、最小の payload でも
-///   `internal_error` で拒否される (実測)
-/// - その状態では本文のある通知が 1 通も届かなかった。部分成功していたなら
-///   届いていたはずなので、この payload の形では拒否を意味する
-/// - 外すと本文のある通知が全部落ちる。理論上の重複より、確実な取りこぼしの
-///   方が損が大きい
-///
-/// ブロックを使わなくなればこの判断自体が要らなくなる。
-fn should_fall_back(payload: &MessagePayload, error: &str) -> bool {
-    payload.has_blocks() && !is_hopeless(error)
+/// 一覧から漏れたエラーで通知が無言で落ちるより、無駄に 1 回投げる方が
+/// 損が小さい。再送は [`POST_BUDGET`] の中で行う。
+fn should_retry(error: &str) -> bool {
+    !is_hopeless(error)
 }
 
 /// `chat.postMessage` の応答。
@@ -300,60 +270,20 @@ pub struct Footer {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum Body {
-    /// markdown ブロックとして送る。
-    ///
-    /// attachment の `text` は mrkdwn (Slack 独自記法) なので、GitHub の本文を
-    /// そのまま貼ると崩れる (`##` がそのまま出る、`*x*` の強調が入れ替わる)。
-    /// markdown ブロックは **本物の Markdown** を解釈するので、見出しや表、
-    /// タスクリストまでそのまま渡せる。
-    /// 色バーを残したいので、トップレベルではなく attachment の中に置く。
-    Blocks {
-        blocks: Vec<Block>,
-        /// 拒否されたときの退避先 (mrkdwn)。リクエストには含めない。
-        #[serde(skip)]
-        mrkdwn: Option<String>,
-    },
-    /// 従来どおり attachment の `text` として送る (退避先)。
+    /// attachment の `text` として送る。中身は mrkdwn。
     Text { text: String },
     /// 本文が無い。
     ///
-    /// 空の `text` を持つブロックは `invalid_blocks` で拒否され、通知そのものが
-    /// 飛ばなくなるので、空なら何も入れない。
+    /// 空文字を送ると `no_text` で拒否され、通知そのものが飛ばなくなるので、
+    /// 空なら何も入れない。
     Empty {},
 }
 
 impl Body {
-    /// markdown ブロックと、拒否されたとき用の mrkdwn から作る。
-    pub fn new(blocks: Vec<Block>, mrkdwn: Option<String>) -> Self {
-        if !blocks.is_empty() {
-            return Self::Blocks { blocks, mrkdwn };
-        }
-
-        match mrkdwn {
+    pub fn new(text: Option<String>) -> Self {
+        match text {
             Some(text) => Self::Text { text },
             None => Self::Empty {},
-        }
-    }
-
-    /// blocks をやめて退避先に変える。
-    fn fall_back(&mut self) {
-        let Self::Blocks { mrkdwn, .. } = self else {
-            return;
-        };
-
-        let mrkdwn = mrkdwn.take();
-        *self = match mrkdwn {
-            Some(text) => Self::Text { text },
-            None => Self::Empty {},
-        };
-    }
-
-    /// 中の blocks。テストで中身を確認するために使う。
-    #[cfg(test)]
-    pub fn blocks(&self) -> &[Block] {
-        match self {
-            Self::Blocks { blocks, .. } => blocks,
-            _ => &[],
         }
     }
 
@@ -365,97 +295,21 @@ impl Body {
             _ => None,
         }
     }
-
-    /// 退避用に用意しておいた mrkdwn。テストで中身を確認するために使う。
-    #[cfg(test)]
-    pub fn mrkdwn(&self) -> Option<&str> {
-        match self {
-            Self::Blocks { mrkdwn, .. } => mrkdwn.as_deref(),
-            _ => None,
-        }
-    }
-}
-
-/// Block Kit のブロック。今は markdown だけ使う。
-///
-/// <https://docs.slack.dev/reference/block-kit/blocks/markdown-block>
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Block {
-    Markdown { text: String },
 }
 
 impl MessagePayload {
-    /// blocks をやめて、`text` だけにした payload。
-    ///
-    /// markdown ブロックが受け付けられない場合の退避先。用意しておいた
-    /// mrkdwn の本文を `text` に移す。ブロックの Markdown を流用すると
-    /// `**太字**` や `[name](url)` が解釈されず、従来より悪い表示になる
-    /// (方言が違う)。
-    ///
-    /// 従来の表現なので、長い本文は Slack 側で畳まれる。
-    fn into_text_fallback(mut self) -> Self {
-        for a in self.attachments.iter_mut().flatten() {
-            a.body.fall_back();
-        }
-
-        self
-    }
-
-    /// 本文をどの表現で送ったか。ログに出して答え合わせに使う。
-    ///
-    /// attachment の中で markdown ブロックが使えるかはドキュメントに記載が無く、
-    /// こちらでは確かめられない。実際に通ったかはログでしか分からない。
+    /// 本文をどの表現で送ったか。ログに出す。
     fn body_kind(&self) -> &'static str {
-        let bodies = || self.attachments.iter().flatten().map(|a| &a.body);
-
-        if bodies().any(|b| matches!(b, Body::Blocks { .. })) {
-            "markdown blocks"
-        } else if bodies().any(|b| matches!(b, Body::Text { .. })) {
+        if self
+            .attachments
+            .iter()
+            .flatten()
+            .any(|a| matches!(a.body, Body::Text { .. }))
+        {
             "attachment text"
         } else {
             "no body"
         }
-    }
-
-    /// markdown ブロックを含むか。
-    ///
-    /// 含まないなら退避しても payload は変わらない。再送しても同じエラーで
-    /// 確実に失敗するので、時間とレート制限を捨てるだけになる。
-    fn has_blocks(&self) -> bool {
-        self.attachments
-            .iter()
-            .flatten()
-            .any(|a| matches!(a.body, Body::Blocks { .. }))
-    }
-}
-
-impl Block {
-    /// ブロックの本文。テストで中身を確認するために使う。
-    #[cfg(test)]
-    pub fn text(&self) -> &str {
-        match self {
-            Self::Markdown { text } => text,
-        }
-    }
-
-    /// 本文からブロックを作る。
-    ///
-    /// 空なら `None`。空の `text` は `invalid_blocks` で拒否され、
-    /// 通知そのものが飛ばなくなる。
-    ///
-    /// 長さは切らない。markdown ブロックには payload 全体で 12,000 文字の
-    /// 上限があるが、超えた場合は Slack に拒否させて `text` へ退避する
-    /// ([`MessagePayload::into_text_fallback`])。退避先では従来どおり
-    /// Slack が長い本文を「Show more」で畳む。
-    pub fn markdown(text: &str) -> Option<Self> {
-        if text.trim().is_empty() {
-            return None;
-        }
-
-        Some(Self::Markdown {
-            text: text.to_string(),
-        })
     }
 }
 
@@ -546,53 +400,34 @@ impl Message {
             let Some(left) = remaining(deadline, Instant::now()) else {
                 error!(channel, link, "POST gave up: out of budget");
                 return;
-            };
-
-            match post(&client, base, token, &payload, left).await {
-                Ok(()) => {
-                    if degraded {
-                        // 届いてはいるが本来の表現が拒否された degraded success
-                        warn!(channel, body = payload.body_kind(), "POST ok (fallback)");
-                    } else {
-                        // どの表現で通ったかは、表現を変えたときの答え合わせに要る
-                        info!(channel, body = payload.body_kind(), "POST ok");
-                    }
-                    return;
-                }
-                // リクエスト自体の失敗は payload を変えても直らない。
-                // 送り直すと待ち時間も倍になるので諦める。
-                Err(PostError::Request(e)) => {
-                    error!(channel, link, error = %e, "POST failed");
-                    return;
-                }
-                Err(PostError::Api(e)) => {
-                    // 処理前に断られたなら、表現を落とす理由が無いので同じものを
-                    // 送る。先に退避を判定すると、この場合まで表現が落ちる。
-                    if is_retriable(&e) {
-                        if retries >= MAX_RETRIES {
-                            error!(channel, link, error = %e, "POST gave up: too many retries");
-                            return;
-                        }
-                        retries += 1;
-                        warn!(channel, error = %e, "POST failed; retrying");
-                    } else if should_fall_back(&payload, &e) {
-                        // markdown ブロックが attachment 内で使えるか、本文が
-                        // 上限を超えたかはこちらで判定できない。拒否されたら
-                        // 従来の表現 (attachment の text) に落として送る。
-                        warn!(channel, error = %e, "POST rejected; falling back");
-                        payload = payload.into_text_fallback();
-                        degraded = true;
-                        // 上限は payload ごとに数える。別のものを送るので、
-                        // ブロックで使った分を引き継がない
-                        retries = 0;
-                    } else {
-                        // 諦めるが無音にはしない。channel と link が残っていれば
-                        // 落ちた通知を後から追える。
-                        error!(channel, link, error = %e, "POST failed");
-                        return;
-                    }
-                }
             }
+            // リクエスト自体の失敗は payload を変えても直らない。
+            // 再送すると待ち時間も倍になるので諦める。
+            Err(PostError::Request(e)) => {
+                error!(channel, error = %e, "POST failed");
+                return;
+            }
+            Err(PostError::Api(e)) => {
+                if !should_retry(&e) {
+                    error!(channel, error = %e, "POST failed");
+                    return;
+                }
+
+                warn!(channel, error = %e, "POST rejected; retrying");
+            }
+        };
+
+        // 2 通目も予算の中で送る。取り直すと webhook の締め切りを超えて
+        // GitHub が再送し、通知が重複する
+        let Some(left) = remaining(deadline, Instant::now()) else {
+            error!(channel, "POST retry skipped: out of budget");
+            return;
+        };
+
+        match post(&client, base, token, &payload, left).await {
+            // 1 回目が落ちたこと自体が知りたい情報なので info には落とさない。
+            Ok(()) => warn!(channel, body = payload.body_kind(), "POST ok (retry)"),
+            Err(e) => error!(channel, error = %e, "POST failed (retry)"),
         }
     }
 }
@@ -712,41 +547,8 @@ mod tests {
         vec![serde_json::json!({ "ok": false, "error": error })]
     }
 
-    fn blocks(md: &str, mrkdwn: Option<&str>) -> Body {
-        Body::new(
-            vec![Block::markdown(md).expect("ブロックが作られない")],
-            mrkdwn.map(str::to_string),
-        )
-    }
-
-    #[test]
-    fn short_markdown_is_passed_through() {
-        let md = "## 概要\n\n**重要** な `code` と [link](https://example.com)";
-        assert_eq!(
-            Block::markdown(md).unwrap().text(),
-            md,
-            "変換せずそのまま渡す"
-        );
-    }
-
-    /// 長さは切らないこと。
-    ///
-    /// 上限を超えた場合は Slack に拒否させて text へ退避する。
-    /// こちらで切ると、切り方を誤って Markdown を壊す危険がある。
-    #[test]
-    fn long_markdown_is_not_truncated() {
-        let md = "a".repeat(20_000);
-        assert_eq!(Block::markdown(&md).unwrap().text(), md);
-    }
-
-    /// 空の本文ではブロックを作らないこと。
-    ///
-    /// 空の `text` を持つブロックを送ると `invalid_blocks` で拒否され、
-    /// 通知そのものが飛ばなくなる。
-    #[test]
-    fn empty_body_makes_no_block() {
-        assert!(Block::markdown("").is_none());
-        assert!(Block::markdown("   \n  ").is_none());
+    fn text(body: &str) -> Body {
+        Body::new(Some(body.to_string()))
     }
 
     /// 直らないと分かっているエラーだけ再送しないこと。
@@ -797,66 +599,36 @@ mod tests {
         }
     }
 
-    /// **初回のリクエストに `text` を入れないこと。**
+    /// 本文は attachment の `text` に入ること。
     ///
-    /// Slack は attachment の `text` と blocks を両方描画するので、一緒に送ると
-    /// 成功時に本文が二重に出る。退避用の mrkdwn は持っていても送らない。
+    /// attachment の中では `blocks` が一切通らない (`markdown` は
+    /// `internal_error`、`rich_text` と `section` は `invalid_attachments`)。
     #[test]
-    fn first_request_sends_blocks_without_text() {
-        let payload = payload(blocks("## body", Some("## body\n*Assignees*")));
-        let json = serde_json::to_value(&payload).expect("直列化に失敗");
+    fn attachment_sends_the_body_as_text() {
+        let mrkdwn = "*body*\n\n*Assignees*: <https://github.com/sksat|sksat>";
+        let json = serde_json::to_value(payload(text(mrkdwn))).expect("直列化に失敗");
         let a = &json["attachments"][0];
 
-        assert!(a["blocks"].is_array(), "blocks が無い: {a}");
-        assert!(a.get("text").is_none(), "text が同送されている: {a}");
+        assert_eq!(a["text"], mrkdwn, "text になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks を送っている: {a}");
     }
 
-    /// 退避後は `text` だけになること。
+    /// 本文が無いときは `text` を送らないこと。
     ///
-    /// 用意しておいた mrkdwn が入る。ブロックの Markdown を流用すると
-    /// `**太字**` や `[name](url)` が解釈されず、従来より悪い表示になる。
+    /// 空文字を送ると `no_text` で拒否され、通知そのものが飛ばなくなる。
     #[test]
-    fn fallback_request_sends_text_without_blocks() {
-        let mrkdwn = "## body\n*Assignees*\n<https://github.com/sksat|sksat>";
-        let payload = payload(blocks("## body", Some(mrkdwn))).into_text_fallback();
-        let json = serde_json::to_value(&payload).expect("直列化に失敗");
-        let a = &json["attachments"][0];
-
-        assert_eq!(a["text"], mrkdwn, "mrkdwn の text になっていない: {a}");
-        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
-    }
-
-    /// 本文が無いときは `text` も `blocks` も送らないこと。
-    ///
-    /// 空の `text` を持つブロックは `invalid_blocks` で拒否される。
-    #[test]
-    fn bodyless_attachment_sends_neither() {
-        let json = serde_json::to_value(payload(Body::new(vec![], None))).expect("直列化に失敗");
+    fn bodyless_attachment_sends_no_text() {
+        let json = serde_json::to_value(payload(Body::new(None))).expect("直列化に失敗");
         let a = &json["attachments"][0];
 
         assert!(a.get("text").is_none(), "text が入っている: {a}");
-        assert!(a.get("blocks").is_none(), "blocks が入っている: {a}");
     }
 
-    /// どの表現で送ったかを言えること。
-    ///
-    /// attachment 内で markdown ブロックが使えるかは検証できないので、
-    /// 実際に通ったかを知る手段はこのログだけになる。
+    /// 本文を送ったかどうかをログで言えること。
     #[test]
     fn body_kind_names_the_representation() {
-        assert_eq!(
-            payload(blocks("## body", Some("body"))).body_kind(),
-            "markdown blocks"
-        );
-        assert_eq!(
-            payload(Body::new(vec![], Some("body".to_string()))).body_kind(),
-            "attachment text"
-        );
-        assert_eq!(payload(Body::new(vec![], None)).body_kind(), "no body");
-
-        // 退避すると表現が変わることも言えていること
-        let fallback = payload(blocks("## body", Some("body"))).into_text_fallback();
-        assert_eq!(fallback.body_kind(), "attachment text");
+        assert_eq!(payload(text("body")).body_kind(), "attachment text");
+        assert_eq!(payload(Body::new(None)).body_kind(), "no body");
     }
 
     /// footer が `footer` / `footer_icon` として出ること。
@@ -869,7 +641,7 @@ mod tests {
             footer_icon: Some("https://example.com/avatar.png".parse().unwrap()),
         };
 
-        let json = serde_json::to_value(payload_with_footer(blocks("## body", None), Some(footer)))
+        let json = serde_json::to_value(payload_with_footer(text("*body*"), Some(footer)))
             .expect("直列化に失敗");
         let a = &json["attachments"][0];
 
@@ -880,8 +652,8 @@ mod tests {
     /// footer が無いときは何も出ないこと。
     #[test]
     fn no_footer_sends_nothing() {
-        let json = serde_json::to_value(payload_with_footer(blocks("## body", None), None))
-            .expect("直列化に失敗");
+        let json =
+            serde_json::to_value(payload_with_footer(text("*body*"), None)).expect("直列化に失敗");
         let a = &json["attachments"][0];
 
         assert!(a.get("footer").is_none(), "footer が入っている: {a}");
@@ -891,33 +663,17 @@ mod tests {
         );
     }
 
-    /// blocks を持つときだけ退避すること。
-    ///
-    /// blocks が無い payload は外しても変わらないので、送り直しても同じ
-    /// エラーで失敗する。
+    /// blocks を持ち、かつ直らないと分かっていないエラーのときだけ再送すること。
     #[test]
-    fn falling_back_needs_blocks() {
-        let with_blocks = payload(blocks("## body", None));
-
-        assert!(should_fall_back(&with_blocks, "invalid_blocks"));
+    fn retry_needs_a_fixable_error() {
         assert!(
-            should_fall_back(&with_blocks, "internal_error"),
-            "拒否されたのに退避していない"
+            should_retry("internal_error"),
+            "transient なエラーで再送していない"
         );
         assert!(
-            !should_fall_back(&with_blocks, "invalid_auth"),
-            "直らないエラーで退避している"
+            !should_retry("invalid_auth"),
+            "直らないエラーで再送している"
         );
-
-        for body in [
-            Body::new(vec![], Some("body".to_string())),
-            Body::new(vec![], None),
-        ] {
-            assert!(
-                !should_fall_back(&payload(body), "invalid_blocks"),
-                "blocks が無いのに退避している"
-            );
-        }
     }
 
     /// 同じ payload を送り直してよいエラーだけリトライすること。
@@ -952,7 +708,7 @@ mod tests {
     /// 取り直すと GitHub の webhook 配信タイムアウトを超え、GitHub が再送して
     /// 通知が重複する。
     #[test]
-    fn exhausted_budget_leaves_no_time_for_the_fallback() {
+    fn exhausted_budget_leaves_no_time_for_the_retry() {
         let now = Instant::now();
 
         assert_eq!(
@@ -977,8 +733,8 @@ mod tests {
     async fn post_sends_the_charset() {
         let (base, _got, ctypes) = spawn_slack(vec![]);
 
-        message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+        message(text("*body*"))
+            .post_message_to(&base, "token", "channel", None)
             .await;
 
         let ctypes = ctypes.lock().unwrap();
@@ -995,15 +751,15 @@ mod tests {
     async fn success_posts_once() {
         let (base, got, _ctypes) = spawn_slack(vec![]);
 
-        message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+        message(text("*body*"))
+            .post_message_to(&base, "token", "channel", None)
             .await;
 
         let got = got.lock().unwrap();
         assert_eq!(got.len(), 1, "余計に送っている");
-        assert!(
-            got[0]["attachments"][0]["blocks"].is_array(),
-            "blocks で送っていない: {}",
+        assert_eq!(
+            got[0]["attachments"][0]["text"], "*body*",
+            "text で送っていない: {}",
             got[0]
         );
     }
@@ -1037,181 +793,29 @@ mod tests {
         assert!(res.warnings().is_empty(), "{:?}", res.warnings());
     }
 
-    /// blocks 由来のエラーなら、従来の表現で再送すること。
+    /// 直るかもしれないエラーなら、同じ payload で再送すること。
     #[actix_web::test]
-    async fn block_error_is_retried_as_text() {
-        let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
-
-        message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        let got = got.lock().unwrap();
-        assert_eq!(got.len(), 2, "再送していない");
-
-        let a = &got[1]["attachments"][0];
-        assert_eq!(
-            a["text"], "*Assignees*: sksat",
-            "mrkdwn になっていない: {a}"
-        );
-        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
-    }
-
-    /// 拒否されたら退避して送り直すこと。
-    ///
-    /// 単体テストだけでは
-    /// 「1 回目の応答を読んで 2 回目を投げる」という手順自体が壊れても
-    /// 気付けないので、HTTP を通して確かめる。
-    #[actix_web::test]
-    async fn transient_error_is_retried_as_text() {
+    async fn retryable_error_resends_the_same_payload() {
         let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
 
-        message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+        message(text("*body*"))
+            .post_message_to(&base, "token", "channel", None)
             .await;
 
         let got = got.lock().unwrap();
         assert_eq!(got.len(), 2, "再送していない");
-
-        let a = &got[1]["attachments"][0];
-        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
-        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+        assert_eq!(got[0], got[1], "違う payload を送っている");
     }
 
-    /// 本文が無い payload でも、一時的なエラーなら再送すること。
-    ///
-    /// 退避しても payload は変わらないが、一時的な失敗なら同じものを
-    /// 送り直して通る。ここを落とすと本文の無い通知が消える。
-    #[actix_web::test]
-    async fn blockless_payloads_are_retried_on_transient_errors() {
-        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
-
-        message(Body::new(vec![], None))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        assert_eq!(got.lock().unwrap().len(), 2, "再送していない");
-    }
-
-    /// 処理前に断られたときは表現を落とさず同じものを送ること。
-    ///
-    /// 退避を先に判定すると、blocks を持つ payload では `service_unavailable`
-    /// でも表現が落ちてしまう。落とす理由が無い。
-    #[actix_web::test]
-    async fn retriable_errors_keep_the_blocks() {
-        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
-
-        message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        let got = got.lock().unwrap();
-        assert_eq!(got.len(), 2, "送り直していない");
-        assert_eq!(got[0], got[1], "表現が落ちている");
-    }
-
-    /// 断られた後に送り直してブロックを拒否されたら、退避まで進むこと。
-    ///
-    /// 1 通目で手を 1 つ選んで終わりにすると、この組み合わせで通知が消える。
-    #[actix_web::test]
-    async fn a_rejection_after_a_retry_still_falls_back() {
-        let (base, got, _ctypes) = spawn_slack(vec![
-            serde_json::json!({ "ok": false, "error": "service_unavailable" }),
-            serde_json::json!({ "ok": false, "error": "internal_error" }),
-        ]);
-
-        message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        let got = got.lock().unwrap();
-        assert_eq!(got.len(), 3, "退避まで進んでいない");
-
-        let a = &got[2]["attachments"][0];
-        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
-        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
-    }
-
-    /// 断られ続けても投げ続けないこと。
-    #[actix_web::test]
-    async fn repeated_rejections_stop_at_the_attempt_limit() {
-        let refused = serde_json::json!({ "ok": false, "error": "service_unavailable" });
-        let (base, got, _ctypes) = spawn_slack(vec![
-            refused.clone(),
-            refused.clone(),
-            refused.clone(),
-            refused,
-        ]);
-
-        message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        assert_eq!(
-            got.lock().unwrap().len(),
-            MAX_RETRIES + 1,
-            "上限を超えて投げている"
-        );
-    }
-
-    /// 上限まで送り直した後にブロックを拒否されても、退避先を送ること。
-    ///
-    /// 回数の上限を「送った回数」で数えると、退避先を作った直後に打ち切って
-    /// 通知が消える。
-    #[actix_web::test]
-    async fn a_fallback_is_sent_even_after_the_retry_limit() {
-        let refused = serde_json::json!({ "ok": false, "error": "service_unavailable" });
-        let (base, got, _ctypes) = spawn_slack(vec![
-            refused.clone(),
-            refused,
-            serde_json::json!({ "ok": false, "error": "internal_error" }),
-        ]);
-
-        message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        let got = got.lock().unwrap();
-        assert_eq!(got.len(), MAX_RETRIES + 2, "退避先を送っていない");
-
-        let a = &got[got.len() - 1]["attachments"][0];
-        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
-        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
-    }
-
-    /// blocks 由来でないエラーでは再送しないこと。
+    /// 直らないと分かっているエラーでは再送しないこと。
     #[actix_web::test]
     async fn other_errors_are_not_retried() {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_auth"));
 
-        message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+        message(text("*body*"))
+            .post_message_to(&base, "token", "channel", None)
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
-    }
-
-    /// blocks を持たない payload では再送しないこと。
-    #[actix_web::test]
-    async fn blockless_payloads_are_not_retried() {
-        let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
-
-        message(Body::new(vec![], None))
-            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
-            .await;
-
-        assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
-    }
-
-    /// ブロックの無い本文は退避しても変わらないこと。
-    #[test]
-    fn fallback_leaves_blockless_bodies_alone() {
-        let mut empty = Body::new(vec![], None);
-        empty.fall_back();
-        assert!(matches!(empty, Body::Empty {}), "{empty:?}");
-
-        let mut text = Body::new(vec![], Some("body".to_string()));
-        text.fall_back();
-        assert_eq!(text.text(), Some("body"));
     }
 }

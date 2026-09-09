@@ -55,21 +55,20 @@ impl TryFrom<&github::Payload> for slack::Message {
     }
 }
 
-/// リンクの記法。同じメッセージでも場所によって解釈される方言が違う。
+/// リンクの記法。
 ///
-/// - トップレベルの `text` は mrkdwn なので `<url|text>`
-/// - attachment の本文は markdown ブロックなので `[text](url)`
+/// トップレベルの `text` も attachment の本文も mrkdwn なので `<url|text>`。
+/// 本文の GitHub markdown は [`crate::mrkdwn`] で変換してから入れるため、
+/// `[text](url)` を組み立てる場所は無い。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkStyle {
     Mrkdwn,
-    Markdown,
 }
 
 impl LinkStyle {
     fn link(self, text: &str, url: &str) -> String {
         match self {
             Self::Mrkdwn => format!("<{url}|{text}>"),
-            Self::Markdown => format!("[{text}]({url})"),
         }
     }
 }
@@ -113,20 +112,14 @@ fn with_assignees(body: &str, line: Option<String>) -> String {
     format!("{body}\n\n{line}")
 }
 
-/// attachment の本文 (markdown ブロック)。
-fn body_blocks(body: &str, assignees: &[github::common::User]) -> Vec<slack::Block> {
-    let body = with_assignees(body, assignees_line(assignees, LinkStyle::Markdown, "**"));
-
-    slack::Block::markdown(&body).into_iter().collect()
-}
-
-/// ブロックが拒否されたときの退避先 (mrkdwn)。
+/// attachment の本文。
 ///
-/// ブロックの Markdown をそのまま `text` に入れると、`**太字**` や
-/// `[name](url)` が解釈されず、従来より悪い表示になる。方言が違うので
-/// 使い回せない。本文は元から生のままだったので、Assignees だけ作り直す。
+/// GitHub の本文を mrkdwn に変換して入れる。attachment の中では `blocks` が
+/// 一切通らない (`markdown` は `internal_error`、`rich_text` と `section` は
+/// `invalid_attachments`) ので、色バーを残すにはこの形しかない。
 fn body_text(body: &str, assignees: &[github::common::User]) -> Option<String> {
-    let text = with_assignees(body, assignees_line(assignees, LinkStyle::Mrkdwn, "*"));
+    let body = crate::mrkdwn::from_markdown(body);
+    let text = with_assignees(&body, assignees_line(assignees, LinkStyle::Mrkdwn, "*"));
 
     (!text.trim().is_empty()).then_some(text)
 }
@@ -142,9 +135,8 @@ fn sender_footer(sender: &github::common::User) -> slack::Footer {
     }
 }
 
-/// attachment の本文。markdown ブロックと、退避用の mrkdwn を組にする。
 fn body_content(body: &str, assignees: &[github::common::User]) -> slack::Body {
-    slack::Body::new(body_blocks(body, assignees), body_text(body, assignees))
+    slack::Body::new(body_text(body, assignees))
 }
 
 fn users2str(
@@ -606,9 +598,9 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            attach.body.blocks()[0].text().contains("@sksat"),
+            attach.body.text().expect("本文が無い").contains("@sksat"),
             "attach = {}",
-            attach.body.blocks()[0].text()
+            attach.body.text().expect("本文が無い")
         );
     }
 
@@ -641,9 +633,9 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            attach.body.blocks()[0].text().contains("@sksat"),
+            attach.body.text().expect("本文が無い").contains("@sksat"),
             "attach = {}",
-            attach.body.blocks()[0].text()
+            attach.body.text().expect("本文が無い")
         );
     }
 
@@ -676,19 +668,20 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            !attach.body.blocks()[0].text().is_empty(),
+            !attach.body.text().expect("本文が無い").is_empty(),
             "attachment の本文が空"
         );
-        assert_eq!(attach.body.blocks()[0].text(), attach.fallback);
+        assert_eq!(attach.body.text().expect("本文が無い"), attach.fallback);
     }
 
     /// 本文を markdown ブロックとして、変換せずそのまま渡すこと。
     ///
-    /// attachment の `text` (mrkdwn) に入れていた頃は `##` がそのまま出て、
-    /// `*x*` の強調も入れ替わっていた。markdown ブロックは本物の Markdown を
-    /// 解釈するので、GitHub の本文を加工せずに渡す。
+    /// 本文が mrkdwn に変換されて入ること。
+    ///
+    /// GitHub の本文をそのまま入れると `##` や `**` が生で出る。attachment の
+    /// 中では blocks が通らないので、こちらで mrkdwn にしてから入れる。
     #[test]
-    fn body_is_passed_through_as_markdown() {
+    fn body_is_converted_to_mrkdwn() {
         let msg = message(
             "pull_request_review",
             "pull_request_review.approved.derived.json",
@@ -696,9 +689,8 @@ mod tests {
         .expect("通知されるべき");
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
-        assert_eq!(attach.body.blocks().len(), 1, "markdown ブロックが 1 つ");
 
-        // fixture の review 本文がそのまま入っていること
+        // 装飾の無い本文は変換しても変わらないこと
         let crate::github::Payload::PullRequestReview(review) = &de(
             "pull_request_review",
             "pull_request_review.approved.derived.json",
@@ -706,29 +698,33 @@ mod tests {
             panic!("not a review");
         };
         let body = review.review.body.as_deref().unwrap();
-        assert_eq!(attach.body.blocks()[0].text(), body, "加工されている");
+        assert_eq!(
+            attach.body.text().expect("本文が無い"),
+            body,
+            "加工されている"
+        );
     }
 
-    /// attachment 本文の Assignees が Markdown 記法になること。
+    /// attachment 本文の Assignees が mrkdwn 記法になること。
     ///
-    /// markdown ブロックの中では `*x*` は斜体、リンクは `[text](url)` なので、
-    /// mrkdwn のまま (`*Assignees*` / `<url|x>`) だと崩れる。
+    /// attachment の本文は mrkdwn なので、`**x**` や `[text](url)` を入れると
+    /// 生のまま出る。
     #[test]
-    fn assignees_in_body_use_markdown_syntax() {
+    fn assignees_in_body_use_mrkdwn_syntax() {
         let msg = message(
             "pull_request",
             "pull_request.assigned.with-organization.json",
         )
         .expect("通知されるべき");
 
-        let body = msg.attachments.as_ref().unwrap()[0].body.blocks()[0].text();
+        let body = msg.attachments.as_ref().unwrap()[0]
+            .body
+            .text()
+            .expect("本文が無い");
+        assert!(body.contains("*Assignees*: "), "1 行になっていない: {body}");
         assert!(
-            body.contains("**Assignees**: "),
-            "1 行になっていない: {body}"
-        );
-        assert!(
-            body.contains("[Codertocat](https://github.com/Codertocat)"),
-            "リンクが Markdown でない: {body}"
+            body.contains("<https://github.com/Codertocat|Codertocat>"),
+            "リンクが mrkdwn でない: {body}"
         );
     }
 
@@ -767,8 +763,8 @@ mod tests {
         let a = &msg.attachments.as_ref().unwrap()[0];
 
         for text in [
-            a.body.blocks()[0].text(),
-            a.body.mrkdwn().expect("退避先が無い"),
+            a.body.text().expect("本文が無い"),
+            a.body.text().expect("本文が無い"),
         ] {
             assert!(text.starts_with('*'), "空行から始まっている: {text:?}");
         }
@@ -803,53 +799,17 @@ mod tests {
         let assignees = payload.assignees();
         assert_eq!(assignees.len(), 2, "2 人以上の fixture が必要");
 
-        // 入れる場所によって方言が違うので、両方確かめる
-        for (style, bold) in [(LinkStyle::Markdown, "**"), (LinkStyle::Mrkdwn, "*")] {
-            let line = assignees_line(assignees, style, bold).expect("Assignees が無い");
+        let style = LinkStyle::Mrkdwn;
+        let line = assignees_line(assignees, style, "*").expect("Assignees が無い");
 
-            assert!(!line.contains('\n'), "1 行に収まっていない: {line:?}");
-            for (login, url) in [
-                ("Codertocat", "https://github.com/Codertocat"),
-                ("octocat", "http://github.com/octocat"),
-            ] {
-                let link = style.link(login, url);
-                assert!(line.contains(&link), "{link} が無い: {line}");
-            }
+        assert!(!line.contains('\n'), "1 行に収まっていない: {line:?}");
+        for (login, url) in [
+            ("Codertocat", "https://github.com/Codertocat"),
+            ("octocat", "http://github.com/octocat"),
+        ] {
+            let link = style.link(login, url);
+            assert!(line.contains(&link), "{link} が無い: {line}");
         }
-    }
-
-    /// 主となるブロックは Markdown、退避先は mrkdwn になること。
-    ///
-    /// 退避時にブロックの Markdown をそのまま `text` に入れると、
-    /// `**太字**` や `[name](url)` が解釈されず、従来より悪い表示になる。
-    #[test]
-    fn block_is_markdown_and_fallback_is_mrkdwn() {
-        let msg = message(
-            "pull_request",
-            "pull_request.assigned.with-organization.json",
-        )
-        .expect("通知されるべき");
-        let a = &msg.attachments.as_ref().unwrap()[0];
-
-        // 主: markdown ブロック
-        let block = a.body.blocks()[0].text();
-        assert!(block.contains("**Assignees**"), "block = {block}");
-        assert!(
-            block.contains("[Codertocat](https://github.com/Codertocat)"),
-            "block = {block}"
-        );
-
-        // 退避: mrkdwn
-        let text = a.body.mrkdwn().expect("退避先が無い");
-        assert!(
-            !text.contains("**Assignees**"),
-            "Markdown のままになっている: {text}"
-        );
-        assert!(text.contains("*Assignees*"), "text = {text}");
-        assert!(
-            text.contains("<https://github.com/Codertocat|Codertocat>"),
-            "mrkdwn のリンクになっていない: {text}"
-        );
     }
 
     /// repo とアカウントがトップレベルの text でリンクになること。
@@ -880,7 +840,7 @@ mod tests {
     /// 空の `text` を持つ markdown ブロックを送ると `invalid_blocks` で
     /// 拒否され、通知そのものが飛ばなくなる。本文なしの PR は珍しくない。
     #[test]
-    fn bodyless_pull_request_makes_no_block() {
+    fn bodyless_pull_request_sends_no_text() {
         let msg = message(
             "pull_request",
             "pull_request.review_requested.no-body.derived.json",
@@ -889,9 +849,9 @@ mod tests {
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
         assert!(
-            attach.body.blocks().is_empty(),
-            "空のブロックを作っている: {:?}",
-            attach.body.blocks()
+            attach.body.text().is_none(),
+            "空の本文を入れている: {:?}",
+            attach.body
         );
         // 本文が無くても要約行は出る
         assert!(
@@ -940,7 +900,10 @@ mod tests {
         .expect("レビューコメントは通知されるべき");
 
         let attach = &msg.attachments.as_ref().unwrap()[0];
-        assert!(!attach.body.blocks()[0].text().is_empty(), "本文が空");
+        assert!(
+            !attach.body.text().expect("本文が無い").is_empty(),
+            "本文が空"
+        );
         // どのファイルへのコメントかが分かること
         assert!(attach.title.is_some(), "path が入っていない");
     }

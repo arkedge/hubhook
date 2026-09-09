@@ -22,6 +22,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 mod github;
 mod message;
+mod mrkdwn;
 mod slack;
 mod team;
 
