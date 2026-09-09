@@ -45,37 +45,44 @@ impl std::fmt::Display for PostError {
     }
 }
 
-/// blocks が原因と考えられるエラーか。
+/// 退避しても直らないと分かっているエラー。
 ///
-/// コードは `chat.postMessage` の Errors に載っているものだけを書く
-/// (<https://docs.slack.dev/reference/methods/chat.postMessage>)。
-/// それらしい名前でも実在しないコードを書くと、その分岐は永久に通らない。
-/// `invalid_attachments` は無く、長さの上限は `msg_too_long` ではなく
-/// `msg_blocks_too_long`。
-///
-/// `invalid_auth` や `channel_not_found` は blocks を外しても直らないので、
-/// 再送しても 2 回目が無駄に失敗し、レート制限を悪化させるだけ。
-/// ここに無いエラーが blocks 由来だった場合はログに残るので、後から足せる。
-///
-/// `invalid_arguments` は blocks 以外が原因でも返る汎用のエラーだが、あえて
-/// 含めている。attachment の中で markdown ブロックが使えるかはドキュメントに
-/// 記載が無く、拒否されるとしてどのエラーで返るかも分からない。外して汎用の
-/// エラーで返っていた場合、本文のある通知が全部無言で落ちる。含めた場合の
-/// 損は API 1 回分で、しかも [`POST_BUDGET`] の中に収まる。
-fn is_blocks_problem(error: &str) -> bool {
+/// 認証・チャンネル・権限・レート制限は payload の形と無関係なので、中身を
+/// 変えて送り直しても同じ結果になる。
+fn is_hopeless(error: &str) -> bool {
     matches!(
         error,
-        "invalid_blocks" | "invalid_blocks_format" | "msg_blocks_too_long" | "invalid_arguments"
+        "invalid_auth"
+            | "not_authed"
+            | "account_inactive"
+            | "token_revoked"
+            | "token_expired"
+            | "missing_scope"
+            | "no_permission"
+            | "channel_not_found"
+            | "not_in_channel"
+            | "is_archived"
+            | "ratelimited"
+            | "rate_limited"
+            | "org_login_required"
     )
 }
 
 /// 退避して再送すべきか。
 ///
-/// blocks を外して直るのは blocks 由来のエラーだけで、しかも payload に
-/// blocks が無ければ外しても何も変わらない。どちらも満たさない再送は
-/// 2 回目も同じ結果になり、時間とレート制限を捨てるだけになる。
+/// blocks が無ければ外しても何も変わらないので送り直さない。それ以外は
+/// [`is_hopeless`] に無いエラーなら再送する。
+///
+/// 以前は「blocks 由来と分かっているエラー」を列挙していたが、attachment の
+/// 中で markdown ブロックが使えるかはドキュメントに記載が無く、拒否された
+/// ときに返るエラーも分からない。列挙から漏れたエラーで本文のある通知が
+/// 無言で落ちるため、判断を反転させる。漏れたときの損は API 1 回分で、
+/// [`POST_BUDGET`] の中に収まる。
+///
+/// `internal_error` はドキュメントで transient とされているので、まさに
+/// 再送すべき側。
 fn should_retry(payload: &MessagePayload, error: &str) -> bool {
-    is_blocks_problem(error) && payload.has_blocks()
+    payload.has_blocks() && !is_hopeless(error)
 }
 
 /// `chat.postMessage` の応答。
@@ -635,28 +642,41 @@ mod tests {
         assert!(Block::markdown("   \n  ").is_none());
     }
 
-    /// blocks 由来のエラーだけ再送すること。
+    /// 直らないと分かっているエラーだけ再送しないこと。
     ///
-    /// 認証やチャンネルの問題は blocks を外しても直らないので、
-    /// 再送しても無駄打ちになりレート制限を悪化させる。
+    /// 認証やチャンネルの問題は blocks を外しても直らないので、再送しても
+    /// 無駄打ちになりレート制限を悪化させる。
     #[test]
-    fn only_block_errors_are_retried() {
+    fn hopeless_errors_are_not_retried() {
+        for e in [
+            "invalid_auth",
+            "channel_not_found",
+            "not_in_channel",
+            "is_archived",
+            "missing_scope",
+            "ratelimited",
+        ] {
+            assert!(is_hopeless(e), "{e} は再送すべきでない");
+        }
+    }
+
+    /// 列挙に無いエラーは再送すること。
+    ///
+    /// blocks が拒否されたときに返るエラーは分からないので、直らないと
+    /// 分かっているものだけを除いて退避する。`internal_error` は
+    /// ドキュメントで transient とされている。
+    #[test]
+    fn unknown_and_transient_errors_are_retried() {
         for e in [
             "invalid_blocks",
             "invalid_blocks_format",
             "msg_blocks_too_long",
             "invalid_arguments",
+            "internal_error",
+            "attachment_payload_limit_exceeded",
+            "some_error_slack_has_not_documented_yet",
         ] {
-            assert!(is_blocks_problem(e), "{e} は再送すべき");
-        }
-
-        for e in [
-            "invalid_auth",
-            "channel_not_found",
-            "not_in_channel",
-            "rate_limited",
-        ] {
-            assert!(!is_blocks_problem(e), "{e} は再送すべきでない");
+            assert!(!is_hopeless(e), "{e} は再送すべき");
         }
     }
 
@@ -754,18 +774,22 @@ mod tests {
         );
     }
 
-    /// blocks 由来のエラーで、かつ blocks を持つときだけ再送すること。
+    /// blocks を持ち、かつ直らないと分かっていないエラーのときだけ再送すること。
     ///
     /// blocks が無い payload は退避しても変わらないので、2 回目も同じエラーで
     /// 確実に失敗する。
     #[test]
-    fn only_block_errors_with_blocks_are_retried() {
+    fn retry_needs_blocks_and_a_fixable_error() {
         let with_blocks = payload(blocks("## body", None));
 
         assert!(should_retry(&with_blocks, "invalid_blocks"));
         assert!(
+            should_retry(&with_blocks, "internal_error"),
+            "transient なエラーで再送していない"
+        );
+        assert!(
             !should_retry(&with_blocks, "invalid_auth"),
-            "blocks 由来でないエラーで再送している"
+            "直らないエラーで再送している"
         );
 
         for body in [
