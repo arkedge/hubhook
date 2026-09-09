@@ -267,29 +267,39 @@ async fn webhook(
     }
 
     // 変換できるかは payload だけで決まるので、rule が複数当たっても失敗の理由は
-    // 同じ。channel ごとに Message を作り直す必要はある (post_message が self を
-    // 取る) が、ログは 1 回で足りる。
+    // 同じ。ログは 1 回で足りる。
     let rendered: Result<slack::Message, _> = (&payload).try_into();
-    if let Err(why) = rendered {
-        match &why {
-            // 通知対象にしていない action。error! で出すと本物の失敗が埋もれる。
-            message::NotRendered::Skipped(_) => {
-                debug!("not notified ({why}). link = {}", payload.url());
+    let mut first = match rendered {
+        Ok(msg) => Some(msg),
+        Err(why) => {
+            match &why {
+                // 通知対象にしていない action。error! で出すと本物の失敗が埋もれる。
+                message::NotRendered::Skipped(_) => {
+                    debug!("not notified ({why}). link = {}", payload.url());
+                }
+                message::NotRendered::Unexpected(_) => {
+                    error!(
+                        "GitHub payload -> slack::Message failed ({why}). link = {}",
+                        payload.url()
+                    );
+                }
             }
-            message::NotRendered::Unexpected(_) => {
-                error!(
-                    "GitHub payload -> slack::Message failed ({why}). link = {}",
-                    payload.url()
-                );
-            }
+            return Ok(HttpResponse::Ok().body("webhook"));
         }
-        return Ok(HttpResponse::Ok().body("webhook"));
-    }
+    };
 
     for (channel, m) in matches {
-        let msg: Result<slack::Message, _> = (&payload).try_into();
-        // 上で変換できることを確認済み
-        let Ok(msg) = msg else { continue };
+        // post_message が self を取るので channel ごとに作り直すが、1 通目は
+        // 上で作ったものを使い回す。
+        let msg = match first.take() {
+            Some(msg) => msg,
+            None => {
+                let msg: Result<slack::Message, _> = (&payload).try_into();
+                // 上で変換できることを確認済み
+                let Ok(msg) = msg else { continue };
+                msg
+            }
+        };
         msg.post_message(&opt.slack_token, &channel, Some(&m.display_name))
             .await;
     }
