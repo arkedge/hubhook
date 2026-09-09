@@ -54,24 +54,25 @@ impl std::fmt::Display for PostError {
     }
 }
 
-/// 同じ payload で送り直して直る見込みのあるエラー。
+/// 同じ payload を送り直してよいエラー。
 ///
-/// 本文の表現を落として送り直していた頃は「直らないと分かっているものを
-/// 除いて再送する」で良かった。表現が 1 つになって同じ payload を送るように
-/// なった今は、payload の不正・宛先・権限・流量はどれも 2 回目に同じ結果を
-/// 返すので、再送は予算を捨てるだけになる。
+/// 表現が 1 つになったので、送り直すときは必ず同じ payload になる。
+/// `chat.postMessage` に冪等キーは無いので、既に投稿されている可能性が
+/// あるなら送り直せない。
 ///
-/// なのでドキュメントが一時的だと言っているものだけ再送する。知らないエラーは
-/// 再送しない。同じものを送って直る根拠が無い。
+/// `internal_error` と `fatal_error` はドキュメントに "It's possible some
+/// aspect of the operation succeeded before the error was raised." と
+/// 書かれているので除く。送り直すと通知が重複する。
+///
+/// `request_timeout` は名前に反して "the POST data was either missing or
+/// truncated" で、送った内容の不備なので送り直しても直らない。
+///
+/// 残るのは `service_unavailable` ("The service is temporarily unavailable")
+/// だけ。処理に入る前に断られているので、同じものを送ってよい。
 ///
 /// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
-/// `internal_error` は "likely due to a transient issue on our end" と
-/// されている。
-fn is_transient(error: &str) -> bool {
-    matches!(
-        error,
-        "internal_error" | "fatal_error" | "request_timeout" | "service_unavailable"
-    )
+fn is_retriable(error: &str) -> bool {
+    matches!(error, "service_unavailable")
 }
 
 /// `chat.postMessage` の応答。
@@ -398,7 +399,7 @@ impl Message {
                 return;
             }
             Err(PostError::Api(e)) => {
-                if !is_transient(&e) {
+                if !is_retriable(&e) {
                     error!(channel, error = %e, "POST failed");
                     return;
                 }
@@ -538,42 +539,34 @@ mod tests {
         Body::new(Some(body.to_string()))
     }
 
-    /// 一時的だと分かっているエラーだけ再送すること。
+    /// 同じ payload を送り直してよいエラーだけリトライすること。
     ///
-    /// 同じ payload を送るので、payload の不正や権限の問題は 2 回目も同じ
-    /// 結果になる。再送しても予算を捨てるだけ。
+    /// `internal_error` と `fatal_error` は「一部が既に成功している可能性が
+    /// ある」とドキュメントにあるので、送り直すと通知が重複する。
     #[test]
-    fn only_transient_errors_are_retried() {
-        for e in [
-            "internal_error",
-            "fatal_error",
-            "request_timeout",
-            "service_unavailable",
-        ] {
-            assert!(is_transient(e), "{e} は再送すべき");
-        }
+    fn only_safe_errors_are_retried() {
+        assert!(
+            is_retriable("service_unavailable"),
+            "処理前に断られているので送り直せる"
+        );
 
         for e in [
+            // 一部が投稿済みの可能性がある。送り直すと通知が重複する
+            "internal_error",
+            "fatal_error",
+            // 送った内容の不備。同じものを送っても直らない
+            "request_timeout",
+            "invalid_arguments",
+            "msg_blocks_too_long",
+            "no_text",
             // 宛先・権限・流量
             "invalid_auth",
             "channel_not_found",
-            "not_in_channel",
-            "is_archived",
-            "missing_scope",
-            "restricted_action",
-            "team_access_not_granted",
             "ratelimited",
-            // payload の不正。同じものを送り直しても通らない
-            "invalid_arguments",
-            "invalid_blocks",
-            "msg_blocks_too_long",
-            "attachment_payload_limit_exceeded",
-            "too_many_attachments",
-            "no_text",
             // 知らないエラー。同じものを送って直る根拠が無い
             "some_error_slack_has_not_documented_yet",
         ] {
-            assert!(!is_transient(e), "{e} は再送すべきでない");
+            assert!(!is_retriable(e), "{e} は送り直すべきでない");
         }
     }
 
@@ -746,7 +739,7 @@ mod tests {
     /// 直るかもしれないエラーなら、同じ payload で再送すること。
     #[actix_web::test]
     async fn retryable_error_resends_the_same_payload() {
-        let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
+        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
 
         message(text("*body*"))
             .post_message_to(&base, "token", "channel", None)
