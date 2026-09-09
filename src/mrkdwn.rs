@@ -154,12 +154,68 @@ fn decode_numeric(text: &str) -> String {
 /// mrkdwn のリンク。
 ///
 /// ラベルが無いときは URL だけ出す。`<url|>` は空ラベルになって何も見えない。
+///
+/// 絶対 URL でない行き先はリンクにしない。`[Usage](#usage)` を
+/// `<#usage|Usage>` にすると、mrkdwn では **Slack のチャンネル参照**として
+/// 解釈されて、無いチャンネルへのリンクになる。相対パスも辿れない。
 fn link(url: &str, label: &str) -> String {
+    if !is_absolute(url) {
+        return label.to_string();
+    }
     if label.trim().is_empty() {
         format!("<{}>", escape_url(url))
     } else {
         format!("<{}|{}>", escape_url(url), label)
     }
+}
+
+/// Slack がリンクとして辿れる行き先か。
+fn is_absolute(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
+/// タグから属性値を取り出す。
+///
+/// 生 HTML の `<a href>` や `<img src>` の行き先を捨てないために使う。
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+
+    while let Some(i) = lower[from..].find(name) {
+        let at = from + i;
+        // 属性名の切れ目を確かめる (`href` が `data-href` に当たらないように)
+        let before_ok = at == 0
+            || lower.as_bytes()[at - 1].is_ascii_whitespace()
+            || lower.as_bytes()[at - 1] == b'"';
+        let rest = &tag[at + name.len()..];
+        let rest_trimmed = rest.trim_start();
+
+        if before_ok && rest_trimmed.starts_with('=') {
+            let value = rest_trimmed[1..].trim_start();
+            let quoted = value.strip_prefix('"').or_else(|| value.strip_prefix('\''));
+            return match quoted {
+                Some(v) => {
+                    let q = value.as_bytes()[0] as char;
+                    v.find(q).map(|e| v[..e].to_string())
+                }
+                // 引用符なしの値は空白まで
+                None => Some(
+                    value
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('/')
+                        .to_string(),
+                ),
+            };
+        }
+        from = at + name.len();
+    }
+
+    None
 }
 
 /// 変換したものを組み立てる。
@@ -175,6 +231,8 @@ struct Renderer {
     links: Vec<String>,
     /// 組み立て中の表
     table: Option<Table>,
+    /// 読んでいる途中の `<a href>` の行き先。
+    pending_href: Option<String>,
     /// HTML コメントの途中か。
     ///
     /// pulldown-cmark は HTML ブロックを行ごとに別のイベントで渡すので、
@@ -201,6 +259,7 @@ impl Renderer {
             lists: Vec::new(),
             links: Vec::new(),
             table: None,
+            pending_href: None,
             in_html_comment: false,
             at_item_start: false,
         }
@@ -295,10 +354,16 @@ impl Renderer {
                     break;
                 }
 
+                let tag = &html[i + 1..j];
+
                 // 区切りを意味するタグは、落とすと語がくっつく (`a<br>b` -> `ab`)
-                if let Some(sep) = tag_separator(&html[i + 1..j]) {
+                if let Some(sep) = tag_separator(tag) {
                     out.push(sep);
                 }
+
+                // タグを落とすと行き先まで消える。`<img>` は中に文字が無いので
+                // alt か src を出さないと本文が空になる。
+                out.push_str(&self.html_target(tag));
 
                 i = j + 1;
                 continue;
@@ -310,6 +375,38 @@ impl Renderer {
         }
 
         decode_refs(&out)
+    }
+
+    /// 生 HTML のタグから、落とすと消えてしまう情報を取り出す。
+    ///
+    /// `<a href>` はラベルがタグの外にあるので、閉じタグまで待って URL を
+    /// 添える。`<img>` は中に文字が無いので、alt か src をここで出す。
+    fn html_target(&mut self, tag: &str) -> String {
+        let name = tag
+            .trim_start_matches('/')
+            .split([' ', '\t', '\n', '/'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match name.as_str() {
+            "a" if !tag.starts_with('/') => {
+                self.pending_href = attr(tag, "href").filter(|u| is_absolute(u));
+                String::new()
+            }
+            "a" => match self.pending_href.take() {
+                Some(url) => format!(" ({})", escape_url(&url)),
+                None => String::new(),
+            },
+            "img" => {
+                let alt = attr(tag, "alt").unwrap_or_default();
+                if !alt.trim().is_empty() {
+                    return alt;
+                }
+                attr(tag, "src").unwrap_or_default()
+            }
+            _ => String::new(),
+        }
     }
 
     /// ブロックの始まり。段落の区切りを入れる。
@@ -824,6 +921,36 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// アンカーや相対パスをリンク記法にしないこと。
+    ///
+    /// `<#usage|Usage>` は mrkdwn では Slack のチャンネル参照になる。
+    #[test]
+    fn non_absolute_destinations_are_not_linked() {
+        assert_eq!(from_markdown("[Usage](#usage)"), "Usage");
+        assert_eq!(from_markdown("[doc](docs/README.md)"), "doc");
+        assert_eq!(
+            from_markdown("[mail](mailto:a@example.com)"),
+            "<mailto:a@example.com|mail>"
+        );
+    }
+
+    /// 生 HTML のリンクと画像の行き先を捨てないこと。
+    #[test]
+    fn raw_html_targets_are_kept() {
+        let a = from_markdown(r#"<a href="https://example.com">label</a>"#);
+        assert!(a.contains("label"), "{a:?}");
+        assert!(a.contains("https://example.com"), "{a:?}");
+
+        assert_eq!(
+            from_markdown(r#"<img src="https://example.com/x.png" alt="shot">"#),
+            "shot"
+        );
+        assert_eq!(
+            from_markdown(r#"<img src="https://example.com/x.png">"#),
+            "https://example.com/x.png"
+        );
     }
 
     /// 複数行の HTML コメントの中身を漏らさないこと。
