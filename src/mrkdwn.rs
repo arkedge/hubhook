@@ -113,19 +113,31 @@ fn opens_tag(next: Option<&u8>) -> bool {
     next.is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'))
 }
 
-/// タグを閉じる `>` の位置。
+/// 複数行に分かれたタグの、まだ閉じていない部分。
+///
+/// 読んだ位置と引用符の状態も持つ。継ぎ足すたびに頭から読み直すと、`<div` の
+/// 後に属性の行が延々と続く本文で長さの 2 乗の時間がかかる。本文は誰でも
+/// 書けるので、続きから読む。
+struct PendingTag {
+    text: String,
+    /// ここまでは読んだ
+    scanned: usize,
+    /// 読んでいる途中の引用符
+    quote: Option<u8>,
+}
+
+/// タグを閉じる `>` の位置。`from` から続きを読む。
 ///
 /// 引用符の中の `>` は属性値の一部なのでタグの終わりではない。閉じていなければ
 /// `None` で、その場合は次のイベントに続いている。
-fn scan_tag(s: &str) -> Option<usize> {
-    let mut quote: Option<u8> = None;
-
-    // `"` `'` `>` は ASCII なので UTF-8 の後続バイトと衝突しない
-    for (i, &c) in s.as_bytes().iter().enumerate().skip(1) {
-        match quote {
-            Some(q) if c == q => quote = None,
+fn scan_tag(s: &str, from: usize, quote: &mut Option<u8>) -> Option<usize> {
+    // 先頭の `<` は読まない。`"` `'` `>` は ASCII なので UTF-8 の後続バイトと
+    // 衝突しない
+    for (i, &c) in s.as_bytes().iter().enumerate().skip(from.max(1)) {
+        match *quote {
+            Some(q) if c == q => *quote = None,
             Some(_) => {}
-            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'"' || c == b'\'' => *quote = Some(c),
             None if c == b'>' => return Some(i),
             None => {}
         }
@@ -356,7 +368,7 @@ struct Renderer {
     /// 入れてしまい、`• ` と本文が離れてしまう。
     after_marker: bool,
     /// 複数行に分かれたタグの、まだ閉じていない部分
-    pending_tag: Option<String>,
+    pending_tag: Option<PendingTag>,
 }
 
 #[derive(Default)]
@@ -453,18 +465,20 @@ impl Renderer {
             }
 
             // タグが前のイベントで閉じていなかった場合、続きを足して閉じるまで待つ
-            if let Some(partial) = self.pending_tag.take() {
-                let combined = format!("{partial}{}", &html[i..]);
+            if let Some(mut pending) = self.pending_tag.take() {
+                let base = pending.text.len();
+                pending.text.push_str(&html[i..]);
 
-                let Some(end) = scan_tag(&combined) else {
-                    self.pending_tag = Some(combined);
+                let Some(end) = scan_tag(&pending.text, pending.scanned, &mut pending.quote) else {
+                    pending.scanned = pending.text.len();
+                    self.pending_tag = Some(pending);
                     return decode_refs(&out);
                 };
 
-                self.drop_tag(&combined[1..end], &mut out);
+                self.drop_tag(&pending.text[1..end], &mut out);
 
-                // partial に閉じる `>` は無かったので end は partial の外にある
-                i += end + 1 - partial.len();
+                // 前のイベントまでに閉じる `>` は無かったので end はその外にある
+                i += end + 1 - base;
                 continue;
             }
 
@@ -475,10 +489,17 @@ impl Renderer {
             }
 
             if bytes[i] == b'<' && opens_tag(bytes.get(i + 1)) {
-                let Some(end) = scan_tag(&html[i..]) else {
+                let rest = &html[i..];
+                let mut quote = None;
+
+                let Some(end) = scan_tag(rest, 1, &mut quote) else {
                     // 閉じていないので次のイベントに続く。属性が複数行に
                     // 分かれているだけなので、捨てずに持ち越す
-                    self.pending_tag = Some(html[i..].to_string());
+                    self.pending_tag = Some(PendingTag {
+                        text: rest.to_string(),
+                        scanned: rest.len(),
+                        quote,
+                    });
                     return decode_refs(&out);
                 };
 
@@ -1082,6 +1103,17 @@ mod tests {
             out.contains("https://example.com"),
             "リンク先が消えている: {out:?}"
         );
+    }
+
+    /// イベントを跨いだ引用符の中の `>` でタグを閉じないこと。
+    ///
+    /// 続きから読むので、引用符の途中で行が変わっても状態を引き継ぐ必要が
+    /// ある。閉じたと思うと属性値の残りが本文に出る。
+    #[test]
+    fn a_quote_spanning_events_keeps_its_state() {
+        let out = from_markdown("<div title=\"a\n b > c\">\nvisible\n</div>");
+
+        assert_eq!(out, "visible");
     }
 
     /// 複数行に分かれたタグの属性が本文に出ないこと。
