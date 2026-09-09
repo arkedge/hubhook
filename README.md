@@ -9,132 +9,28 @@ This project is inspired by [tokite](https://github.com/cookpad/tokite).
 
 ## Deploy
 
+The image is `ghcr.io/arkedge/hubhook`, tagged with `main` for the tip of the
+default branch, `sha-<short>` for every build, and the version plus `latest`
+for a release.
+
+|Environment variable|Description|
+|-|-|
+|`HUBHOOK_PORT`|port to listen on|
+|`SLACK_TOKEN`|Slack bot token|
+|`WEBHOOK_SECRET`|secret used to verify the webhook signature|
+|`SENTRY_DSN`|Sentry DSN|
+|`GITHUB_TOKEN`|used to expand team mentions (optional)|
+|`CONFIG_PATH`|where the config lives (optional, defaults to `/config/config.json`)|
+
+Everything but the last two is required. `docker-compose.yml` and
+`.env.example` are set up for running it locally.
+
 ## Configuration
 
-Edit config.json.
+Write rules in the config file (`CONFIG_PATH`). An event is posted to a rule's
+`channel` when **every** field of its `query` matches. If the rule has an
+`exclude_query`, the event is dropped when **any** of its fields matches.
 
-### Supported query
-
-|Name|Description|
-|-|-|
-|repo|repository name|
-|topic|repository topic|
-|user|event sender|
-|title|Issue title|
-|body|Issue / Issue Comment / review / review comment の本文|
-|label|Issue label|
-|assignee|Issue / PR の assignee の login|
-|reviewer|review を依頼された user の login、または team の slug|
-|review_state|`pull_request_review` の state (`approved` / `changes_requested` / `commented`)|
-
-### Message appearance
-
-本文は Slack の **markdown ブロック**として送る。attachment の `text` は
-mrkdwn (Slack 独自記法) なので、GitHub の本文をそのまま貼ると `##` が
-そのまま表示され、`*x*` の強調も入れ替わる (GitHub は斜体、Slack は太字)。
-markdown ブロックは本物の Markdown を解釈するので、見出し・表・タスクリスト・
-コードブロックまでそのまま渡せる。色バーを残すため attachment の中に置いている。
-
-GFM 固有の参照記法 (`#123` の issue リンク、`@user`、コミット SHA) は
-Markdown の仕様外なのでリンクにはならない。
-
-本文が無い場合はブロックを作らない。空の `text` を持つブロックは
-`invalid_blocks` で拒否され、通知そのものが飛ばなくなる。
-
-markdown ブロックには payload 全体で 12,000 文字の上限があるが、こちらでは
-切り詰めない。拒否された場合は attachment の `text` に切り替えて再送する
-(再送するのは blocks 由来と思われるエラーで、かつ payload が blocks を
-持つときのみ。認証やチャンネルの問題は blocks を外しても直らず、blocks が
-無ければ外しても payload が変わらないので、どちらも無駄打ちになる)。
-再送も含めて Slack への POST は 1 つの予算 (5 秒) に収める。取り直すと
-GitHub の webhook 配信タイムアウト (10 秒) を超え、GitHub が再送して通知が
-重複する。
-`text` は mrkdwn なので、ブロックの Markdown を流用せず構築時に別に作る
-(流用すると `**太字**` や `[name](url)` が解釈されない)
-(従来の表現なので、長い本文は Slack 側で畳まれる)。Slack は API エラーも
-HTTP 200 + `ok: false` で返すので、応答本文を見て判定している。
-
-リポジトリ名とアカウント名はリンクにする。リンクが unfurl されて縦に
-伸びないよう、post 時に `unfurl_links` / `unfurl_media` を切っている。
-Assignees は `Assignees: a, b, c` の 1 行にまとめる (1 人 1 行だと縦に
-伸びて本文が見えなくなる)。
-
-attachment の footer には**操作した人** (sender) の login とアイコンを出す。
-issue の作成者ではないので、コメントなら作者ではなくコメントした人になる。
-footer は mrkdwn が効かないのでリンクにはならない。
-
-### Notified events
-
-`X-GitHub-Event` のうち以下を扱う。
-GitHub App / Webhook 側でこれらのイベントを購読していないと通知は飛ばない。
-
-- `issues`
-- `issue_comment`
-- `pull_request`
-- `pull_request_review` (approve / changes requested / コメント付き review)
-- `pull_request_review_comment` (diff 上のコメントとその返信)
-
-### Team mention
-
-`body` に team メンション (`@org/team`) が書かれている場合、
-GitHub API で team のメンバーを引いて `@login` に展開する (#286)。
-`@Octocoders/octo-team` へのメンションで、`body` に `@sksat` を指定している
-個人のルールにもマッチするようになる。
-
-`body` クエリは次の 3 つに当てて、いずれかが一致すればマッチとする。
-
-1. **元の本文** — `@org/team$` のようなアンカー付きルールの意味を保つ
-   (連結したものだけに当てると末尾一致が効かなくなり、exclude_query では
-   除外されるべきものが除外されなくなる)
-2. **元の本文 + 展開結果** — 本文の文脈と組み合わせたパターン
-   (`レビュー.*@sksat` など) を拾うため、本文を含めて連結する
-3. **展開された `@login` を 1 つずつ** — まとめて 1 つの文字列に当てると、
-   `@sksat$` のようなアンカー付きルールが並び順に依存してしまうため
-
-既知の制限として、「本文の文脈 + member への末尾アンカー」
-(`レビュー.*@sksat$` など) は展開結果の並び順に依存する。
-本文を member ごとに連結して照合すれば解消するが、rule ごと × member ごとに
-本文長を走査することになり、rule が増えるほど webhook 1 通の処理が重くなる。
-
-`body` クエリを使う rule が 1 つも無い場合は、展開結果が使われないので
-GitHub API を叩かない。
-
-展開には `GITHUB_TOKEN` が必要 (org の team を読める権限)。
-未設定の場合は展開されず、team メンションは team メンションのままとして扱う。
-
-展開は **`GITHUB_TOKEN` の可視性**で行う。body を書いた人の権限は見ないので、
-GitHub 上ではメンションできない secret team でも、team 名を書けば展開される。
-通知先は Slack で、隠したい team もない前提なので、
-「通知が飛ばない」より「飛ぶ」side に倒している (意図した挙動)。
-
-同じ方針で、API の取得に失敗した場合も展開せずに処理を続ける
-(fail-open)。team メンション以外のルールの通知を止めないため。
-
-メンバーは 10 分キャッシュする。取得に失敗した場合は展開せずに処理を続け、
-log と Sentry に記録する (他のルールの通知は止めない)。
-
-webhook のレスポンスを遅らせないため、API 呼び出しには次の制限をかけている。
-
-- 1 リクエスト 3 秒でタイムアウト
-- 展開全体で 3 秒を超えたら打ち切る (team もページも直列に引くため、
-  ページを進める前にも残り時間を見る)
-- 1 つの body で展開する team は 8 件まで
-- 失敗した team は 60 秒間再取得しない
-- キャッシュは insert 時に期限切れを掃除し、最大 1024 team まで
-- 同じ team に同時にリクエストが来ても API 呼び出しは 1 本にまとめる
-  (キャッシュが空の瞬間は全員がミスするため、キャッシュだけでは防げない)
-
-メンバーが 2000 人を **超える** team はエラーとして扱い、展開しない。
-一部だけ返すと、載らなかった人に通知が飛ばないまま気付けないため。
-
-なお、この 3 秒は **展開フェーズだけの上限**で、webhook 全体の締め切りでは
-ない。展開のあとに channel ごとの Slack POST が直列で走る (それぞれ 5 秒で
-タイムアウト) ため、channel が複数あると合計は GitHub の配信タイムアウト
-(10 秒) を超えうる。超えると再送され、通知が重複する。
-端から端まで縛るには、1 つの締め切りを配信まで通すか、配信を webhook の
-応答から外す必要がある。
-
-### Example
 ```json
 {
   "rule": [
@@ -147,3 +43,59 @@ webhook のレスポンスを遅らせないため、API 呼び出しには次�
   ]
 }
 ```
+
+Values are case-insensitive regular expressions.
+
+|Name|Description|
+|-|-|
+|repo|repository name|
+|topic|repository topic|
+|user|event sender|
+|title|Issue title|
+|body|body of an Issue, Issue Comment, review or review comment|
+|label|Issue label|
+|assignee|login of an Issue / PR assignee|
+|reviewer|login of a requested reviewer, or the slug of a requested team|
+|review_state|`pull_request_review` state (`approved` / `changes_requested` / `commented`)|
+
+## Notified events
+
+These `X-GitHub-Event` values are handled. Nothing is notified unless the
+GitHub App / Webhook is subscribed to them.
+
+- `issues`
+- `issue_comment`
+- `pull_request`
+- `pull_request_review` (approve / changes requested / review with a comment)
+- `pull_request_review_comment` (comments on a diff and their replies)
+
+## Message appearance
+
+Bodies are sent as Slack markdown blocks, so headings, tables, task lists and
+code blocks render as written. GFM-specific references (`#123`, `@user`, commit
+SHAs) are outside the Markdown spec and are not linked.
+
+Repository and account names are links. Assignees are put on a single line as
+`Assignees: a, b, c`. The attachment footer shows the login and avatar of
+whoever did it (the sender).
+
+## Team mention
+
+When a body mentions `@org/team`, the team members are fetched from the GitHub
+API and expanded to `@login` before the `body` query is matched. A mention of
+`@Octocoders/octo-team` therefore also matches a personal rule whose `body` is
+`@sksat`.
+
+- Expansion needs `GITHUB_TOKEN`. Without it, nothing is expanded
+- Expansion uses **the visibility of `GITHUB_TOKEN`**, not the permissions of
+  whoever wrote the body. A secret team that cannot be mentioned on GitHub is
+  still expanded if its name is written
+- A failed API call does not stop the expansion phase, so rules other than team
+  mentions still notify
+- Members are cached for 10 minutes
+- Teams with more than 2000 members are not expanded, to avoid notifying only
+  some of them
+
+A rule that combines body context with an anchor on a member, such as
+`review.*@sksat$`, depends on the order of the expanded logins and may not
+match.
