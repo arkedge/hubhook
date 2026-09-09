@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Slack への POST 全体の予算。**再送する分も含める。**
 ///
@@ -250,6 +250,22 @@ impl MessagePayload {
         self
     }
 
+    /// 本文をどの表現で送ったか。ログに出して答え合わせに使う。
+    ///
+    /// attachment の中で markdown ブロックが使えるかはドキュメントに記載が無く、
+    /// こちらでは確かめられない。実際に通ったかはログでしか分からない。
+    fn body_kind(&self) -> &'static str {
+        let bodies = || self.attachments.iter().flatten().map(|a| &a.body);
+
+        if bodies().any(|b| matches!(b, Body::Blocks { .. })) {
+            "markdown blocks"
+        } else if bodies().any(|b| matches!(b, Body::Text { .. })) {
+            "attachment text"
+        } else {
+            "no body"
+        }
+    }
+
     /// markdown ブロックを含むか。
     ///
     /// 含まないなら退避しても payload は変わらない。再送しても同じエラーで
@@ -344,7 +360,10 @@ impl Message {
         };
 
         match post(&client, base, token, &payload, POST_BUDGET).await {
-            Ok(()) => return,
+            Ok(()) => {
+                debug!("POST ok ({})", payload.body_kind());
+                return;
+            }
             // リクエスト自体の失敗は payload を変えても直らない。
             // 再送すると待ち時間も倍になるので諦める。
             Err(PostError::Request(e)) => {
@@ -372,8 +391,10 @@ impl Message {
         };
 
         let fallback = payload.into_text_fallback();
-        if let Err(e) = post(&client, base, token, &fallback, left).await {
-            error!("POST (fallback): {e}");
+        match post(&client, base, token, &fallback, left).await {
+            // 退避が起きたこと自体が知りたい情報なので debug では埋もれる
+            Ok(()) => info!("POST ok (fallback: {})", fallback.body_kind()),
+            Err(e) => error!("POST (fallback): {e}"),
         }
     }
 }
@@ -418,8 +439,8 @@ mod tests {
     /// `chat.postMessage` を受けるテスト用サーバを立て、base URL と受け取った
     /// payload を返す。`replies` を順に返し、尽きたら成功を返す。
     ///
-    /// 再送は「1 回目の応答を読んで 2 回目を投げる」という手順そのものが本体な
-    /// ので、HTTP を実際に通さないと壊れても気付けない。
+    /// 再送は「1 回目の応答を読んで 2 回目を投げる」という手順そのものが
+    /// 本体なので、HTTP を実際に通さないと壊れても気付けない。
     fn spawn_slack(
         replies: Vec<serde_json::Value>,
     ) -> (
@@ -572,6 +593,27 @@ mod tests {
 
         assert!(a.get("text").is_none(), "text が入っている: {a}");
         assert!(a.get("blocks").is_none(), "blocks が入っている: {a}");
+    }
+
+    /// どの表現で送ったかを言えること。
+    ///
+    /// attachment 内で markdown ブロックが使えるかは検証できないので、
+    /// 実際に通ったかを知る手段はこのログだけになる。
+    #[test]
+    fn body_kind_names_the_representation() {
+        assert_eq!(
+            payload(blocks("## body", Some("body"))).body_kind(),
+            "markdown blocks"
+        );
+        assert_eq!(
+            payload(Body::new(vec![], Some("body".to_string()))).body_kind(),
+            "attachment text"
+        );
+        assert_eq!(payload(Body::new(vec![], None)).body_kind(), "no body");
+
+        // 退避すると表現が変わることも言えていること
+        let fallback = payload(blocks("## body", Some("body"))).into_text_fallback();
+        assert_eq!(fallback.body_kind(), "attachment text");
     }
 
     /// blocks 由来のエラーで、かつ blocks を持つときだけ再送すること。
