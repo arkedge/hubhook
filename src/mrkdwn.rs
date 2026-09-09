@@ -146,6 +146,31 @@ fn scan_tag(s: &str, from: usize, quote: &mut Option<u8>) -> Option<usize> {
     None
 }
 
+/// 数値参照の番号を文字にする。
+///
+/// HTML はそのまま Unicode の番号として読まない。0 と、文字にならない番号は
+/// U+FFFD。素直に読むと `&#0;` が NUL になって、Slack に送る本文に制御文字が
+/// 入る。
+///
+/// 0x80..=0x9F は Windows-1252 の記号に読み替える (`&#128;` は `€`)。
+/// <https://html.spec.whatwg.org/multipage/parsing.html#numeric-character-reference-end-state>
+fn from_code(code: u32) -> char {
+    const C1: [char; 32] = [
+        '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}',
+        '\u{8f}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}',
+        '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}',
+        '\u{178}',
+    ];
+
+    match code {
+        0 => '\u{fffd}',
+        0x80..=0x9f => C1[(code - 0x80) as usize],
+        // 単独のサロゲートや範囲外は char にならない
+        _ => char::from_u32(code).unwrap_or('\u{fffd}'),
+    }
+}
+
 /// HTML の文字参照を戻す。
 ///
 /// タグを外しただけの文字列には `&amp;` などが残っている。そのまま Slack 用に
@@ -195,7 +220,7 @@ fn decode_refs(text: &str) -> String {
                 return None;
             }
             let code = u32::from_str_radix(&digits[..end], radix).ok()?;
-            Some((char::from_u32(code)?, &digits[end + 1..]))
+            Some((from_code(code), &digits[end + 1..]))
         });
 
         if let Some((c, tail)) = numeric {
@@ -1212,6 +1237,20 @@ mod tests {
         let out = from_markdown("``` ``` ```\n\nafter");
 
         assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
+    }
+
+    /// 数値参照を HTML の規則で戻すこと。
+    ///
+    /// そのまま Unicode の番号として読むと、`&#0;` が NUL になって Slack に
+    /// 送る本文に制御文字が入る。`&#128;` は Windows-1252 の `€`。
+    ///
+    /// `div` は HTML ブロックなので中身は markdown として解釈されず、
+    /// こちらで戻すことになる。
+    #[test]
+    fn numeric_references_follow_the_html_rules() {
+        assert_eq!(from_markdown("<div>&#0;x</div>"), "\u{fffd}x");
+        assert_eq!(from_markdown("<div>&#128;</div>"), "€");
+        assert_eq!(from_markdown("<div>&#xD800;</div>"), "\u{fffd}");
     }
 
     /// 文字参照を 1 段だけ戻すこと。
