@@ -607,7 +607,11 @@ impl Renderer {
 
         match name.as_str() {
             "a" if !tag.starts_with('/') => {
-                self.pending_href = attr(tag, "href").filter(|u| is_absolute(u));
+                // scheme の判定は参照を戻した方で行う。`&#104;ttps://…` は
+                // HTML では https なので、生のままだと相対 URL とみなして
+                // リンク先を落としてしまう。出す値は生のままにして、戻すのは
+                // html_text の最後の 1 回に任せる
+                self.pending_href = attr(tag, "href").filter(|u| is_absolute(&decode_refs(u)));
                 String::new()
             }
             // 属性値は HTML のまま返す。文字参照を戻すのは html_text の最後の
@@ -1365,6 +1369,20 @@ mod tests {
         assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
         assert!(out.contains("inner"), "中身が消えている: {out:?}");
         assert_eq!(out.matches("```").count(), 2, "フェンスの数が違う: {out:?}");
+    }
+
+    /// 参照で書かれた scheme のリンク先を落とさないこと。
+    ///
+    /// `&#104;ttps://…` は HTML では https。生のまま判定すると相対 URL と
+    /// みなしてリンク先が消える。判定を戻した方で行っても、`javascript:` の
+    /// ような scheme は絶対 URL ではないので通らない。
+    #[test]
+    fn an_encoded_scheme_keeps_its_destination() {
+        let out = from_markdown(r#"<a href="&#104;ttps://example.com">label</a>"#);
+        assert_eq!(out, "label (https://example.com)");
+
+        let js = from_markdown(r#"<a href="&#106;avascript:alert(1)">label</a>"#);
+        assert_eq!(js, "label", "scheme を通してしまった: {js:?}");
     }
 
     /// 別の属性値の中に属性の形があっても行き先にしないこと。
