@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use tracing::{debug, error, info, warn};
 
+/// 1 つの通知で Slack に投げる最大回数。
+///
+/// 「断られたので送り直したらブロックを拒否された」のように手が続くことが
+/// あるので 1 回では足りない。一方で無制限にすると、応答が速い相手に対して
+/// 予算を使い切るまで投げ続けてしまう。
+const MAX_ATTEMPTS: usize = 3;
+
 /// Slack への POST 全体の予算。**再送する分も含める。**
 ///
 /// GitHub の webhook 配信タイムアウト (10 秒) を超えると GitHub が再送し、
@@ -138,16 +145,6 @@ fn is_retriable(error: &str) -> bool {
 /// ブロックを使わなくなればこの判断自体が要らなくなる。
 fn should_fall_back(payload: &MessagePayload, error: &str) -> bool {
     payload.has_blocks() && !is_hopeless(error)
-}
-
-/// 1 通目が失敗したときに次に何を送るか。
-///
-/// 同じものを送る (リトライ) のと、表現を落として送る (退避) を混ぜると、
-/// 処理前に断られただけの場合まで表現が落ちる。
-#[derive(Clone, Copy)]
-enum Next {
-    Retry,
-    FallBack,
 }
 
 /// `chat.postMessage` の応答。
@@ -514,67 +511,65 @@ impl Message {
             unfurl_media: false,
         };
 
-        let next = match post(&client, base, token, &payload, POST_BUDGET).await {
-            Ok(()) => {
-                // どの表現で通ったかは、表現を変えたときの答え合わせに要る。
-                info!(channel, body = payload.body_kind(), "POST ok");
+        // 1 通目が失敗したときの手は 2 つある。
+        //
+        // - リトライ: 同じものを送る。処理前に断られただけのとき
+        // - 退避: ブロックを外して送る。ブロックが拒否されたとき
+        //
+        // 2 段の決め打ちにすると「断られた後に送り直したらブロックを拒否
+        // された」のような組み合わせを取りこぼす。手を打てる限り繰り返す。
+        //
+        // 打ち切りは予算と回数の両方で行う。予算だけだと、応答が速い相手に
+        // 対して無駄に何度も投げることになる。
+        let mut payload = payload;
+        let mut degraded = false;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let Some(left) = remaining(deadline, Instant::now()) else {
+                error!(channel, "POST gave up: out of budget");
                 return;
-            }
-            // リクエスト自体の失敗は payload を変えても直らない。
-            // 再送すると待ち時間も倍になるので諦める。
-            Err(PostError::Request(e)) => {
-                error!(channel, error = %e, "POST failed");
-                return;
-            }
-            Err(PostError::Api(e)) => {
-                // 処理前に断られたなら、表現を落とす理由が無いので同じものを
-                // 送る。先に退避を判定すると、この場合まで表現が落ちる。
-                if is_retriable(&e) {
-                    warn!(channel, error = %e, "POST failed; retrying");
-                    Next::Retry
-                } else if should_fall_back(&payload, &e) {
-                    // markdown ブロックが attachment 内で使えるか、本文が上限を
-                    // 超えたかはこちらで判定できない。拒否されたら、従来の
-                    // 表現 (attachment の text) に落として送る。
-                    warn!(channel, error = %e, "POST rejected; falling back");
-                    Next::FallBack
-                } else {
-                    // 諦めるが無音にはしない。channel と link が残っていれば
-                    // 落ちた通知を後から追える。
+            };
+
+            match post(&client, base, token, &payload, left).await {
+                Ok(()) => {
+                    if degraded {
+                        // 届いてはいるが本来の表現が拒否された degraded success
+                        warn!(channel, body = payload.body_kind(), "POST ok (fallback)");
+                    } else {
+                        // どの表現で通ったかは、表現を変えたときの答え合わせに要る
+                        info!(channel, body = payload.body_kind(), "POST ok");
+                    }
+                    return;
+                }
+                // リクエスト自体の失敗は payload を変えても直らない。
+                // 送り直すと待ち時間も倍になるので諦める。
+                Err(PostError::Request(e)) => {
                     error!(channel, error = %e, "POST failed");
                     return;
                 }
-            }
-        };
-
-        // 2 通目も予算の中で送る。取り直すと webhook の締め切りを超えて
-        // GitHub が再送し、通知が重複する
-        let Some(left) = remaining(deadline, Instant::now()) else {
-            error!(channel, "POST retry skipped: out of budget");
-            return;
-        };
-
-        let second = match next {
-            Next::Retry => payload,
-            Next::FallBack => payload.into_text_fallback(),
-        };
-
-        // 2 通目が何だったのかを取り違えると、ブロックが拒否されたのかどうかが
-        // 分からなくなる。リトライと退避でメッセージを分ける。
-        match post(&client, base, token, &second, left).await {
-            Ok(()) => match next {
-                // 同じものを送り直して通っただけなので、表現は落ちていない
-                Next::Retry => info!(channel, body = second.body_kind(), "POST ok (retry)"),
-                // 届いてはいるが本来の表現が拒否された、という degraded success
-                Next::FallBack => {
-                    warn!(channel, body = second.body_kind(), "POST ok (fallback)")
+                Err(PostError::Api(e)) => {
+                    // 処理前に断られたなら、表現を落とす理由が無いので同じものを
+                    // 送る。先に退避を判定すると、この場合まで表現が落ちる。
+                    if is_retriable(&e) {
+                        warn!(channel, error = %e, "POST failed; retrying");
+                    } else if should_fall_back(&payload, &e) {
+                        // markdown ブロックが attachment 内で使えるか、本文が
+                        // 上限を超えたかはこちらで判定できない。拒否されたら
+                        // 従来の表現 (attachment の text) に落として送る。
+                        warn!(channel, error = %e, "POST rejected; falling back");
+                        payload = payload.into_text_fallback();
+                        degraded = true;
+                    } else {
+                        // 諦めるが無音にはしない。channel と link が残っていれば
+                        // 落ちた通知を後から追える。
+                        error!(channel, error = %e, "POST failed");
+                        return;
+                    }
                 }
-            },
-            Err(e) => match next {
-                Next::Retry => error!(channel, error = %e, "POST failed (retry)"),
-                Next::FallBack => error!(channel, error = %e, "POST failed (fallback)"),
-            },
+            }
         }
+
+        error!(channel, "POST gave up: too many attempts");
     }
 }
 
@@ -1089,6 +1084,50 @@ mod tests {
         let got = got.lock().unwrap();
         assert_eq!(got.len(), 2, "送り直していない");
         assert_eq!(got[0], got[1], "表現が落ちている");
+    }
+
+    /// 断られた後に送り直してブロックを拒否されたら、退避まで進むこと。
+    ///
+    /// 1 通目で手を 1 つ選んで終わりにすると、この組み合わせで通知が消える。
+    #[actix_web::test]
+    async fn a_rejection_after_a_retry_still_falls_back() {
+        let (base, got, _ctypes) = spawn_slack(vec![
+            serde_json::json!({ "ok": false, "error": "service_unavailable" }),
+            serde_json::json!({ "ok": false, "error": "internal_error" }),
+        ]);
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 3, "退避まで進んでいない");
+
+        let a = &got[2]["attachments"][0];
+        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
+    /// 断られ続けても投げ続けないこと。
+    #[actix_web::test]
+    async fn repeated_rejections_stop_at_the_attempt_limit() {
+        let refused = serde_json::json!({ "ok": false, "error": "service_unavailable" });
+        let (base, got, _ctypes) = spawn_slack(vec![
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused,
+        ]);
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        assert_eq!(
+            got.lock().unwrap().len(),
+            MAX_ATTEMPTS,
+            "上限を超えて投げている"
+        );
     }
 
     /// blocks 由来でないエラーでは再送しないこと。
