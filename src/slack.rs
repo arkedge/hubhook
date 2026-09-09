@@ -54,19 +54,46 @@ impl std::fmt::Display for PostError {
 fn is_hopeless(error: &str) -> bool {
     matches!(
         error,
+        // token
         "invalid_auth"
             | "not_authed"
             | "account_inactive"
             | "token_revoked"
             | "token_expired"
-            | "missing_scope"
+            | "not_allowed_token_type"
+            | "two_factor_setup_required"
+            // 権限・アクセス
+            | "access_denied"
             | "no_permission"
+            | "missing_scope"
+            | "app_access_restricted"
+            | "enterprise_is_restricted"
+            | "ekm_access_denied"
+            | "team_access_not_granted"
+            | "org_login_required"
+            | "send_on_behalf_not_allowed"
+            | "messages_tab_disabled"
+            // 宛先
             | "channel_not_found"
             | "not_in_channel"
             | "is_archived"
+            | "team_not_found"
+            | "team_added_to_org"
+            | "restricted_action"
+            | "restricted_action_read_only_channel"
+            | "restricted_action_thread_only_channel"
+            | "restricted_action_non_threadable_channel"
+            | "restricted_action_thread_locked"
+            // 流量
             | "ratelimited"
             | "rate_limited"
-            | "org_login_required"
+            | "accesslimited"
+            | "message_limit_exceeded"
+            // 呼び出し方
+            | "deprecated_endpoint"
+            | "method_deprecated"
+            // attachment の数は退避しても変わらない
+            | "too_many_attachments"
     )
 }
 
@@ -654,11 +681,17 @@ mod tests {
     fn hopeless_errors_are_not_retried() {
         for e in [
             "invalid_auth",
+            "token_expired",
             "channel_not_found",
             "not_in_channel",
             "is_archived",
             "missing_scope",
+            "restricted_action",
+            "restricted_action_read_only_channel",
+            "team_access_not_granted",
+            "ekm_access_denied",
             "ratelimited",
+            "too_many_attachments",
         ] {
             assert!(is_hopeless(e), "{e} は再送すべきでない");
         }
@@ -677,7 +710,11 @@ mod tests {
             "msg_blocks_too_long",
             "invalid_arguments",
             "internal_error",
+            "fatal_error",
+            "request_timeout",
+            "service_unavailable",
             "attachment_payload_limit_exceeded",
+            "markdown_text_conflict",
             "some_error_slack_has_not_documented_yet",
         ] {
             assert!(!is_hopeless(e), "{e} は再送すべき");
