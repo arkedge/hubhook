@@ -391,8 +391,26 @@ impl Renderer {
         }
     }
 
+    /// 書き込み先に足す。
+    ///
+    /// 継ぎ目で ``` ができないようにする。無効化は 1 つの文字列の中しか見ない
+    /// ので、前が `` ` `` で終わって次が `` ` `` で始まると、どちらも 3 本未満
+    /// でも繋がって Slack のフェンスになる。イベントが分かれるだけで起きる
+    /// (`` \` `` と HTML コメントと `` \`\` `` など)。
+    ///
+    /// 幅ゼロの文字を挟む。こちらが組み立てるコード span やコードブロックの
+    /// `` ` `` も対象にするが、挟まるのは前の文字列との間なので、区切りとしては
+    /// そのまま残る。
     fn push(&mut self, s: &str) {
-        self.bufs.last_mut().expect("書き込み先が無い").push_str(s);
+        let buf = self.bufs.last_mut().expect("書き込み先が無い");
+
+        let tail = buf.chars().rev().take_while(|c| *c == '`').count();
+        let head = s.chars().take_while(|c| *c == '`').count();
+        if tail > 0 && head > 0 && tail + head >= 3 {
+            buf.push('\u{200b}');
+        }
+
+        buf.push_str(s);
     }
 
     fn open(&mut self) {
@@ -1159,6 +1177,22 @@ mod tests {
         let out = from_markdown("本文[^1]\n\n[^1]: **定義**");
 
         assert_eq!(out, "本文[^1]\n\n[^1]: *定義*");
+    }
+
+    /// イベントを跨いで ``` ができないこと。
+    ///
+    /// 無効化は 1 つの文字列の中しか見ないので、`` ` `` が別のイベントに
+    /// 分かれていると、繋がってから Slack のフェンスになる。開いたままの
+    /// フェンスは以降の本文と Assignees まで飲み込む。
+    #[test]
+    fn fences_assembled_across_events_are_neutralized() {
+        // escape した `` ` `` が HTML コメントで分かれる
+        let split = from_markdown("\\`<!-- c -->\\`\\`");
+        assert!(!split.contains("```"), "フェンスができている: {split:?}");
+
+        // 数値参照はイベントごとに `` ` `` になる
+        let refs = from_markdown("&#96;&#96;&#96;");
+        assert!(!refs.contains("```"), "フェンスができている: {refs:?}");
     }
 
     /// 散文に書かれた ``` でもフェンスを開かせないこと。
