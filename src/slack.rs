@@ -142,8 +142,25 @@ pub struct Attachment {
     pub title_link: Option<url::Url>,
     pub fallback: String,
     pub color: Option<Color>,
+    /// 誰の操作かを小さく出す
+    #[serde(flatten)]
+    pub footer: Option<Footer>,
     #[serde(flatten)]
     pub body: Body,
+}
+
+/// attachment の footer。
+///
+/// mrkdwn は効かないので素のテキスト (`mrkdwn_in` に footer は入れられない)。
+/// 300 文字までで、狭い画面ではさらに切られる。
+/// `footer_icon` は footer があるときだけ効き、16x16 で描画される。
+///
+/// <https://docs.slack.dev/legacy/legacy-messaging/legacy-secondary-message-attachments>
+#[derive(Debug, Serialize)]
+pub struct Footer {
+    pub footer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_icon: Option<url::Url>,
 }
 
 /// attachment の本文。
@@ -424,8 +441,16 @@ mod tests {
             title_link: None,
             fallback: "fallback".to_string(),
             color: None,
+            footer: None,
             body,
         }
+    }
+
+    fn payload_with_footer(body: Body, footer: Option<Footer>) -> MessagePayload {
+        let mut p = payload(body);
+        p.attachments.as_mut().unwrap()[0].footer = footer;
+
+        p
     }
 
     fn payload(body: Body) -> MessagePayload {
@@ -625,6 +650,38 @@ mod tests {
         // 退避すると表現が変わることも言えていること
         let fallback = payload(blocks("## body", Some("body"))).into_text_fallback();
         assert_eq!(fallback.body_kind(), "attachment text");
+    }
+
+    /// footer が `footer` / `footer_icon` として出ること。
+    ///
+    /// `Option` を flatten しているので、直列化の形を確かめておく。
+    #[test]
+    fn footer_is_flattened() {
+        let footer = Footer {
+            footer: "sksat".to_string(),
+            footer_icon: Some("https://example.com/avatar.png".parse().unwrap()),
+        };
+
+        let json = serde_json::to_value(payload_with_footer(blocks("## body", None), Some(footer)))
+            .expect("直列化に失敗");
+        let a = &json["attachments"][0];
+
+        assert_eq!(a["footer"], "sksat", "{a}");
+        assert_eq!(a["footer_icon"], "https://example.com/avatar.png", "{a}");
+    }
+
+    /// footer が無いときは何も出ないこと。
+    #[test]
+    fn no_footer_sends_nothing() {
+        let json = serde_json::to_value(payload_with_footer(blocks("## body", None), None))
+            .expect("直列化に失敗");
+        let a = &json["attachments"][0];
+
+        assert!(a.get("footer").is_none(), "footer が入っている: {a}");
+        assert!(
+            a.get("footer_icon").is_none(),
+            "footer_icon が入っている: {a}"
+        );
     }
 
     /// blocks 由来のエラーで、かつ blocks を持つときだけ再送すること。

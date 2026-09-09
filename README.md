@@ -59,6 +59,10 @@ HTTP 200 + `ok: false` で返すので、応答本文を見て判定している
 Assignees は `Assignees: a, b, c` の 1 行にまとめる (1 人 1 行だと縦に
 伸びて本文が見えなくなる)。
 
+attachment の footer には**操作した人** (sender) の login とアイコンを出す。
+issue の作成者ではないので、コメントなら作者ではなくコメントした人になる。
+footer は mrkdwn が効かないのでリンクにはならない。
+
 ### Notified events
 
 `X-GitHub-Event` のうち以下を扱う。
