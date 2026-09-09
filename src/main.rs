@@ -320,8 +320,13 @@ async fn webhook(
                 msg
             }
         };
-        msg.post_message(&opt.slack_token, &channel, Some(&m.display_name))
-            .await;
+        msg.post_message(
+            &opt.slack_token,
+            &channel,
+            Some(&m.display_name),
+            payload.url().as_str(),
+        )
+        .await;
     }
 
     Ok(HttpResponse::Ok().body("webhook"))
@@ -491,8 +496,13 @@ impl Rule {
 #[allow(dead_code)]
 async fn post_test(opt: &Opt, payload: &github::Payload) {
     let msg: slack::Message = payload.try_into().unwrap();
-    msg.post_message(&opt.slack_token, "tmp_hubhook", None)
-        .await;
+    msg.post_message(
+        &opt.slack_token,
+        "tmp_hubhook",
+        None,
+        payload.url().as_str(),
+    )
+    .await;
 }
 
 /// webhook の署名 (`X-Hub-Signature-256`) を検証する。

@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use tracing::{debug, error, info, warn};
 
+/// 同じ payload を送り直す回数の上限。
+///
+/// 予算だけで打ち切ると、応答が速い相手に対して使い切るまで投げ続けてしまう。
+///
+/// 退避 (payload を変える) はこの上限に数えない。退避すると blocks が消えて
+/// 2 度目は成立しないので高々 1 回で、作った退避先を送らずに終わるのを
+/// 避けたい。
+const MAX_RETRIES: usize = 2;
+
 /// Slack への POST 全体の予算。**再送する分も含める。**
 ///
 /// GitHub の webhook 配信タイムアウト (10 秒) を超えると GitHub が再送し、
@@ -45,37 +54,99 @@ impl std::fmt::Display for PostError {
     }
 }
 
-/// blocks が原因と考えられるエラーか。
+/// 退避しても直らないと分かっているエラー。
 ///
-/// コードは `chat.postMessage` の Errors に載っているものだけを書く
-/// (<https://docs.slack.dev/reference/methods/chat.postMessage>)。
-/// それらしい名前でも実在しないコードを書くと、その分岐は永久に通らない。
-/// `invalid_attachments` は無く、長さの上限は `msg_too_long` ではなく
-/// `msg_blocks_too_long`。
+/// 認証・チャンネル・権限・レート制限は payload の形と無関係なので、中身を
+/// 変えて送り直しても同じ結果になる。
 ///
-/// `invalid_auth` や `channel_not_found` は blocks を外しても直らないので、
-/// 再送しても 2 回目が無駄に失敗し、レート制限を悪化させるだけ。
-/// ここに無いエラーが blocks 由来だった場合はログに残るので、後から足せる。
-///
-/// `invalid_arguments` は blocks 以外が原因でも返る汎用のエラーだが、あえて
-/// 含めている。attachment の中で markdown ブロックが使えるかはドキュメントに
-/// 記載が無く、拒否されるとしてどのエラーで返るかも分からない。外して汎用の
-/// エラーで返っていた場合、本文のある通知が全部無言で落ちる。含めた場合の
-/// 損は API 1 回分で、しかも [`POST_BUDGET`] の中に収まる。
-fn is_blocks_problem(error: &str) -> bool {
+/// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
+fn is_hopeless(error: &str) -> bool {
     matches!(
         error,
-        "invalid_blocks" | "invalid_blocks_format" | "msg_blocks_too_long" | "invalid_arguments"
+        // token
+        "invalid_auth"
+            | "not_authed"
+            | "account_inactive"
+            | "token_revoked"
+            | "token_expired"
+            | "not_allowed_token_type"
+            | "two_factor_setup_required"
+            // 権限・アクセス
+            | "access_denied"
+            | "no_permission"
+            | "missing_scope"
+            | "app_access_restricted"
+            | "enterprise_is_restricted"
+            | "ekm_access_denied"
+            | "team_access_not_granted"
+            | "org_login_required"
+            | "send_on_behalf_not_allowed"
+            | "messages_tab_disabled"
+            // 宛先
+            | "channel_not_found"
+            | "not_in_channel"
+            | "is_archived"
+            | "team_not_found"
+            | "team_added_to_org"
+            | "restricted_action"
+            | "restricted_action_read_only_channel"
+            | "restricted_action_thread_only_channel"
+            | "restricted_action_non_threadable_channel"
+            | "restricted_action_thread_locked"
+            // 流量
+            | "ratelimited"
+            | "rate_limited"
+            | "accesslimited"
+            | "message_limit_exceeded"
+            // 呼び出し方
+            | "deprecated_endpoint"
+            | "method_deprecated"
+            // attachment の数は退避しても変わらない
+            | "too_many_attachments"
     )
 }
 
-/// 退避して再送すべきか。
+/// 同じ payload を送り直してよいエラー。
 ///
-/// blocks を外して直るのは blocks 由来のエラーだけで、しかも payload に
-/// blocks が無ければ外しても何も変わらない。どちらも満たさない再送は
-/// 2 回目も同じ結果になり、時間とレート制限を捨てるだけになる。
-fn should_retry(payload: &MessagePayload, error: &str) -> bool {
-    is_blocks_problem(error) && payload.has_blocks()
+/// `chat.postMessage` に冪等キーは無いので、既に投稿されている可能性がある
+/// なら送り直せない。`internal_error` と `fatal_error` はドキュメントに
+/// "It's possible some aspect of the operation succeeded before the error was
+/// raised." と書かれているので除く。送り直すと通知が重複する。
+///
+/// `request_timeout` は名前に反して "the POST data was either missing or
+/// truncated" で、送った内容の不備なので送り直しても直らない。
+///
+/// 残るのは `service_unavailable` ("The service is temporarily unavailable")
+/// だけ。処理に入る前に断られているので、同じものを送ってよい。
+///
+/// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
+fn is_retriable(error: &str) -> bool {
+    matches!(error, "service_unavailable")
+}
+
+/// 退避すべきか。ブロックを外した別の payload を送る。
+///
+/// 拒否されたときは投稿されていないので、別のものを送っても重複しない。
+/// blocks を持たない payload は外しても変わらないので送らない。
+///
+/// どのエラーで拒否されるかはドキュメントに書かれていないので、[`is_hopeless`]
+/// に無いものは退避してみる。漏れたときの損は API 1 回分で、[`POST_BUDGET`]
+/// の中に収まる。
+///
+/// `internal_error` と `fatal_error` は "It's possible some aspect of the
+/// operation succeeded before the error was raised." とされているので、
+/// 厳密には投稿済みかどうか分からない。それでも退避する。
+///
+/// - attachment の中の markdown ブロックは、最小の payload でも
+///   `internal_error` で拒否される (実測)
+/// - その状態では本文のある通知が 1 通も届かなかった。部分成功していたなら
+///   届いていたはずなので、この payload の形では拒否を意味する
+/// - 外すと本文のある通知が全部落ちる。理論上の重複より、確実な取りこぼしの
+///   方が損が大きい
+///
+/// ブロックを使わなくなればこの判断自体が要らなくなる。
+fn should_fall_back(payload: &MessagePayload, error: &str) -> bool {
+    payload.has_blocks() && !is_hopeless(error)
 }
 
 /// `chat.postMessage` の応答。
@@ -416,12 +487,26 @@ impl Message {
         }
     }
 
-    pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
-        self.post_message_to(API_BASE, token, channel, username)
+    /// `link` は元になった GitHub の item。落ちた通知を後から辿るのに要る。
+    pub async fn post_message(
+        self,
+        token: &str,
+        channel: &str,
+        username: Option<&str>,
+        link: &str,
+    ) {
+        self.post_message_to(API_BASE, token, channel, username, link)
             .await
     }
 
-    async fn post_message_to(self, base: &str, token: &str, channel: &str, username: Option<&str>) {
+    async fn post_message_to(
+        self,
+        base: &str,
+        token: &str,
+        channel: &str,
+        username: Option<&str>,
+        link: &str,
+    ) {
         // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
         // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
         // リクエストごとに残り時間を渡すが、渡し忘れの上限としても入れておく。
@@ -442,43 +527,72 @@ impl Message {
             unfurl_media: false,
         };
 
-        match post(&client, base, token, &payload, POST_BUDGET).await {
-            Ok(()) => {
-                // どの表現で通ったかは、表現を変えたときの答え合わせに要る。
-                info!(channel, body = payload.body_kind(), "POST ok");
+        // 1 通目が失敗したときの手は 2 つある。
+        //
+        // - リトライ: 同じものを送る。処理前に断られただけのとき
+        // - 退避: ブロックを外して送る。ブロックが拒否されたとき
+        //
+        // 手を 1 つ選んで終わりにすると「断られた後に送り直したらブロックを
+        // 拒否された」のような組み合わせを取りこぼす。手がある限り続ける。
+        //
+        // 終わるのは、通ったとき / 打つ手が無いとき / 予算が尽きたとき /
+        // 同じものを送り直しすぎたとき。退避は blocks を消すので高々 1 回しか
+        // 成立せず、ループは必ず止まる。
+        let mut payload = payload;
+        let mut degraded = false;
+        let mut retries = 0;
+
+        loop {
+            let Some(left) = remaining(deadline, Instant::now()) else {
+                error!(channel, link, "POST gave up: out of budget");
                 return;
-            }
-            // リクエスト自体の失敗は payload を変えても直らない。
-            // 再送すると待ち時間も倍になるので諦める。
-            Err(PostError::Request(e)) => {
-                error!(channel, error = %e, "POST failed");
-                return;
-            }
-            Err(PostError::Api(e)) => {
-                if !should_retry(&payload, &e) {
-                    error!(channel, error = %e, "POST failed");
+            };
+
+            match post(&client, base, token, &payload, left).await {
+                Ok(()) => {
+                    if degraded {
+                        // 届いてはいるが本来の表現が拒否された degraded success
+                        warn!(channel, body = payload.body_kind(), "POST ok (fallback)");
+                    } else {
+                        // どの表現で通ったかは、表現を変えたときの答え合わせに要る
+                        info!(channel, body = payload.body_kind(), "POST ok");
+                    }
                     return;
                 }
-
-                // markdown ブロックが attachment 内で使えるか、本文が上限を
-                // 超えたかはこちらで判定できない。blocks 由来と思われる
-                // エラーなら、従来の表現 (attachment の text) で再送する。
-                warn!(channel, error = %e, "POST rejected; retrying without markdown blocks");
+                // リクエスト自体の失敗は payload を変えても直らない。
+                // 送り直すと待ち時間も倍になるので諦める。
+                Err(PostError::Request(e)) => {
+                    error!(channel, link, error = %e, "POST failed");
+                    return;
+                }
+                Err(PostError::Api(e)) => {
+                    // 処理前に断られたなら、表現を落とす理由が無いので同じものを
+                    // 送る。先に退避を判定すると、この場合まで表現が落ちる。
+                    if is_retriable(&e) {
+                        if retries >= MAX_RETRIES {
+                            error!(channel, link, error = %e, "POST gave up: too many retries");
+                            return;
+                        }
+                        retries += 1;
+                        warn!(channel, error = %e, "POST failed; retrying");
+                    } else if should_fall_back(&payload, &e) {
+                        // markdown ブロックが attachment 内で使えるか、本文が
+                        // 上限を超えたかはこちらで判定できない。拒否されたら
+                        // 従来の表現 (attachment の text) に落として送る。
+                        warn!(channel, error = %e, "POST rejected; falling back");
+                        payload = payload.into_text_fallback();
+                        degraded = true;
+                        // 上限は payload ごとに数える。別のものを送るので、
+                        // ブロックで使った分を引き継がない
+                        retries = 0;
+                    } else {
+                        // 諦めるが無音にはしない。channel と link が残っていれば
+                        // 落ちた通知を後から追える。
+                        error!(channel, link, error = %e, "POST failed");
+                        return;
+                    }
+                }
             }
-        }
-
-        // 再送も予算の中で行う。取り直すと webhook の締め切りを超えて
-        // GitHub が再送し、通知が重複する
-        let Some(left) = remaining(deadline, Instant::now()) else {
-            error!(channel, "POST fallback skipped: out of budget");
-            return;
-        };
-
-        let fallback = payload.into_text_fallback();
-        match post(&client, base, token, &fallback, left).await {
-            // 届いてはいるが本来の表現が拒否された、という degraded success。
-            Ok(()) => warn!(channel, body = fallback.body_kind(), "POST ok (fallback)"),
-            Err(e) => error!(channel, error = %e, "POST failed (fallback)"),
         }
     }
 }
@@ -635,28 +749,51 @@ mod tests {
         assert!(Block::markdown("   \n  ").is_none());
     }
 
-    /// blocks 由来のエラーだけ再送すること。
+    /// 直らないと分かっているエラーだけ再送しないこと。
     ///
-    /// 認証やチャンネルの問題は blocks を外しても直らないので、
-    /// 再送しても無駄打ちになりレート制限を悪化させる。
+    /// 認証やチャンネルの問題は blocks を外しても直らないので、再送しても
+    /// 無駄打ちになりレート制限を悪化させる。
     #[test]
-    fn only_block_errors_are_retried() {
+    fn hopeless_errors_are_not_retried() {
+        for e in [
+            "invalid_auth",
+            "token_expired",
+            "channel_not_found",
+            "not_in_channel",
+            "is_archived",
+            "missing_scope",
+            "restricted_action",
+            "restricted_action_read_only_channel",
+            "team_access_not_granted",
+            "ekm_access_denied",
+            "ratelimited",
+            "too_many_attachments",
+        ] {
+            assert!(is_hopeless(e), "{e} は再送すべきでない");
+        }
+    }
+
+    /// 列挙に無いエラーは再送すること。
+    ///
+    /// blocks が拒否されたときに返るエラーは分からないので、直らないと
+    /// 分かっているものだけを除いて退避する。`internal_error` は
+    /// ドキュメントで transient とされている。
+    #[test]
+    fn unknown_and_transient_errors_are_retried() {
         for e in [
             "invalid_blocks",
             "invalid_blocks_format",
             "msg_blocks_too_long",
             "invalid_arguments",
+            "internal_error",
+            "fatal_error",
+            "request_timeout",
+            "service_unavailable",
+            "attachment_payload_limit_exceeded",
+            "markdown_text_conflict",
+            "some_error_slack_has_not_documented_yet",
         ] {
-            assert!(is_blocks_problem(e), "{e} は再送すべき");
-        }
-
-        for e in [
-            "invalid_auth",
-            "channel_not_found",
-            "not_in_channel",
-            "rate_limited",
-        ] {
-            assert!(!is_blocks_problem(e), "{e} は再送すべきでない");
+            assert!(!is_hopeless(e), "{e} は再送すべき");
         }
     }
 
@@ -754,18 +891,22 @@ mod tests {
         );
     }
 
-    /// blocks 由来のエラーで、かつ blocks を持つときだけ再送すること。
+    /// blocks を持つときだけ退避すること。
     ///
-    /// blocks が無い payload は退避しても変わらないので、2 回目も同じエラーで
-    /// 確実に失敗する。
+    /// blocks が無い payload は外しても変わらないので、送り直しても同じ
+    /// エラーで失敗する。
     #[test]
-    fn only_block_errors_with_blocks_are_retried() {
+    fn falling_back_needs_blocks() {
         let with_blocks = payload(blocks("## body", None));
 
-        assert!(should_retry(&with_blocks, "invalid_blocks"));
+        assert!(should_fall_back(&with_blocks, "invalid_blocks"));
         assert!(
-            !should_retry(&with_blocks, "invalid_auth"),
-            "blocks 由来でないエラーで再送している"
+            should_fall_back(&with_blocks, "internal_error"),
+            "拒否されたのに退避していない"
+        );
+        assert!(
+            !should_fall_back(&with_blocks, "invalid_auth"),
+            "直らないエラーで退避している"
         );
 
         for body in [
@@ -773,9 +914,36 @@ mod tests {
             Body::new(vec![], None),
         ] {
             assert!(
-                !should_retry(&payload(body), "invalid_blocks"),
-                "blocks が無いのに再送している"
+                !should_fall_back(&payload(body), "invalid_blocks"),
+                "blocks が無いのに退避している"
             );
+        }
+    }
+
+    /// 同じ payload を送り直してよいエラーだけリトライすること。
+    ///
+    /// `internal_error` と `fatal_error` は「一部が既に成功している可能性が
+    /// ある」とドキュメントにあるので、送り直すと通知が重複する。
+    #[test]
+    fn only_safe_errors_are_retried() {
+        assert!(
+            is_retriable("service_unavailable"),
+            "処理前に断られているので送り直せる"
+        );
+
+        for e in [
+            // 一部が投稿済みの可能性がある。送り直すと重複する
+            "internal_error",
+            "fatal_error",
+            // 送った内容の不備。同じものを送っても直らない
+            "request_timeout",
+            "invalid_arguments",
+            // 宛先・権限・流量
+            "invalid_auth",
+            "channel_not_found",
+            "ratelimited",
+        ] {
+            assert!(!is_retriable(e), "{e} は送り直すべきでない");
         }
     }
 
@@ -810,7 +978,7 @@ mod tests {
         let (base, _got, ctypes) = spawn_slack(vec![]);
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let ctypes = ctypes.lock().unwrap();
@@ -828,7 +996,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(vec![]);
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -875,7 +1043,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
 
         message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -889,13 +1057,135 @@ mod tests {
         assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
     }
 
+    /// 拒否されたら退避して送り直すこと。
+    ///
+    /// 単体テストだけでは
+    /// 「1 回目の応答を読んで 2 回目を投げる」という手順自体が壊れても
+    /// 気付けないので、HTTP を通して確かめる。
+    #[actix_web::test]
+    async fn transient_error_is_retried_as_text() {
+        let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "再送していない");
+
+        let a = &got[1]["attachments"][0];
+        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
+    /// 本文が無い payload でも、一時的なエラーなら再送すること。
+    ///
+    /// 退避しても payload は変わらないが、一時的な失敗なら同じものを
+    /// 送り直して通る。ここを落とすと本文の無い通知が消える。
+    #[actix_web::test]
+    async fn blockless_payloads_are_retried_on_transient_errors() {
+        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
+
+        message(Body::new(vec![], None))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        assert_eq!(got.lock().unwrap().len(), 2, "再送していない");
+    }
+
+    /// 処理前に断られたときは表現を落とさず同じものを送ること。
+    ///
+    /// 退避を先に判定すると、blocks を持つ payload では `service_unavailable`
+    /// でも表現が落ちてしまう。落とす理由が無い。
+    #[actix_web::test]
+    async fn retriable_errors_keep_the_blocks() {
+        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "送り直していない");
+        assert_eq!(got[0], got[1], "表現が落ちている");
+    }
+
+    /// 断られた後に送り直してブロックを拒否されたら、退避まで進むこと。
+    ///
+    /// 1 通目で手を 1 つ選んで終わりにすると、この組み合わせで通知が消える。
+    #[actix_web::test]
+    async fn a_rejection_after_a_retry_still_falls_back() {
+        let (base, got, _ctypes) = spawn_slack(vec![
+            serde_json::json!({ "ok": false, "error": "service_unavailable" }),
+            serde_json::json!({ "ok": false, "error": "internal_error" }),
+        ]);
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 3, "退避まで進んでいない");
+
+        let a = &got[2]["attachments"][0];
+        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
+    /// 断られ続けても投げ続けないこと。
+    #[actix_web::test]
+    async fn repeated_rejections_stop_at_the_attempt_limit() {
+        let refused = serde_json::json!({ "ok": false, "error": "service_unavailable" });
+        let (base, got, _ctypes) = spawn_slack(vec![
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused,
+        ]);
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        assert_eq!(
+            got.lock().unwrap().len(),
+            MAX_RETRIES + 1,
+            "上限を超えて投げている"
+        );
+    }
+
+    /// 上限まで送り直した後にブロックを拒否されても、退避先を送ること。
+    ///
+    /// 回数の上限を「送った回数」で数えると、退避先を作った直後に打ち切って
+    /// 通知が消える。
+    #[actix_web::test]
+    async fn a_fallback_is_sent_even_after_the_retry_limit() {
+        let refused = serde_json::json!({ "ok": false, "error": "service_unavailable" });
+        let (base, got, _ctypes) = spawn_slack(vec![
+            refused.clone(),
+            refused,
+            serde_json::json!({ "ok": false, "error": "internal_error" }),
+        ]);
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), MAX_RETRIES + 2, "退避先を送っていない");
+
+        let a = &got[got.len() - 1]["attachments"][0];
+        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
+    }
+
     /// blocks 由来でないエラーでは再送しないこと。
     #[actix_web::test]
     async fn other_errors_are_not_retried() {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_auth"));
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
@@ -907,7 +1197,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
 
         message(Body::new(vec![], None))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
