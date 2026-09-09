@@ -61,11 +61,18 @@ fn escape(text: &str) -> String {
 /// `<url|label>` の `<` `>` `|` は Slack が区切りとして読むので、URL に
 /// 入っているとリンク先が途中で切れる (`https://example.com/a|b` が
 /// `https://example.com/a` になる)。percent-encode して渡す。
+///
+/// 空白も同じ。markdown は `[doc](<url with space>)` を許すが、mrkdwn の
+/// URL の中には置けない。
 fn escape_url(url: &str) -> String {
     url.replace('&', "&amp;")
         .replace('|', "%7C")
         .replace('<', "%3C")
         .replace('>', "%3E")
+        .replace(' ', "%20")
+        .replace('\t', "%09")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D")
 }
 
 /// 落とすと語がくっついてしまうタグに対して、代わりに置く文字。
@@ -109,6 +116,13 @@ fn tag_separator(tag: &str) -> Option<char> {
 /// HTML では `<` の次が英字・`/`・`!`・`?` のどれかでないとタグ名を始められず、
 /// `<` は文字として表示される。`a < b > c` の `< b >` はタグではないので、
 /// タグとして落とすと本文が消える。
+///
+/// `/` の後が英字でなくても (`</ b >`) タグとして扱う。HTML の tokenizer は
+/// この形を bogus comment state として `>` まで読み、表示しない。ここで文字
+/// として残すと、ブラウザが出さないものを出すことになる。
+///
+/// 段落の中の `</ b >` は pulldown-cmark が HTML と見なさないので Text として
+/// 来る。そちらはこの関数を通らず、文字として残る。
 fn opens_tag(next: Option<&u8>) -> bool {
     next.is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'))
 }
@@ -1250,6 +1264,18 @@ mod tests {
         assert_eq!(from_markdown("a < b & c > d"), "a &lt; b &amp; c &gt; d");
     }
 
+    /// URL の空白を percent-encode すること。
+    ///
+    /// markdown は `[doc](<url with space>)` を許すが、mrkdwn の URL の中に
+    /// 空白は置けず、リンク先が途中で切れる。
+    #[test]
+    fn link_urls_encode_whitespace() {
+        assert_eq!(
+            from_markdown("[doc](<https://example.com/a b>)"),
+            "<https://example.com/a%20b|doc>"
+        );
+    }
+
     /// URL の `&` も escape するが、リンクの区切りは壊さないこと。
     #[test]
     fn link_urls_escape_ampersands() {
@@ -1467,6 +1493,20 @@ mod tests {
     #[test]
     fn nested_quotes_are_flattened() {
         assert_eq!(from_markdown("> a\n> > b"), "> a\n>\n> b");
+    }
+
+    /// タグ名にならない `</` は、ブラウザと同じく表示しないこと。
+    ///
+    /// HTML の tokenizer は `</` の後が英字でないと bogus comment state に
+    /// 入り、`>` までを読んで表示しない。生 HTML はブラウザがそう解釈するので
+    /// それに合わせる。
+    ///
+    /// 段落の中の同じ文字列は HTML と見なされず Text として来るので、文字と
+    /// して残る。
+    #[test]
+    fn a_malformed_end_tag_follows_the_html_tokenizer() {
+        assert_eq!(from_markdown("<div>a </ b > c</div>"), "a  c");
+        assert_eq!(from_markdown("a </ b > c"), "a &lt;/ b &gt; c");
     }
 
     /// タグを開かない `<` は文字として残すこと。
