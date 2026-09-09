@@ -207,6 +207,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         footer: Some(sender_footer(&issues.sender)),
                         body: body_content(issue.body.as_deref().unwrap_or(""), &issue.assignees),
                         color,
+                        ..Default::default()
                     }
                 };
                 let attachments = Some(vec![attach]);
@@ -250,6 +251,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                         footer: Some(sender_footer(&issues.sender)),
                         body: body_content("", assignees),
                         color,
+                        ..Default::default()
                     }
                 };
                 let attachments = Some(vec![attach]);
@@ -298,6 +300,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         footer: Some(sender_footer(&pull_request.sender)),
                         body: body_content(body, &pr.assignees),
                         color,
+                        ..Default::default()
                     }
                 };
                 let attachments = Some(vec![attach]);
@@ -348,6 +351,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         body: body_content(pr.body.as_deref().unwrap_or(""), &[]),
                         // 「対応してほしい」通知なので opened / assigned とは色を変える
                         color: Some(slack::Color::Warning),
+                        ..Default::default()
                     }
                 };
 
@@ -384,6 +388,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         footer: Some(sender_footer(&pull_request.sender)),
                         body: body_content("", assignees),
                         color,
+                        ..Default::default()
                     }
                 };
                 let attachments = Some(vec![attach]);
@@ -430,6 +435,7 @@ impl TryFrom<&github::IssueComment> for slack::Message {
                     footer: Some(sender_footer(&issue_comment.sender)),
                     body: body_content(&comment.body, &[]),
                     color,
+                    ..Default::default()
                 };
                 let attachments = Some(vec![attach]);
 
@@ -507,6 +513,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
             footer: Some(sender_footer(&review.sender)),
             body: body_content(&attach_text, &[]),
             color: Some(color),
+            ..Default::default()
         };
 
         Ok(Self {
@@ -555,6 +562,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
             footer: Some(sender_footer(&review_comment.sender)),
             body: body_content(&comment.body, &[]),
             color: Some(slack::Color::Comment),
+            ..Default::default()
         };
 
         Ok(Self {

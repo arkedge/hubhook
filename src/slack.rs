@@ -195,11 +195,36 @@ pub struct Attachment {
     pub title_link: Option<url::Url>,
     pub fallback: String,
     pub color: Option<Color>,
+    /// `text` を mrkdwn として解釈させる。
+    ///
+    /// 省略時の既定はドキュメントに書かれていない (実際には解釈される) ので、
+    /// 依存しないように明示する。`footer` は mrkdwn が効かないため入れられない。
+    #[serde(rename = "mrkdwn_in")]
+    pub mrkdwn_in: [&'static str; 1],
     /// 誰の操作かを小さく出す
     #[serde(flatten)]
     pub footer: Option<Footer>,
     #[serde(flatten)]
     pub body: Body,
+}
+
+impl Default for Attachment {
+    /// `mrkdwn_in` は常に `["text"]`。
+    ///
+    /// 書き忘れると `text` が mrkdwn として解釈されない (既定の挙動は
+    /// ドキュメントに書かれていない) ので、`..Default::default()` で
+    /// 埋めるようにしておく。
+    fn default() -> Self {
+        Self {
+            title: None,
+            title_link: None,
+            fallback: String::new(),
+            color: None,
+            mrkdwn_in: ["text"],
+            footer: None,
+            body: Body::Empty {},
+        }
+    }
 }
 
 /// attachment の footer。
@@ -232,6 +257,12 @@ pub enum Body {
     /// 空文字を送ると `no_text` で拒否され、通知そのものが飛ばなくなるので、
     /// 空なら何も入れない。
     Empty {},
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Self::Empty {}
+    }
 }
 
 impl Body {
@@ -403,12 +434,9 @@ mod tests {
 
     fn attachment(body: Body) -> Attachment {
         Attachment {
-            title: None,
-            title_link: None,
             fallback: "fallback".to_string(),
-            color: None,
-            footer: None,
             body,
+            ..Default::default()
         }
     }
 
@@ -561,6 +589,18 @@ mod tests {
 
         assert_eq!(a["text"], mrkdwn, "text になっていない: {a}");
         assert!(a.get("blocks").is_none(), "blocks を送っている: {a}");
+    }
+
+    /// `mrkdwn_in` を必ず送ること。
+    ///
+    /// 省略したときに `text` が mrkdwn として解釈されるかはドキュメントに
+    /// 書かれていないので、既定の挙動に頼らない。
+    #[test]
+    fn attachment_declares_mrkdwn_in() {
+        let json = serde_json::to_value(payload(text("*body*"))).expect("直列化に失敗");
+        let a = &json["attachments"][0];
+
+        assert_eq!(a["mrkdwn_in"], serde_json::json!(["text"]), "{a}");
     }
 
     /// 本文が無いときは `text` を送らないこと。

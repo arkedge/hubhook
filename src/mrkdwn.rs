@@ -98,6 +98,11 @@ struct Renderer {
     links: Vec<String>,
     /// 組み立て中の表
     table: Option<Table>,
+    /// リスト項目の印を書いた直後か。
+    ///
+    /// 項目の中に段落が来ると (blank line を含むリスト) 段落として空行を
+    /// 入れてしまい、`• ` と本文が離れてしまう。
+    at_item_start: bool,
 }
 
 #[derive(Default)]
@@ -113,6 +118,7 @@ impl Renderer {
             lists: Vec::new(),
             links: Vec::new(),
             table: None,
+            at_item_start: false,
         }
     }
 
@@ -209,7 +215,14 @@ pub fn from_markdown(md: &str) -> String {
 
 fn start(r: &mut Renderer, tag: Tag) {
     match tag {
-        Tag::Paragraph => r.blank_line(),
+        // 項目の印の直後の段落は、印と本文を離さないように空行を入れない
+        Tag::Paragraph => {
+            if r.at_item_start {
+                r.at_item_start = false;
+            } else {
+                r.blank_line();
+            }
+        }
         // 見出しが無いので太字で代用する。中身を読んでから決めるので開く
         Tag::Heading { .. } => {
             r.blank_line();
@@ -218,9 +231,10 @@ fn start(r: &mut Renderer, tag: Tag) {
         Tag::Strong => r.push("*"),
         Tag::Emphasis => r.push("_"),
         Tag::Strikethrough => r.push("~"),
+        // 中身を読んでから囲むかを決めるので開く
         Tag::CodeBlock(_) => {
             r.blank_line();
-            r.push("```\n");
+            r.open();
         }
         Tag::BlockQuote(kind) => {
             r.blank_line();
@@ -261,6 +275,7 @@ fn start(r: &mut Renderer, tag: Tag) {
                 _ => "• ".to_string(),
             };
             r.push(&format!("{indent}{marker}"));
+            r.at_item_start = true;
         }
         Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
             r.links.push(dest_url.to_string());
@@ -301,8 +316,16 @@ fn end(r: &mut Renderer, tag: TagEnd) {
         TagEnd::Emphasis => r.push("_"),
         TagEnd::Strikethrough => r.push("~"),
         TagEnd::CodeBlock => {
-            r.newline();
-            r.push("```");
+            let code = r.close();
+            let code = code.trim_end();
+
+            // Slack のコードブロックは ``` 固定で長さを変えられない。中に ```
+            // があると途中で閉じて、以降の装飾まで崩れる。囲むのを諦める。
+            if code.contains("```") {
+                r.push(code);
+            } else {
+                r.push(&format!("```\n{code}\n```"));
+            }
             r.blank_line();
         }
         TagEnd::BlockQuote(_) => {
@@ -382,7 +405,9 @@ fn render_table(rows: &[Vec<String>]) -> String {
         let cells: Vec<String> = row
             .iter()
             .map(|c| {
-                if i == 0 && !c.is_empty() {
+                // 中身が既に太字なら二重にしない (見出しと同じ理由)
+                let already_bold = c.len() > 1 && c.starts_with('*') && c.ends_with('*');
+                if i == 0 && !c.is_empty() && !already_bold {
                     format!("*{c}*")
                 } else {
                     c.clone()
@@ -595,6 +620,36 @@ mod tests {
     fn html_comments_are_dropped() {
         assert!(from_markdown("<!-- 説明 -->").is_empty());
         assert_eq!(from_markdown("<!-- 説明 -->text"), "text");
+    }
+
+    /// 空行を含むリストでも印と本文が離れないこと。
+    ///
+    /// 項目の中に段落が来ると、段落として空行を入れてしまい `• ` だけの行に
+    /// なってしまう。
+    #[test]
+    fn loose_lists_keep_their_markers() {
+        assert_eq!(from_markdown("- a\n\n- b"), "• a\n\n• b");
+    }
+
+    /// コードブロックの中に ``` があるときは囲まないこと。
+    ///
+    /// Slack のコードブロックは ``` 固定で長さを変えられないので、囲むと
+    /// 中の ``` で途中で閉じて、以降の装飾まで崩れる。
+    #[test]
+    fn code_blocks_containing_a_fence_are_not_fenced() {
+        let out = from_markdown("````\n```\ninner\n```\n````");
+
+        assert!(!out.starts_with("```\n```"), "二重に囲んでいる: {out:?}");
+        assert!(out.contains("inner"), "中身が消えている: {out:?}");
+    }
+
+    /// 表の見出しが既に太字なら二重にしないこと。
+    #[test]
+    fn already_bold_table_headers_are_not_wrapped_again() {
+        assert_eq!(
+            from_markdown("| **Name** | x |\n| --- | --- |\n| 1 | 2 |"),
+            "*Name* | *x*\n1 | 2"
+        );
     }
 
     /// 装飾の無い本文は変えないこと。通知の大半はこれ。
