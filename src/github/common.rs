@@ -47,6 +47,21 @@ pub struct Organization {
     pub description: Option<String>,
 }
 
+/// repository の日時。**unix timestamp と ISO 8601 のどちらでも来る。**
+///
+/// schema でも `integer | string` になっている
+/// (`repository.created_at` / `repository.pushed_at` だけ)。片方に決め打つと、
+/// もう片方が来たときに deserialize が落ちて通知が飛ばなくなる。
+///
+/// 読んでいないフィールドなので、区別できる形にしておくだけでよい。
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Timestamp {
+    Unix(i64),
+    Iso(String),
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Repository {
     pub id: usize,
@@ -95,9 +110,10 @@ pub struct Repository {
     pub labels_url: Url,
     pub releases_url: Url,
     pub deployments_url: Url,
-    pub created_at: String, // 2021-10-27T05:00:55Z
+    pub created_at: Timestamp,
     pub updated_at: String,
-    pub pushed_at: Option<String>, // 未 push の repo だと null
+    /// 未 push の repo だと null
+    pub pushed_at: Option<Timestamp>,
     pub git_url: Url,
     pub ssh_url: String, // "git@github.com:arkedge/hubhook.git"
     pub clone_url: Url,
@@ -115,7 +131,8 @@ pub struct Repository {
     pub forks_count: usize,
     pub mirror_url: Option<Url>,
     pub archived: bool,
-    pub disabled: bool,
+    /// schema では required ではない (`allow_forking` と同じ)
+    pub disabled: Option<bool>,
     pub open_issues_count: usize,
     pub license: Option<License>,
     // octokit/webhooks の payload-examples には無い。必須にしておくと、
@@ -152,9 +169,13 @@ pub struct Issue {
     pub number: usize,
     pub title: String,
     pub user: User,
+    /// schema では required ではない。無ければラベル無しとして扱う
+    #[serde(default)]
     pub labels: Vec<Label>,
-    pub state: String,
-    pub locked: bool,
+    // 以下はどちらも schema で required ではない。読んでいないので、
+    // 既定値を捏造せず「入っていない」をそのまま表す
+    pub state: Option<String>,
+    pub locked: Option<bool>,
     pub assignee: Option<User>,
     pub assignees: Vec<User>,
     pub milestone: Option<IgnoredAny>,
@@ -166,7 +187,8 @@ pub struct Issue {
     pub active_lock_reason: Option<IgnoredAny>,
     pub body: Option<String>,
     pub reactions: Reactions,
-    pub timeline_url: Url,
+    /// schema では required ではない
+    pub timeline_url: Option<Url>,
     pub performed_via_github_app: Option<IgnoredAny>,
 }
 

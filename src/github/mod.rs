@@ -54,9 +54,13 @@ pub struct Issues {
     pub action: IssuesAction,
     pub issue: common::Issue,
     pub repository: common::Repository,
-    pub organization: common::Organization,
+    // どちらも octokit の schema では required ではない。
+    // organization は個人リポジトリ、installation は GitHub App 以外の
+    // webhook で入らないので、必須にすると deserialize が失敗して
+    // 通知が止まる (どちらも読んでいないフィールド)。
+    pub organization: Option<common::Organization>,
     pub sender: common::User,
-    pub installation: common::InstallationLite,
+    pub installation: Option<common::InstallationLite>,
 }
 
 // payload schema の写しなので、読んでいないフィールドも残す
@@ -90,9 +94,13 @@ pub struct IssueComment {
     pub issue: common::Issue,
     pub comment: common::IssueComment,
     pub repository: common::Repository,
-    pub organization: common::Organization,
+    // どちらも octokit の schema では required ではない。
+    // organization は個人リポジトリ、installation は GitHub App 以外の
+    // webhook で入らないので、必須にすると deserialize が失敗して
+    // 通知が止まる (どちらも読んでいないフィールド)。
+    pub organization: Option<common::Organization>,
     pub sender: common::User,
-    pub installation: common::InstallationLite,
+    pub installation: Option<common::InstallationLite>,
 }
 
 impl IssueComment {
@@ -398,11 +406,14 @@ impl Payload {
 pub(crate) mod testing {
     use super::Payload;
 
+    /// `test/` の payload を deserialize する。
+    ///
+    /// 失敗したフィールドが分かるように、エラーをそのまま panic に出す。
     pub(crate) fn de(event: &str, test_json: &str) -> Payload {
         let path = format!("test/{test_json}");
         let payload =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
-        // 失敗したフィールドが分かるように、エラーをそのまま出す
+
         Payload::from_event(event, payload.as_bytes())
             .unwrap_or_else(|e| panic!("{test_json}: {e}"))
             .expect("unsupported event")
@@ -413,6 +424,7 @@ pub(crate) mod testing {
 mod tests {
     use crate::github::testing::de;
     use crate::github::*;
+    use serde_json::Value;
 
     #[test]
     fn unsupported_event_is_ignored() {
@@ -878,37 +890,626 @@ mod tests {
         assert!(!p.body().is_empty(), "body が空");
     }
 
-    // TODO: add test for OSS
+    /// **schema の `required` だけで作った payload を deserialize できること。**
+    ///
+    /// これが payload に対する保証。struct が schema より厳しい (schema で
+    /// required でないフィールドを必須にしている) と落ちる。落ちたフィールドは、
+    /// その payload が来たときに通知が飛ばなくなる箇所そのもの。
+    ///
+    /// schema は実行時に取ってくる。fixture を置くと octokit 側が変わるたびに
+    /// 追随が必要になるし、置いたまま古くなると保証にならない。取ってくれば
+    /// required の追加や action の追加が自動で入る。
+    ///
+    /// 取得元は 1 ファイルにまとまった bundle
+    /// (<https://www.npmjs.com/package/@octokit/webhooks-schemas>)。
+    /// `$ref` が内部参照だけになるので、ファイル間のパス解決が要らない。
+    #[actix_web::test]
+    async fn minimal_required_payloads_deserialize() {
+        let schema = octokit_schema().await;
+        let defs = schema["definitions"]
+            .as_object()
+            .expect("definitions が無い");
 
-    //#[test]
-    //fn de_issue_comment() {
-    //    assert!(matches!(de("issue_comment", "issue_comment.json"), Payload::IssueComment(_)));
-    //}
+        let mut per_event = std::collections::HashMap::new();
 
-    //#[test]
-    //fn de_issue() {
-    //    assert!(matches!(de("issues", "issue_open.json"), Payload::Issues(_)));
-    //    assert!(matches!(de("issues", "issue_assigned.json"), Payload::Issues(_)));
-    //    assert!(matches!(de("issues", "issue_labeled.json"), Payload::Issues(_)));
-    //}
+        for (name, def) in defs {
+            // `<event>$<action>` の形をしている
+            let Some((event, _action)) = name.split_once('$') else {
+                continue;
+            };
+            if !SUPPORTED_EVENTS.contains(&event) {
+                continue;
+            }
 
-    //#[test]
-    //fn de_pull_request() {
-    //    assert!(matches!(
-    //        de("pull_request", "pull_request_assign.json"),
-    //        Payload::PullRequest(_)
-    //    ));
-    //}
+            for (selected, payload) in enumerate_payloads(def, defs) {
+                let body = serde_json::to_vec(&payload).expect("直列化に失敗");
 
-    //#[test]
-    //fn issues_action() {
-    //    assert!(matches!(
-    //        serde_json::from_str("\"opened\"").unwrap(),
-    //        IssuesAction::Opened
-    //    ));
-    //    assert!(matches!(
-    //        serde_json::from_str("\"closed\"").unwrap(),
-    //        IssuesAction::Closed
-    //    ));
-    //}
+                Payload::from_event(event, &body)
+                    .unwrap_or_else(|e| panic!("{name} {selected}: {e}"))
+                    .expect("unsupported event");
+            }
+
+            *per_event.entry(event).or_insert(0) += 1;
+        }
+
+        // 命名が変わって丸ごと filter されても総数だけでは気付けないので、
+        // イベントごとに 1 件以上あることを見る
+        for event in SUPPORTED_EVENTS {
+            let n = per_event.get(event).copied().unwrap_or(0);
+            assert!(n > 0, "{event} の definition が 1 つも見つからない");
+        }
+    }
+
+    /// action enum が schema の action を網羅していること。
+    ///
+    /// 未知の action は deserialize が落ちて webhook 全体が 400 になり、
+    /// 通知が失われる。GitHub が action を追加したらここで気付ける。
+    #[actix_web::test]
+    async fn every_schema_action_is_known() {
+        let schema = octokit_schema().await;
+        let defs = schema["definitions"]
+            .as_object()
+            .expect("definitions が無い");
+
+        let mut missing = Vec::new();
+        let mut per_event = std::collections::HashMap::new();
+
+        for name in defs.keys() {
+            let Some((event, action)) = name.split_once('$') else {
+                continue;
+            };
+            if !SUPPORTED_EVENTS.contains(&event) {
+                continue;
+            }
+
+            *per_event.entry(event).or_insert(0) += 1;
+
+            // action だけを持つ payload で、enum が受け付けるかを見る
+            let probe = serde_json::json!({ "action": action });
+            let accepted = match event {
+                "issues" => serde_json::from_value::<ActionOnly<IssuesAction>>(probe).is_ok(),
+                "issue_comment" => {
+                    serde_json::from_value::<ActionOnly<IssueCommentAction>>(probe).is_ok()
+                }
+                "pull_request" => {
+                    serde_json::from_value::<ActionOnly<PullRequestAction>>(probe).is_ok()
+                }
+                "pull_request_review" => {
+                    serde_json::from_value::<ActionOnly<PullRequestReviewAction>>(probe).is_ok()
+                }
+                "pull_request_review_comment" => {
+                    serde_json::from_value::<ActionOnly<PullRequestReviewCommentAction>>(probe)
+                        .is_ok()
+                }
+                _ => unreachable!("SUPPORTED_EVENTS と一致していない"),
+            };
+
+            if !accepted {
+                missing.push(name.clone());
+            }
+        }
+
+        assert!(missing.is_empty(), "enum が知らない action: {missing:?}");
+
+        // 命名が変わって丸ごと filter されても気付けるように
+        for event in SUPPORTED_EVENTS {
+            let n = per_event.get(event).copied().unwrap_or(0);
+            assert!(n > 0, "{event} の definition が 1 つも見つからない");
+        }
+    }
+
+    /// hubhook が扱うイベント。
+    const SUPPORTED_EVENTS: &[&str] = &[
+        "issues",
+        "issue_comment",
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+    ];
+
+    /// `action` だけを取り出して enum を試すための入れ物。
+    #[derive(Deserialize)]
+    struct ActionOnly<T> {
+        #[allow(dead_code)]
+        action: T,
+    }
+
+    /// schema の中の位置。
+    ///
+    /// パスは選択肢のある箇所でしか使わないのに、文字列で持つと全プロパティ分
+    /// 生成することになる (payload 数 x プロパティ数で数百万回)。親へのリンクだけ
+    /// 持って、必要になったときに組み立てる。
+    struct Loc<'a> {
+        parent: Option<&'a Loc<'a>>,
+        /// 親との区切り。`/` は property や配列の要素、`|` は oneOf の枝番
+        sep: char,
+        seg: &'a str,
+    }
+
+    impl Loc<'_> {
+        fn root() -> Self {
+            Loc {
+                parent: None,
+                sep: '/',
+                seg: "",
+            }
+        }
+
+        fn child<'a>(&'a self, sep: char, seg: &'a str) -> Loc<'a> {
+            Loc {
+                parent: Some(self),
+                sep,
+                seg,
+            }
+        }
+
+        fn path(&self) -> String {
+            let Some(parent) = self.parent else {
+                return String::new();
+            };
+
+            let mut out = parent.path();
+            out.push(self.sep);
+            out.push_str(self.seg);
+
+            out
+        }
+    }
+
+    /// `oneOf` / `anyOf` の枝番。`format!` を避けるために表で持つ。
+    ///
+    /// hubhook が辿る範囲での最大 branch 数は 3。足りなければ最後のものを使う
+    /// (パスが衝突しても、その位置の選択肢が 1 つに潰れるだけ)。
+    const BRANCH_SEGS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7"];
+
+    /// 選択肢の種類。同じ位置に複数の選択肢が来ることがある
+    /// (`type: ["array", "null"]` の配列と、その配列を埋めるかどうかなど)。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    enum Kind {
+        Type,
+        Enum,
+        Branch,
+        Items,
+    }
+
+    /// 選択肢の位置と種類 -> 選ぶ候補の index。
+    type Selections = std::collections::BTreeMap<(String, Kind), usize>;
+
+    /// `at` に到達するのに必要な選択だけを残す。
+    ///
+    /// 全部引き継ぐと兄弟の選択肢との掛け算になって組み合わせが爆発する。
+    /// 逆に何も引き継がないと、外側の選択で初めて現れる内側の選択肢
+    /// (空でない配列の要素など) に到達できない。
+    fn enabling(selections: &Selections, at: &str) -> Selections {
+        selections
+            .iter()
+            .filter(|((path, _), _)| {
+                at == path
+                    || at.starts_with(&format!("{path}/"))
+                    || at.starts_with(&format!("{path}|"))
+            })
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    /// 1 つの definition から、選択肢を全部通る payload を列挙する。
+    ///
+    /// schema が選択肢を許す箇所 (型・`oneOf` / `anyOf` の branch・enum の値・
+    /// 配列の中身) は、1 つだけ試すと他を受けない型に戻しても気付けない。
+    ///
+    /// グローバルな index 1 つで回すと**入れ子の選択肢を網羅できない**。
+    /// 外側で別の枝を選ぶと内側の選択肢に到達しないので、例えば
+    /// `oneOf: [{ enum: [A, B] }, string]` は `B` が一度も生成されない。
+    /// そこで選択肢ごとに、そこへ到達できる選び方 + その候補で payload を作る。
+    ///
+    /// `required` だけの形と optional も入れた形の両方を回す。optional を
+    /// 入れないと、そのフィールドの型を間違えていてもキーが来ないので
+    /// 気付けない。中の選択肢も同じように列挙する。
+    fn enumerate_payloads(
+        def: &Value,
+        defs: &serde_json::Map<String, Value>,
+    ) -> Vec<(String, Value)> {
+        // 選択肢が増えると組み合わせが増えるので、暴走したら気付けるようにする
+        const MAX_PAYLOADS: usize = 40_000;
+
+        let mut out = Vec::new();
+        let mut queue = vec![(false, Selections::new()), (true, Selections::new())];
+        let mut tried = std::collections::HashSet::new();
+
+        while let Some((all_props, selections)) = queue.pop() {
+            if !tried.insert((all_props, selections.clone())) {
+                continue;
+            }
+            assert!(
+                out.len() < MAX_PAYLOADS,
+                "payload が多すぎる (選択肢の暴走?)"
+            );
+
+            let ctx = Ctx {
+                defs,
+                selections: &selections,
+                all_props,
+            };
+
+            let mut found = Selections::new();
+            let payload = build(&ctx, def, None, &Loc::root(), &mut found, 0);
+
+            let mut label = if all_props {
+                "optional 込み".to_string()
+            } else {
+                "required だけ".to_string()
+            };
+            for ((path, kind), k) in &selections {
+                label.push_str(&format!(" {path}:{kind:?}=#{k}"));
+            }
+            out.push((label, payload));
+
+            for ((path, kind), candidates) in found {
+                for k in 1..candidates {
+                    let mut next = enabling(&selections, &path);
+                    next.insert((path.clone(), kind), k);
+                    queue.push((all_props, next));
+                }
+            }
+        }
+
+        out
+    }
+
+    /// octokit の schema bundle。`target/` に置くので git には入らない。
+    ///
+    /// **CI では必ず取り直す。手元ではキャッシュを使う。**
+    ///
+    /// 保証が効いていないと困るのはマージの門である CI なので、そこでは毎回
+    /// 取得して octokit 側の変更を必ず拾う。キャッシュを優先すると一度保存した
+    /// 後は二度と取得せず、required や action が増えても永久に気付けない
+    /// (置き場所が変わっただけの fixture になる)。
+    ///
+    /// 手元でキャッシュを使うのは、毎回の `cargo test` を速くするためと、
+    /// オフラインでも動かせるようにするため。手元が古くても CI が拾う。
+    async fn octokit_schema() -> &'static Value {
+        // テストは並列に走る。それぞれが取得するとネットワークも
+        // キャッシュへの書き込みも競合するので、プロセスで 1 回にまとめる
+        static SCHEMA: tokio::sync::OnceCell<Value> = tokio::sync::OnceCell::const_new();
+
+        SCHEMA.get_or_init(fetch_octokit_schema).await
+    }
+
+    async fn fetch_octokit_schema() -> Value {
+        const URL: &str = "https://cdn.jsdelivr.net/npm/@octokit/webhooks-schemas/schema.json";
+
+        let cache = cache_path();
+
+        if !in_ci()
+            && let Ok(cached) = std::fs::read(&cache)
+            && let Ok(schema) = serde_json::from_slice(&cached)
+        {
+            return schema;
+        }
+
+        let body = fetch_schema(URL)
+            .await
+            .unwrap_or_else(|e| panic!("schema を取得できない ({URL}): {e}"));
+
+        let schema = serde_json::from_slice(&body).expect("schema が JSON でない");
+
+        // 手元の次回以降と、オフライン時のために残す。
+        // 直接書くと、並列で走る別のテストが書きかけを読んでしまう
+        // 名前を共有すると、別に走っている cargo test の書きかけを
+        // rename してしまう
+        let tmp = cache.with_extension(format!("tmp.{}", std::process::id()));
+        let written = std::fs::write(&tmp, &body).and_then(|()| std::fs::rename(&tmp, &cache));
+
+        // 黙って失敗すると、オフラインで動くという前提が崩れたことに気付けない
+        if let Err(e) = written {
+            eprintln!("警告: キャッシュを書けない ({}): {e}", cache.display());
+        }
+
+        schema
+    }
+
+    /// schema のキャッシュの置き場所。
+    ///
+    /// `target/` は git に入らないので都合が良い。ただし `CARGO_TARGET_DIR` で
+    /// 外に出している場合は `<manifest>/target` が作られないので、そちらを見る。
+    fn cache_path() -> std::path::PathBuf {
+        let dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+
+        // 手元で一度もビルドしていないと無いことがある
+        let _ = std::fs::create_dir_all(&dir);
+
+        dir.join("octokit-webhooks-schema.json")
+    }
+
+    /// CI で走っているか。GitHub Actions は `CI=true` を入れる。
+    fn in_ci() -> bool {
+        std::env::var("CI").is_ok_and(|v| v == "true" || v == "1")
+    }
+
+    async fn fetch_schema(url: &str) -> Result<Vec<u8>, reqwest::Error> {
+        // reqwest にはデフォルトのタイムアウトが無い。CDN が応答しないと
+        // テストがぶら下がったままになる
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let body = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+
+        Ok(body.to_vec())
+    }
+
+    /// `$ref` と `allOf` を辿って、参照している schema を並べる。
+    ///
+    /// 畳んで 1 枚の Map にするとクローンが大量に発生する (`repository` は
+    /// 77 プロパティあり、これを payload ごとに何度も複製することになる)。
+    /// 参照を並べるだけにして、必要なキーをそこから探す。
+    ///
+    /// 後ろにあるものが優先 (自分自身のキーが `$ref` 先を上書きする)。
+    fn sources<'a>(
+        node: &'a Value,
+        defs: &'a serde_json::Map<String, Value>,
+        out: &mut Vec<&'a serde_json::Map<String, Value>>,
+        depth: usize,
+    ) {
+        assert!(depth < MAX_DEPTH, "schema が深すぎる ($ref の循環?)");
+
+        let Some(obj) = node.as_object() else {
+            return;
+        };
+
+        if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
+            let name = r
+                .strip_prefix("#/definitions/")
+                .unwrap_or_else(|| panic!("外部参照は解けない: {r}"));
+            let target = defs
+                .get(name)
+                .unwrap_or_else(|| panic!("参照先が無い: {r}"));
+
+            sources(target, defs, out, depth + 1);
+        }
+
+        if let Some(parts) = obj.get("allOf").and_then(Value::as_array) {
+            for part in parts {
+                sources(part, defs, out, depth + 1);
+            }
+        }
+
+        out.push(obj);
+    }
+
+    /// 並べた schema からキーを探す。後ろ (優先度の高い方) から見る。
+    fn lookup<'a>(sources: &[&'a serde_json::Map<String, Value>], key: &str) -> Option<&'a Value> {
+        sources.iter().rev().find_map(|s| s.get(key))
+    }
+
+    /// 並べた schema の `required` の和集合。
+    fn required_keys<'a>(sources: &[&'a serde_json::Map<String, Value>]) -> Vec<&'a str> {
+        let mut out = Vec::new();
+
+        for s in sources {
+            if let Some(names) = s.get("required").and_then(Value::as_array) {
+                for n in names.iter().filter_map(Value::as_str) {
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    /// 埋めるフィールド。`all_props` なら optional も入れる。
+    ///
+    /// required だけだと、optional なフィールドの型を間違えていても
+    /// そのキーが来ないので気付けない。
+    fn keys_to_fill<'a>(
+        sources: &[&'a serde_json::Map<String, Value>],
+        all_props: bool,
+    ) -> Vec<&'a str> {
+        let mut out = required_keys(sources);
+
+        if !all_props {
+            return out;
+        }
+
+        for s in sources {
+            if let Some(props) = s.get("properties").and_then(Value::as_object) {
+                for key in props.keys() {
+                    if !out.contains(&key.as_str()) {
+                        out.push(key);
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    /// 並べた schema から `properties` の 1 つを探す。
+    fn property<'a>(
+        sources: &[&'a serde_json::Map<String, Value>],
+        key: &str,
+    ) -> Option<&'a Value> {
+        sources
+            .iter()
+            .rev()
+            .find_map(|s| s.get("properties")?.as_object()?.get(key))
+    }
+
+    /// `properties` を持つか。
+    fn has_properties(sources: &[&serde_json::Map<String, Value>]) -> bool {
+        sources.iter().any(|s| s.contains_key("properties"))
+    }
+
+    /// $ref に循環があっても止まるようにする深さの上限。
+    ///
+    /// 現在の schema で必要な深さは 10 程度。ここに当たったら循環を疑う。
+    const MAX_DEPTH: usize = 64;
+
+    /// `required` のフィールドだけを持つ payload を作る。
+    ///
+    /// 値そのものに意味は無く、型と有無だけが意味を持つ。
+    ///
+    /// 選択肢のある箇所では `selections` にその位置と種類の指定があればそれを
+    /// 使い、無ければ先頭を使う。通った選択肢と候補数は `found` に記録するので、
+    /// 呼び出し側が 1 つずつ差し替えて列挙できる。
+    /// 1 つの payload を作る間ずっと変わらないもの。
+    struct Ctx<'a> {
+        defs: &'a serde_json::Map<String, Value>,
+        /// 選択肢のある箇所で使う候補
+        selections: &'a Selections,
+        /// optional なフィールドも入れるか
+        all_props: bool,
+    }
+
+    fn build(
+        ctx: &Ctx,
+        node: &Value,
+        name: Option<&str>,
+        loc: &Loc,
+        found: &mut Selections,
+        depth: usize,
+    ) -> Value {
+        assert!(
+            depth < MAX_DEPTH,
+            "schema が深すぎる ($ref の循環?): {}",
+            loc.path()
+        );
+
+        let mut srcs = Vec::new();
+        sources(node, ctx.defs, &mut srcs, 0);
+
+        // 候補が複数ある箇所を記録して、どれを使うか決める
+        let choose = |kind: Kind, candidates: usize, found: &mut Selections| -> usize {
+            // 候補が 1 つなら選ぶ余地が無い。ここが大多数なので、
+            // パス文字列の生成も map 引きも省く
+            if candidates <= 1 {
+                return 0;
+            }
+
+            let key = (loc.path(), kind);
+            found.insert(key.clone(), candidates);
+
+            ctx.selections
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .min(candidates - 1)
+        };
+
+        // enum も選択肢。null を含むものがあり、それを試さないと
+        // Option を外しても気付けない
+        if let Some(vs) = lookup(&srcs, "enum").and_then(Value::as_array) {
+            if vs.is_empty() {
+                return Value::Null;
+            }
+
+            return vs[choose(Kind::Enum, vs.len(), found)].clone();
+        }
+        if let Some(c) = lookup(&srcs, "const") {
+            return c.clone();
+        }
+
+        let t = match lookup(&srcs, "type") {
+            Some(Value::String(t)) => Some(t.as_str()),
+            Some(Value::Array(ts)) => {
+                let ts: Vec<&str> = ts.iter().filter_map(Value::as_str).collect();
+                let k = choose(Kind::Type, ts.len(), found);
+
+                ts.get(k).copied()
+            }
+            _ => None,
+        };
+
+        // 型が決まっていない oneOf / anyOf は branch を選ぶ。
+        // branch の中にも選択肢がありうるので、パスに枝番を足して区別する
+        if t.is_none() && !has_properties(&srcs) {
+            for key in ["oneOf", "anyOf"] {
+                if let Some(branches) = lookup(&srcs, key).and_then(Value::as_array) {
+                    if branches.is_empty() {
+                        return Value::Null;
+                    }
+
+                    let k = choose(Kind::Branch, branches.len(), found);
+                    let seg = BRANCH_SEGS[k.min(BRANCH_SEGS.len() - 1)];
+
+                    return build(
+                        ctx,
+                        &branches[k],
+                        name,
+                        &loc.child('|', seg),
+                        found,
+                        depth + 1,
+                    );
+                }
+            }
+        }
+
+        match t {
+            Some("object") | None if has_properties(&srcs) || t.is_some() => {
+                let mut out = serde_json::Map::new();
+
+                for key in keys_to_fill(&srcs, ctx.all_props) {
+                    let value = match property(&srcs, key) {
+                        Some(spec) => {
+                            build(ctx, spec, Some(key), &loc.child('/', key), found, depth + 1)
+                        }
+                        // required なのに properties に無いなら空オブジェクト
+                        None => Value::Object(serde_json::Map::new()),
+                    };
+                    out.insert(key.to_string(), value);
+                }
+
+                Value::Object(out)
+            }
+            Some("array") => {
+                // 空だけだと要素の型が一切検証されない。要素側が schema より
+                // 厳しくても、中身のある payload が来て初めて落ちることになる
+                let items = lookup(&srcs, "items");
+                let candidates = if items.is_some() { 2 } else { 1 };
+
+                if choose(Kind::Items, candidates, found) == 0 {
+                    return Value::Array(vec![]);
+                }
+
+                let items = items.expect("候補が 2 なら items がある");
+
+                Value::Array(vec![build(
+                    ctx,
+                    items,
+                    name,
+                    &loc.child('/', "0"),
+                    found,
+                    depth + 1,
+                )])
+            }
+            Some("boolean") => Value::Bool(false),
+            Some("integer") | Some("number") => Value::from(0),
+            Some("null") => Value::Null,
+            _ => {
+                // 文字列。url::Url で受けるフィールドは parse できる形にする
+                // (schema が format: uri を付けていないものがある)
+                let url_ish =
+                    name.is_some_and(|n| n == "url" || n == "href" || n.ends_with("_url"));
+                let fmt = lookup(&srcs, "format").and_then(Value::as_str);
+
+                if fmt == Some("uri") || url_ish {
+                    Value::from("https://example.com/minimal")
+                } else if fmt == Some("date-time") {
+                    Value::from("2026-01-01T00:00:00Z")
+                } else {
+                    Value::from("minimal")
+                }
+            }
+        }
+    }
 }
