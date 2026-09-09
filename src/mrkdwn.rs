@@ -186,10 +186,9 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 
     while let Some(i) = lower[from..].find(name) {
         let at = from + i;
-        // 属性名の切れ目を確かめる (`href` が `data-href` に当たらないように)
-        let before_ok = at == 0
-            || lower.as_bytes()[at - 1].is_ascii_whitespace()
-            || lower.as_bytes()[at - 1] == b'"';
+        // 属性名の切れ目を確かめる。`"` を境界に含めると、別の属性値の中の
+        // 文字列 (`<a title="href=...">`) から行き先を捏造してしまう。
+        let before_ok = at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace();
         let rest = &tag[at + name.len()..];
         let rest_trimmed = rest.trim_start();
 
@@ -395,15 +394,20 @@ impl Renderer {
                 String::new()
             }
             "a" => match self.pending_href.take() {
-                Some(url) => format!(" ({})", escape_url(&url)),
+                // 属性値は HTML なので、`?a=1&amp;b=2` のように文字参照が
+                // 入っている。戻さずに escape すると `&amp;amp;` になって
+                // パラメータ名が変わる。
+                Some(url) => format!(" ({})", escape_url(&decode_refs(&url))),
                 None => String::new(),
             },
             "img" => {
                 let alt = attr(tag, "alt").unwrap_or_default();
                 if !alt.trim().is_empty() {
-                    return alt;
+                    return decode_refs(&alt);
                 }
-                attr(tag, "src").unwrap_or_default()
+                attr(tag, "src")
+                    .map(|s| decode_refs(&s))
+                    .unwrap_or_default()
             }
             _ => String::new(),
         }
@@ -578,12 +582,13 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             let code = code.strip_suffix('\n').unwrap_or(&code);
 
             // Slack のコードブロックは ``` 固定で長さを変えられない。中に ```
-            // があると途中で閉じて、以降の装飾まで崩れる。囲むのを諦める。
-            if code.contains("```") {
-                r.push(code);
-            } else {
-                r.push(&format!("```\n{code}\n```"));
-            }
+            // があると途中で閉じてしまう。囲まずに出すと、その ``` が今度は
+            // フェンスを開いて以降の本文まで飲み込むので、もっと悪い。
+            //
+            // 見た目を保ったまま無効化する。バックティックの間に幅ゼロの文字を
+            // 挟むと、Slack はフェンスとして読まない。
+            let code = code.replace("```", "`\u{200b}`\u{200b}`");
+            r.push(&format!("```\n{code}\n```"));
             r.blank_line();
         }
         TagEnd::BlockQuote(_) => {
@@ -921,6 +926,37 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 内側の ``` でフェンスを開かせないこと。
+    ///
+    /// 囲まずに出すと、その ``` が Slack のフェンスとして読まれて以降の
+    /// 本文まで飲み込む。
+    #[test]
+    fn inner_fences_are_neutralized() {
+        let out = from_markdown("````\n```\ninner\n```\n````\n\nafter");
+
+        assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
+        assert!(out.contains("inner"), "中身が消えている: {out:?}");
+        assert_eq!(out.matches("```").count(), 2, "フェンスの数が違う: {out:?}");
+    }
+
+    /// 別の属性値から行き先を捏造しないこと。
+    #[test]
+    fn attributes_are_matched_on_a_boundary() {
+        let out = from_markdown(r#"<a title="href=https://evil.example.com">label</a>"#);
+
+        assert!(!out.contains("evil"), "捏造している: {out:?}");
+        assert!(out.contains("label"), "{out:?}");
+    }
+
+    /// 属性値の文字参照を二重にエンコードしないこと。
+    #[test]
+    fn href_entities_are_decoded_once() {
+        let out = from_markdown(r#"<a href="https://example.com/?a=1&amp;b=2">label</a>"#);
+
+        assert!(out.contains("a=1&amp;b=2"), "二重になっている: {out:?}");
+        assert!(!out.contains("amp;amp;"), "二重になっている: {out:?}");
     }
 
     /// アンカーや相対パスをリンク記法にしないこと。
