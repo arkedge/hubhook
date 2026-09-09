@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use tracing::{debug, error, info, warn};
 
-/// 1 つの通知で Slack に投げる最大回数。
+/// 同じ payload を送り直す回数の上限。
 ///
-/// 「断られたので送り直したらブロックを拒否された」のように手が続くことが
-/// あるので 1 回では足りない。一方で無制限にすると、応答が速い相手に対して
-/// 予算を使い切るまで投げ続けてしまう。
-const MAX_ATTEMPTS: usize = 3;
+/// 予算だけで打ち切ると、応答が速い相手に対して使い切るまで投げ続けてしまう。
+///
+/// 退避 (payload を変える) はこの上限に数えない。退避すると blocks が消えて
+/// 2 度目は成立しないので高々 1 回で、作った退避先を送らずに終わるのを
+/// 避けたい。
+const MAX_RETRIES: usize = 2;
 
 /// Slack への POST 全体の予算。**再送する分も含める。**
 ///
@@ -516,15 +518,17 @@ impl Message {
         // - リトライ: 同じものを送る。処理前に断られただけのとき
         // - 退避: ブロックを外して送る。ブロックが拒否されたとき
         //
-        // 2 段の決め打ちにすると「断られた後に送り直したらブロックを拒否
-        // された」のような組み合わせを取りこぼす。手を打てる限り繰り返す。
+        // 手を 1 つ選んで終わりにすると「断られた後に送り直したらブロックを
+        // 拒否された」のような組み合わせを取りこぼす。手がある限り続ける。
         //
-        // 打ち切りは予算と回数の両方で行う。予算だけだと、応答が速い相手に
-        // 対して無駄に何度も投げることになる。
+        // 終わるのは、通ったとき / 打つ手が無いとき / 予算が尽きたとき /
+        // 同じものを送り直しすぎたとき。退避は blocks を消すので高々 1 回しか
+        // 成立せず、ループは必ず止まる。
         let mut payload = payload;
         let mut degraded = false;
+        let mut retries = 0;
 
-        for _ in 0..MAX_ATTEMPTS {
+        loop {
             let Some(left) = remaining(deadline, Instant::now()) else {
                 error!(channel, "POST gave up: out of budget");
                 return;
@@ -551,6 +555,11 @@ impl Message {
                     // 処理前に断られたなら、表現を落とす理由が無いので同じものを
                     // 送る。先に退避を判定すると、この場合まで表現が落ちる。
                     if is_retriable(&e) {
+                        if retries >= MAX_RETRIES {
+                            error!(channel, error = %e, "POST gave up: too many retries");
+                            return;
+                        }
+                        retries += 1;
                         warn!(channel, error = %e, "POST failed; retrying");
                     } else if should_fall_back(&payload, &e) {
                         // markdown ブロックが attachment 内で使えるか、本文が
@@ -559,6 +568,9 @@ impl Message {
                         warn!(channel, error = %e, "POST rejected; falling back");
                         payload = payload.into_text_fallback();
                         degraded = true;
+                        // 上限は payload ごとに数える。別のものを送るので、
+                        // ブロックで使った分を引き継がない
+                        retries = 0;
                     } else {
                         // 諦めるが無音にはしない。channel と link が残っていれば
                         // 落ちた通知を後から追える。
@@ -568,8 +580,6 @@ impl Message {
                 }
             }
         }
-
-        error!(channel, "POST gave up: too many attempts");
     }
 }
 
@@ -1125,9 +1135,34 @@ mod tests {
 
         assert_eq!(
             got.lock().unwrap().len(),
-            MAX_ATTEMPTS,
+            MAX_RETRIES + 1,
             "上限を超えて投げている"
         );
+    }
+
+    /// 上限まで送り直した後にブロックを拒否されても、退避先を送ること。
+    ///
+    /// 回数の上限を「送った回数」で数えると、退避先を作った直後に打ち切って
+    /// 通知が消える。
+    #[actix_web::test]
+    async fn a_fallback_is_sent_even_after_the_retry_limit() {
+        let refused = serde_json::json!({ "ok": false, "error": "service_unavailable" });
+        let (base, got, _ctypes) = spawn_slack(vec![
+            refused.clone(),
+            refused,
+            serde_json::json!({ "ok": false, "error": "internal_error" }),
+        ]);
+
+        message(blocks("## body", Some("*Assignees*: sksat")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), MAX_RETRIES + 2, "退避先を送っていない");
+
+        let a = &got[got.len() - 1]["attachments"][0];
+        assert_eq!(a["text"], "*Assignees*: sksat", "退避先になっていない: {a}");
+        assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
     }
 
     /// blocks 由来でないエラーでは再送しないこと。
