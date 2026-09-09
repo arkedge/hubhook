@@ -116,6 +116,16 @@ fn with_assignees(body: &str, line: Option<String>) -> String {
 /// GitHub の本文を mrkdwn に変換して入れる。attachment の中では `blocks` が
 /// 一切通らない (`markdown` は `internal_error`、`rich_text` と `section` は
 /// `invalid_attachments`) ので、色バーを残すにはこの形しかない。
+///
+/// 長さでは切らない。Slack は 40,000 文字を超えたメッセージを切る
+/// (`chat.postMessage` のリファレンス) ので、それを超える本文では末尾の
+/// Assignees が消えることがある。escape で `&` が `&amp;` になる分だけ
+/// 変換後は伸びるが、普通の文では 1% も増えないので 39,000 文字ほどの本文が
+/// 必要になる。
+///
+/// こちらで切らないのは、切る位置が `<url|label>` やコードフェンスの途中に
+/// なると記法が壊れるため。閉じないフェンスは以降の本文と Assignees を
+/// 飲み込むので、切られるより悪い。
 fn body_text(body: &str, assignees: &[github::common::User]) -> Option<String> {
     let body = crate::mrkdwn::from_markdown(body);
     let text = with_assignees(&body, assignees_line(assignees, LinkStyle::Mrkdwn, "*"));
