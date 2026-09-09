@@ -54,6 +54,11 @@ GitHub の webhook 配信タイムアウト (10 秒) を超え、GitHub が再�
 (従来の表現なので、長い本文は Slack 側で畳まれる)。Slack は API エラーも
 HTTP 200 + `ok: false` で返すので、応答本文を見て判定している。
 
+リポジトリ名とアカウント名はリンクにする。リンクが unfurl されて縦に
+伸びないよう、post 時に `unfurl_links` / `unfurl_media` を切っている。
+Assignees は `Assignees: a, b, c` の 1 行にまとめる (1 人 1 行だと縦に
+伸びて本文が見えなくなる)。
+
 ### Notified events
 
 `X-GitHub-Event` のうち以下を扱う。
