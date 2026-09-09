@@ -74,7 +74,7 @@ fn is_retriable(error: &str) -> bool {
 /// `chat.postMessage` の応答。
 ///
 /// Slack は API エラーも HTTP 200 で返し、本文の `ok` で示す。
-/// ステータスだけ見ていると `invalid_blocks` などに気付けない。
+/// ステータスだけ見ていると `channel_not_found` などに気付けない。
 #[derive(Debug, Deserialize)]
 struct PostResponse {
     ok: bool,
