@@ -1157,10 +1157,10 @@ mod tests {
         assert_eq!(from_markdown("<b>&#38;lt;</b>"), "&amp;lt;");
     }
 
-    /// 内側の ``` でフェンスを開かせないこと。
+    /// 内側の ``` を無効化して、外側の 1 組だけを残すこと。
     ///
-    /// 囲まずに出すと、その ``` が Slack のフェンスとして読まれて以降の
-    /// 本文まで飲み込む。
+    /// 内側をそのまま出すと、その ``` が Slack のフェンスとして読まれて
+    /// 以降の本文まで飲み込む。
     #[test]
     fn inner_fences_are_neutralized() {
         let out = from_markdown("````\n```\ninner\n```\n````\n\nafter");

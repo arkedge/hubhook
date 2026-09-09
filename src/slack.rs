@@ -244,8 +244,8 @@ pub struct Footer {
 
 /// attachment の本文。
 ///
-/// `blocks` と `text` の**どちらか一方**しか送らない。両方入れると Slack が
-/// 両方を描画して本文が二重に出るので、型で片方に限っている
+/// 本文があれば `text` に入れ、無ければ何も入れない。空の `text` を送ると
+/// `no_text` で拒否されるので、「入れない」を型で表す
 /// (`skip_serializing_if` は自分の値しか見られず、兄弟フィールドの有無では
 /// 分岐できない)。
 #[derive(Debug, Serialize)]
