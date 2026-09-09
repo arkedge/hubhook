@@ -25,6 +25,8 @@
 //!
 //! - markdown で escape した記号 (`\*literal\*`) は escape が外れた状態で
 //!   渡ってくるため、Slack が装飾として解釈する
+//! - `<code>` の中身は markdown として解釈される。GitHub も同じなので描画は
+//!   一致するが、monospace のスタイルは失う
 
 use pulldown_cmark::{BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -415,21 +417,18 @@ impl Renderer {
                 self.pending_href = attr(tag, "href").filter(|u| is_absolute(u));
                 String::new()
             }
+            // 属性値は HTML のまま返す。文字参照を戻すのは html_text の最後の
+            // 1 回だけで、ここで戻すと二重になる。escape も呼び出し側が行う。
             "a" => match self.pending_href.take() {
-                // 属性値は HTML なので、`?a=1&amp;b=2` のように文字参照が
-                // 入っている。戻さずに escape すると `&amp;amp;` になって
-                // パラメータ名が変わる。
-                Some(url) => format!(" ({})", escape_url(&decode_refs(&url))),
+                Some(url) => format!(" ({url})"),
                 None => String::new(),
             },
             "img" => {
                 let alt = attr(tag, "alt").unwrap_or_default();
                 if !alt.trim().is_empty() {
-                    return decode_refs(&alt);
+                    return alt;
                 }
-                attr(tag, "src")
-                    .map(|s| decode_refs(&s))
-                    .unwrap_or_default()
+                attr(tag, "src").unwrap_or_default()
             }
             _ => String::new(),
         }
@@ -999,6 +998,21 @@ mod tests {
 
         assert!(out.contains("a=1&amp;b=2"), "二重になっている: {out:?}");
         assert!(!out.contains("amp;amp;"), "二重になっている: {out:?}");
+    }
+
+    /// `<code>` の中身は markdown として解釈されること。
+    ///
+    /// GitHub も inline HTML の中の markdown を処理するので、描画結果は
+    /// 一致する。monospace のスタイルだけ失う。
+    #[test]
+    fn markdown_inside_raw_html_is_still_parsed() {
+        assert_eq!(from_markdown("<code>*x*</code>"), "_x_");
+    }
+
+    /// 属性値の文字参照を二重に戻さないこと。
+    #[test]
+    fn image_attributes_are_decoded_once() {
+        assert_eq!(from_markdown(r#"<img src="x" alt="&amp;lt;">"#), "&amp;lt;");
     }
 
     /// アンカーや相対パスをリンク記法にしないこと。
