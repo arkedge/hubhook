@@ -27,6 +27,33 @@ Edit config.json.
 |reviewer|review を依頼された user の login、または team の slug|
 |review_state|`pull_request_review` の state (`approved` / `changes_requested` / `commented`)|
 
+### Message appearance
+
+本文は Slack の **markdown ブロック**として送る。attachment の `text` は
+mrkdwn (Slack 独自記法) なので、GitHub の本文をそのまま貼ると `##` が
+そのまま表示され、`*x*` の強調も入れ替わる (GitHub は斜体、Slack は太字)。
+markdown ブロックは本物の Markdown を解釈するので、見出し・表・タスクリスト・
+コードブロックまでそのまま渡せる。色バーを残すため attachment の中に置いている。
+
+GFM 固有の参照記法 (`#123` の issue リンク、`@user`、コミット SHA) は
+Markdown の仕様外なのでリンクにはならない。
+
+本文が無い場合はブロックを作らない。空の `text` を持つブロックは
+`invalid_blocks` で拒否され、通知そのものが飛ばなくなる。
+
+markdown ブロックには payload 全体で 12,000 文字の上限があるが、こちらでは
+切り詰めない。拒否された場合は attachment の `text` に切り替えて再送する
+(再送するのは blocks 由来と思われるエラーで、かつ payload が blocks を
+持つときのみ。認証やチャンネルの問題は blocks を外しても直らず、blocks が
+無ければ外しても payload が変わらないので、どちらも無駄打ちになる)。
+再送も含めて Slack への POST は 1 つの予算 (5 秒) に収める。取り直すと
+GitHub の webhook 配信タイムアウト (10 秒) を超え、GitHub が再送して通知が
+重複する。
+`text` は mrkdwn なので、ブロックの Markdown を流用せず構築時に別に作る
+(流用すると `**太字**` や `[name](url)` が解釈されない)
+(従来の表現なので、長い本文は Slack 側で畳まれる)。Slack は API エラーも
+HTTP 200 + `ok: false` で返すので、応答本文を見て判定している。
+
 ### Notified events
 
 `X-GitHub-Event` のうち以下を扱う。

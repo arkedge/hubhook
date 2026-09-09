@@ -45,7 +45,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 展開のあとに channel ごとの Slack POST が直列で走るため、channel が
 /// 複数あると合計は 10 秒を超えうる。端から端まで縛るには、
 /// 1 つの締め切りを配信まで通すか、配信を webhook の応答から外す必要がある。
-/// ここでは「展開 + Slack 1 回」が 10 秒に収まる値にしてある。
+/// ここでは「展開 + Slack への POST」が 10 秒に収まる値にしてある。
 const TOTAL_EXPAND_BUDGET: Duration = Duration::from_secs(3);
 
 /// GitHub の org / user 名の最大長。
@@ -1013,7 +1013,8 @@ mod tests {
     fn expand_budget_leaves_room_for_slack_post() {
         const GITHUB_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
-        assert!(TOTAL_EXPAND_BUDGET + crate::slack::POST_TIMEOUT < GITHUB_WEBHOOK_TIMEOUT);
+        // Slack 側の予算は退避のための再送も含む
+        assert!(TOTAL_EXPAND_BUDGET + crate::slack::POST_BUDGET < GITHUB_WEBHOOK_TIMEOUT);
         // 1 リクエストのタイムアウトが予算より長いと予算が意味を持たない
         assert!(API_TIMEOUT <= TOTAL_EXPAND_BUDGET);
     }
