@@ -97,38 +97,47 @@ fn is_hopeless(error: &str) -> bool {
     )
 }
 
-/// 一時的だとドキュメントが言っているエラー。
+/// 同じ payload を送り直してよいエラー。
 ///
-/// これらは payload の中身と無関係なので、同じものを送り直しても通り得る。
-fn is_transient(error: &str) -> bool {
-    matches!(
-        error,
-        "internal_error" | "fatal_error" | "request_timeout" | "service_unavailable"
-    )
+/// `chat.postMessage` に冪等キーは無いので、既に投稿されている可能性がある
+/// なら送り直せない。`internal_error` と `fatal_error` はドキュメントに
+/// "It's possible some aspect of the operation succeeded before the error was
+/// raised." と書かれているので除く。送り直すと通知が重複する。
+///
+/// `request_timeout` は名前に反して "the POST data was either missing or
+/// truncated" で、送った内容の不備なので送り直しても直らない。
+///
+/// 残るのは `service_unavailable` ("The service is temporarily unavailable")
+/// だけ。処理に入る前に断られているので、同じものを送ってよい。
+///
+/// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
+fn is_retriable(error: &str) -> bool {
+    matches!(error, "service_unavailable")
 }
 
-/// 退避して再送すべきか。
+/// 退避すべきか。ブロックを外した別の payload を送る。
 ///
-/// blocks が無ければ外しても何も変わらないので送り直さない。それ以外は
-/// [`is_hopeless`] に無いエラーなら再送する。
+/// 拒否されたときは投稿されていないので、別のものを送っても重複しない。
+/// blocks を持たない payload は外しても変わらないので送らない。
 ///
-/// 以前は「blocks 由来と分かっているエラー」を列挙していたが、attachment の
-/// 中で markdown ブロックが使えるかはドキュメントに記載が無く、拒否された
-/// ときに返るエラーも分からない。列挙から漏れたエラーで本文のある通知が
-/// 無言で落ちるため、判断を反転させる。漏れたときの損は API 1 回分で、
-/// [`POST_BUDGET`] の中に収まる。
+/// どのエラーで拒否されるかはドキュメントに書かれていないので、[`is_hopeless`]
+/// に無いものは退避してみる。漏れたときの損は API 1 回分で、[`POST_BUDGET`]
+/// の中に収まる。
 ///
-/// `internal_error` はドキュメントで
-/// "The server could not complete your operation(s) without encountering an
-/// error, likely due to a transient issue on our end." とされているので、
-/// まさに再送すべき側。
-fn should_retry(payload: &MessagePayload, error: &str) -> bool {
-    // 再送する理由は 2 つあり、必要な条件が違う。
-    //
-    // - 一時的な失敗なら、同じものを送り直せば通る。payload によらない
-    // - blocks が受け付けられないなら、外して送れば通るかもしれない。
-    //   blocks を持たない payload では退避しても何も変わらない
-    is_transient(error) || (payload.has_blocks() && !is_hopeless(error))
+/// `internal_error` と `fatal_error` は "It's possible some aspect of the
+/// operation succeeded before the error was raised." とされているので、
+/// 厳密には投稿済みかどうか分からない。それでも退避する。
+///
+/// - attachment の中の markdown ブロックは、最小の payload でも
+///   `internal_error` で拒否される (実測)
+/// - その状態では本文のある通知が 1 通も届かなかった。部分成功していたなら
+///   届いていたはずなので、この payload の形では拒否を意味する
+/// - 外すと本文のある通知が全部落ちる。理論上の重複より、確実な取りこぼしの
+///   方が損が大きい
+///
+/// ブロックを使わなくなればこの判断自体が要らなくなる。
+fn should_fall_back(payload: &MessagePayload, error: &str) -> bool {
+    payload.has_blocks() && !is_hopeless(error)
 }
 
 /// `chat.postMessage` の応答。
@@ -508,15 +517,19 @@ impl Message {
                 return;
             }
             Err(PostError::Api(e)) => {
-                if !should_retry(&payload, &e) {
+                if should_fall_back(&payload, &e) {
+                    // markdown ブロックが attachment 内で使えるか、本文が上限を
+                    // 超えたかはこちらで判定できない。拒否されたら、従来の
+                    // 表現 (attachment の text) に落として送る。
+                    warn!(channel, error = %e, "POST rejected; falling back");
+                } else if is_retriable(&e) {
+                    warn!(channel, error = %e, "POST failed; retrying");
+                } else {
+                    // 諦めるが無音にはしない。channel と link が残っていれば
+                    // 落ちた通知を後から追える。
                     error!(channel, error = %e, "POST failed");
                     return;
                 }
-
-                // markdown ブロックが attachment 内で使えるか、本文が上限を
-                // 超えたかはこちらで判定できない。blocks 由来と思われる
-                // エラーなら、従来の表現 (attachment の text) で再送する。
-                warn!(channel, error = %e, "POST rejected; retrying without markdown blocks");
             }
         }
 
@@ -830,22 +843,22 @@ mod tests {
         );
     }
 
-    /// blocks を持ち、かつ直らないと分かっていないエラーのときだけ再送すること。
+    /// blocks を持つときだけ退避すること。
     ///
-    /// blocks が無い payload は退避しても変わらないので、2 回目も同じエラーで
-    /// 確実に失敗する。
+    /// blocks が無い payload は外しても変わらないので、送り直しても同じ
+    /// エラーで失敗する。
     #[test]
-    fn retry_needs_blocks_and_a_fixable_error() {
+    fn falling_back_needs_blocks() {
         let with_blocks = payload(blocks("## body", None));
 
-        assert!(should_retry(&with_blocks, "invalid_blocks"));
+        assert!(should_fall_back(&with_blocks, "invalid_blocks"));
         assert!(
-            should_retry(&with_blocks, "internal_error"),
-            "transient なエラーで再送していない"
+            should_fall_back(&with_blocks, "internal_error"),
+            "拒否されたのに退避していない"
         );
         assert!(
-            !should_retry(&with_blocks, "invalid_auth"),
-            "直らないエラーで再送している"
+            !should_fall_back(&with_blocks, "invalid_auth"),
+            "直らないエラーで退避している"
         );
 
         for body in [
@@ -853,9 +866,36 @@ mod tests {
             Body::new(vec![], None),
         ] {
             assert!(
-                !should_retry(&payload(body), "invalid_blocks"),
-                "blocks が無いのに再送している"
+                !should_fall_back(&payload(body), "invalid_blocks"),
+                "blocks が無いのに退避している"
             );
+        }
+    }
+
+    /// 同じ payload を送り直してよいエラーだけリトライすること。
+    ///
+    /// `internal_error` と `fatal_error` は「一部が既に成功している可能性が
+    /// ある」とドキュメントにあるので、送り直すと通知が重複する。
+    #[test]
+    fn only_safe_errors_are_retried() {
+        assert!(
+            is_retriable("service_unavailable"),
+            "処理前に断られているので送り直せる"
+        );
+
+        for e in [
+            // 一部が投稿済みの可能性がある。送り直すと重複する
+            "internal_error",
+            "fatal_error",
+            // 送った内容の不備。同じものを送っても直らない
+            "request_timeout",
+            "invalid_arguments",
+            // 宛先・権限・流量
+            "invalid_auth",
+            "channel_not_found",
+            "ratelimited",
+        ] {
+            assert!(!is_retriable(e), "{e} は送り直すべきでない");
         }
     }
 
@@ -969,9 +1009,9 @@ mod tests {
         assert!(a.get("blocks").is_none(), "blocks が残っている: {a}");
     }
 
-    /// 一時的なエラーでも退避して再送すること。
+    /// 拒否されたら退避して送り直すこと。
     ///
-    /// 判定を反転させた狙いはここにある。`should_retry` の単体テストだけでは
+    /// 単体テストだけでは
     /// 「1 回目の応答を読んで 2 回目を投げる」という手順自体が壊れても
     /// 気付けないので、HTTP を通して確かめる。
     #[actix_web::test]
@@ -996,7 +1036,7 @@ mod tests {
     /// 送り直して通る。ここを落とすと本文の無い通知が消える。
     #[actix_web::test]
     async fn blockless_payloads_are_retried_on_transient_errors() {
-        let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
+        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
 
         message(Body::new(vec![], None))
             .post_message_to(&base, "token", "channel", None)
