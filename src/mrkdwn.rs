@@ -49,70 +49,6 @@ fn escape_url(url: &str) -> String {
         .replace('>', "%3E")
 }
 
-/// HTML のタグとコメントを落として、見える文字だけ返す。
-///
-/// issue のテンプレートは `<!-- 説明 -->` や `<details>` を含む。タグを
-/// そのまま出すと読めないが、イベントごと捨てると中の文字まで消える。
-///
-/// タグの終わりは最初の `>` ではない。`<span title="a > b">` のように属性値の
-/// 中に `>` が入るので、引用符の中は読み飛ばす。
-fn strip_tags(html: &str) -> String {
-    let mut out = String::new();
-    let bytes = html.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // コメントは中身ごと落とす
-        if html[i..].starts_with("<!--") {
-            match html[i + 4..].find("-->") {
-                Some(j) => i += 4 + j + 3,
-                // 閉じていないので、以降はコメントの途中とみなして捨てる
-                None => break,
-            }
-            continue;
-        }
-
-        if bytes[i] == b'<' {
-            let mut j = i + 1;
-            let mut quote: Option<u8> = None;
-
-            while j < bytes.len() {
-                let c = bytes[j];
-                // `"` `'` `>` は ASCII なので、UTF-8 の後続バイトと衝突しない
-                match quote {
-                    Some(q) if c == q => quote = None,
-                    Some(_) => {}
-                    None if c == b'"' || c == b'\'' => quote = Some(c),
-                    None if c == b'>' => break,
-                    None => {}
-                }
-                j += 1;
-            }
-
-            if j >= bytes.len() {
-                // 閉じていないので、以降はタグの途中とみなして捨てる
-                break;
-            }
-
-            // 区切りを意味するタグは、落とすと語がくっつく (`a<br>b` -> `ab`)
-            if let Some(sep) = tag_separator(&html[i + 1..j]) {
-                out.push(sep);
-            }
-
-            i = j + 1;
-            continue;
-        }
-
-        let ch = html[i..].chars().next().expect("char boundary");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-
-    // ここで trim すると `<br>` 単独の改行が消える。全体の trim は
-    // from_markdown の最後で行う
-    decode_refs(&out)
-}
-
 /// 落とすと語がくっついてしまうタグに対して、代わりに置く文字。
 ///
 /// `<br>` と、段落・箇条書き・表の行の閉じタグは改行にする。表のセルは
@@ -137,6 +73,9 @@ fn tag_separator(tag: &str) -> Option<char> {
         "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => {
             Some('\n')
         }
+        // <details><summary>Title</summary>Body</details> が TitleBody に
+        // ならないようにする
+        "summary" | "details" => Some('\n'),
         "td" | "th" => Some(' '),
         _ => None,
     }
@@ -236,6 +175,12 @@ struct Renderer {
     links: Vec<String>,
     /// 組み立て中の表
     table: Option<Table>,
+    /// HTML コメントの途中か。
+    ///
+    /// pulldown-cmark は HTML ブロックを行ごとに別のイベントで渡すので、
+    /// `<!--` と `-->` が別のイベントに分かれる。イベント単位で見ると
+    /// 途中の行が本文として出てしまう。
+    in_html_comment: bool,
     /// リスト項目の印を書いた直後か。
     ///
     /// 項目の中に段落が来ると (blank line を含むリスト) 段落として空行を
@@ -256,6 +201,7 @@ impl Renderer {
             lists: Vec::new(),
             links: Vec::new(),
             table: None,
+            in_html_comment: false,
             at_item_start: false,
         }
     }
@@ -293,6 +239,77 @@ impl Renderer {
         if !cur.is_empty() && !cur.ends_with('\n') {
             self.push("\n");
         }
+    }
+
+    /// HTML からタグとコメントを落として、見える文字だけ返す。
+    ///
+    /// issue のテンプレートは `<!-- 説明 -->` や `<details>` を含む。タグを
+    /// そのまま出すと読めないが、イベントごと捨てると中の文字まで消える。
+    ///
+    /// タグの終わりは最初の `>` ではない。`<span title="a > b">` のように
+    /// 属性値の中に `>` が入るので、引用符の中は読み飛ばす。
+    fn html_text(&mut self, html: &str) -> String {
+        let mut out = String::new();
+        let bytes = html.as_bytes();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            // コメントの中身は落とす。前のイベントから続いていることもある
+            if self.in_html_comment {
+                match html[i..].find("-->") {
+                    Some(j) => {
+                        i += j + 3;
+                        self.in_html_comment = false;
+                    }
+                    // まだコメントの中。次のイベントへ持ち越す
+                    None => return decode_refs(&out),
+                }
+                continue;
+            }
+
+            if html[i..].starts_with("<!--") {
+                self.in_html_comment = true;
+                i += 4;
+                continue;
+            }
+
+            if bytes[i] == b'<' {
+                let mut j = i + 1;
+                let mut quote: Option<u8> = None;
+
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    // `"` `'` `>` は ASCII なので UTF-8 の後続バイトと衝突しない
+                    match quote {
+                        Some(q) if c == q => quote = None,
+                        Some(_) => {}
+                        None if c == b'"' || c == b'\'' => quote = Some(c),
+                        None if c == b'>' => break,
+                        None => {}
+                    }
+                    j += 1;
+                }
+
+                if j >= bytes.len() {
+                    // 閉じていないので、以降はタグの途中とみなして捨てる
+                    break;
+                }
+
+                // 区切りを意味するタグは、落とすと語がくっつく (`a<br>b` -> `ab`)
+                if let Some(sep) = tag_separator(&html[i + 1..j]) {
+                    out.push(sep);
+                }
+
+                i = j + 1;
+                continue;
+            }
+
+            let ch = html[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+
+        decode_refs(&out)
     }
 
     /// ブロックの始まり。段落の区切りを入れる。
@@ -350,7 +367,7 @@ pub fn from_markdown(md: &str) -> String {
             // タグは落とすが中の文字は残す。pulldown-cmark は HTML ブロックを
             // まとめて 1 つのイベントで渡すので、丸ごと捨てると本文が消える
             Event::Html(h) | Event::InlineHtml(h) => {
-                let visible = strip_tags(&h);
+                let visible = r.html_text(&h);
                 if !visible.is_empty() {
                     let escaped = escape(&visible);
                     r.push(&escaped);
@@ -442,15 +459,12 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             let inner = r.close();
             let inner = inner.trim();
 
-            // 中身が既に太字なら二重にしない。`# **重要**` が `**重要**` に
-            // なると、mrkdwn では太字として解釈されない。
-            //
-            // `*a* *b*` のように太字が 2 つ並ぶ場合も囲まないままにする。
+            // 中身に太字が混ざっていたら囲まない。`# **重要** の話` を囲むと
+            // `**重要* の話*` になって区切りが重なり、mrkdwn として壊れる。
             // 見出し全体の太字は失うが、記法が壊れるより良い。
-            let already_bold = inner.len() > 1 && inner.starts_with('*') && inner.ends_with('*');
             if inner.is_empty() {
                 // 空の見出しで `**` を作らない
-            } else if already_bold {
+            } else if inner.contains('*') {
                 r.push(inner);
             } else {
                 r.push(&format!("*{inner}*"));
@@ -561,9 +575,8 @@ fn render_table(rows: &[Vec<String>]) -> String {
         let cells: Vec<String> = row
             .iter()
             .map(|c| {
-                // 中身が既に太字なら二重にしない (見出しと同じ理由)
-                let already_bold = c.len() > 1 && c.starts_with('*') && c.ends_with('*');
-                if i == 0 && !c.is_empty() && !already_bold {
+                // 中身に太字が混ざっていたら囲まない (見出しと同じ理由)
+                if i == 0 && !c.is_empty() && !c.contains('*') {
                     format!("*{c}*")
                 } else {
                     c.clone()
@@ -811,6 +824,39 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 複数行の HTML コメントの中身を漏らさないこと。
+    ///
+    /// pulldown-cmark は HTML ブロックを行ごとに別のイベントで渡すので、
+    /// イベント単位で見ると途中の行が本文として出てしまう。
+    #[test]
+    fn multiline_html_comments_are_dropped() {
+        let out = from_markdown("<!--\nprivate template guidance\n-->\n\ntext");
+
+        assert!(!out.contains("guidance"), "コメントが漏れている: {out:?}");
+        assert!(out.contains("text"), "本文が消えている: {out:?}");
+    }
+
+    /// details と summary の中身をくっつけないこと。
+    #[test]
+    fn details_and_summary_are_separated() {
+        let out = from_markdown("<details><summary>Title</summary>Body</details>");
+
+        assert!(!out.contains("TitleBody"), "くっついている: {out:?}");
+        assert!(out.contains("Title"), "{out:?}");
+        assert!(out.contains("Body"), "{out:?}");
+    }
+
+    /// 一部だけ太字の見出しを囲まないこと。
+    ///
+    /// 囲むと `**重要* の話*` のように区切りが重なって壊れる。
+    #[test]
+    fn headings_with_partial_bold_are_not_wrapped() {
+        assert_eq!(
+            from_markdown("# **Important** details"),
+            "*Important* details"
+        );
     }
 
     /// 表のセルを落として語をくっつけないこと。
