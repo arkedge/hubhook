@@ -81,7 +81,8 @@ fn tag_separator(tag: &str) -> Option<char> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if name == "br" {
+    // 閉じタグを持たないので、開きタグで区切る
+    if name == "br" || name == "hr" {
         return Some('\n');
     }
     if !tag.starts_with('/') {
@@ -92,12 +93,45 @@ fn tag_separator(tag: &str) -> Option<char> {
         "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => {
             Some('\n')
         }
+        // 落とすと前後の塊がくっつく。`<pre>code</pre><p>after</p>` が
+        // `codeafter` になる
+        "pre" | "dl" | "dt" | "dd" | "ul" | "ol" | "table" | "thead" | "tbody" => Some('\n'),
         // <details><summary>Title</summary>Body</details> が TitleBody に
         // ならないようにする
         "summary" | "details" => Some('\n'),
         "td" | "th" => Some(' '),
         _ => None,
     }
+}
+
+/// `<` がタグを開くか。
+///
+/// HTML では `<` の次が英字・`/`・`!`・`?` のどれかでないとタグ名を始められず、
+/// `<` は文字として表示される。`a < b > c` の `< b >` はタグではないので、
+/// タグとして落とすと本文が消える。
+fn opens_tag(next: Option<&u8>) -> bool {
+    next.is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'))
+}
+
+/// タグを閉じる `>` の位置。
+///
+/// 引用符の中の `>` は属性値の一部なのでタグの終わりではない。閉じていなければ
+/// `None` で、その場合は次のイベントに続いている。
+fn scan_tag(s: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+
+    // `"` `'` `>` は ASCII なので UTF-8 の後続バイトと衝突しない
+    for (i, &c) in s.as_bytes().iter().enumerate().skip(1) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'>' => return Some(i),
+            None => {}
+        }
+    }
+
+    None
 }
 
 /// HTML の文字参照を戻す。
@@ -284,6 +318,8 @@ struct Renderer {
     /// 項目の中に段落が来ると (blank line を含むリスト) 段落として空行を
     /// 入れてしまい、`• ` と本文が離れてしまう。
     after_marker: bool,
+    /// 複数行に分かれたタグの、まだ閉じていない部分
+    pending_tag: Option<String>,
 }
 
 #[derive(Default)]
@@ -302,6 +338,7 @@ impl Renderer {
             pending_href: None,
             in_html_comment: false,
             after_marker: false,
+            pending_tag: None,
         }
     }
 
@@ -347,6 +384,18 @@ impl Renderer {
     ///
     /// タグの終わりは最初の `>` ではない。`<span title="a > b">` のように
     /// 属性値の中に `>` が入るので、引用符の中は読み飛ばす。
+    /// タグを落として、落とすと消えてしまうものだけ残す。
+    fn drop_tag(&mut self, tag: &str, out: &mut String) {
+        // 区切りを意味するタグは、落とすと語がくっつく (`a<br>b` -> `ab`)
+        if let Some(sep) = tag_separator(tag) {
+            out.push(sep);
+        }
+
+        // タグを落とすと行き先まで消える。`<img>` は中に文字が無いので
+        // alt か src を出さないと本文が空になる。
+        out.push_str(&self.html_target(tag));
+    }
+
     fn html_text(&mut self, html: &str) -> String {
         let mut out = String::new();
         let bytes = html.as_bytes();
@@ -366,46 +415,38 @@ impl Renderer {
                 continue;
             }
 
+            // タグが前のイベントで閉じていなかった場合、続きを足して閉じるまで待つ
+            if let Some(partial) = self.pending_tag.take() {
+                let combined = format!("{partial}{}", &html[i..]);
+
+                let Some(end) = scan_tag(&combined) else {
+                    self.pending_tag = Some(combined);
+                    return decode_refs(&out);
+                };
+
+                self.drop_tag(&combined[1..end], &mut out);
+
+                // partial に閉じる `>` は無かったので end は partial の外にある
+                i += end + 1 - partial.len();
+                continue;
+            }
+
             if html[i..].starts_with("<!--") {
                 self.in_html_comment = true;
                 i += 4;
                 continue;
             }
 
-            if bytes[i] == b'<' {
-                let mut j = i + 1;
-                let mut quote: Option<u8> = None;
+            if bytes[i] == b'<' && opens_tag(bytes.get(i + 1)) {
+                let Some(end) = scan_tag(&html[i..]) else {
+                    // 閉じていないので次のイベントに続く。属性が複数行に
+                    // 分かれているだけなので、捨てずに持ち越す
+                    self.pending_tag = Some(html[i..].to_string());
+                    return decode_refs(&out);
+                };
 
-                while j < bytes.len() {
-                    let c = bytes[j];
-                    // `"` `'` `>` は ASCII なので UTF-8 の後続バイトと衝突しない
-                    match quote {
-                        Some(q) if c == q => quote = None,
-                        Some(_) => {}
-                        None if c == b'"' || c == b'\'' => quote = Some(c),
-                        None if c == b'>' => break,
-                        None => {}
-                    }
-                    j += 1;
-                }
-
-                if j >= bytes.len() {
-                    // 閉じていないので、以降はタグの途中とみなして捨てる
-                    break;
-                }
-
-                let tag = &html[i + 1..j];
-
-                // 区切りを意味するタグは、落とすと語がくっつく (`a<br>b` -> `ab`)
-                if let Some(sep) = tag_separator(tag) {
-                    out.push(sep);
-                }
-
-                // タグを落とすと行き先まで消える。`<img>` は中に文字が無いので
-                // alt か src を出さないと本文が空になる。
-                out.push_str(&self.html_target(tag));
-
-                i = j + 1;
+                self.drop_tag(&html[i + 1..i + end], &mut out);
+                i += end + 1;
                 continue;
             }
 
@@ -982,6 +1023,41 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 複数行に分かれたタグの属性が本文に出ないこと。
+    ///
+    /// HTML ブロックは pulldown-cmark が行ごとにイベントを分けるので、閉じて
+    /// いないタグを持ち越さないと 2 行目以降が文字として出る。
+    #[test]
+    fn a_tag_split_across_lines_is_dropped_whole() {
+        let out = from_markdown("<div\n class=\"foo\">\nvisible\n</div>\nafter");
+
+        assert!(!out.contains("class"), "属性が出ている: {out:?}");
+        assert!(out.contains("visible"), "中身が消えている: {out:?}");
+        assert!(out.ends_with("after"), "後ろが消えている: {out:?}");
+    }
+
+    /// 複数行に分かれた `<img>` からも alt を出すこと。
+    #[test]
+    fn a_multiline_img_keeps_its_alt() {
+        assert_eq!(from_markdown("<img\n alt=\"shot\"\n src=\"x\">"), "shot");
+    }
+
+    /// タグを開かない `<` は文字として残すこと。
+    ///
+    /// HTML でも `<` の次が英字などでなければタグにならないので、`a < b > c`
+    /// はそのまま表示される。タグとして落とすと本文が消える。
+    #[test]
+    fn a_less_than_that_opens_no_tag_is_kept() {
+        assert_eq!(from_markdown("<div>a < b > c</div>"), "a &lt; b &gt; c");
+    }
+
+    /// ブロック要素を落としても前後がくっつかないこと。
+    #[test]
+    fn block_elements_are_separated() {
+        assert_eq!(from_markdown("<pre>code</pre><p>after</p>"), "code\nafter");
+        assert_eq!(from_markdown("<dl><dt>A</dt><dd>B</dd></dl>"), "A\nB");
     }
 
     /// 脚注の定義を落とさないこと。
