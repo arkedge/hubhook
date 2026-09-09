@@ -376,7 +376,7 @@ impl Message {
         // 打ち切る。予算だけだと、応答が速い相手に対して投げ続けてしまう。
         //
         // 表現が 1 つになったので退避は無く、送るのは常に同じ payload。
-        for _ in 0..=MAX_RETRIES {
+        for attempt in 0..=MAX_RETRIES {
             let Some(left) = remaining(deadline, Instant::now()) else {
                 error!(channel, link, "POST gave up: out of budget");
                 return;
@@ -400,6 +400,13 @@ impl Message {
                         // 落ちた通知を後から追える。
                         error!(channel, link, error = %e, "POST failed");
                         return;
+                    }
+
+                    // 次の試行が無いのに retrying と出すと、送らない
+                    // リクエストを送ると言うことになる。打ち切りはループの
+                    // 後の error で出す
+                    if attempt == MAX_RETRIES {
+                        break;
                     }
 
                     warn!(channel, error = %e, "POST failed; retrying");
