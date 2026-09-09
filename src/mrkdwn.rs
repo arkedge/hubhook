@@ -53,36 +53,73 @@ fn escape_url(url: &str) -> String {
 ///
 /// issue のテンプレートは `<!-- 説明 -->` や `<details>` を含む。タグを
 /// そのまま出すと読めないが、イベントごと捨てると中の文字まで消える。
+///
+/// タグの終わりは最初の `>` ではない。`<span title="a > b">` のように属性値の
+/// 中に `>` が入るので、引用符の中は読み飛ばす。
 fn strip_tags(html: &str) -> String {
     let mut out = String::new();
-    let mut rest = html;
+    let bytes = html.as_bytes();
+    let mut i = 0;
 
-    loop {
+    while i < bytes.len() {
         // コメントは中身ごと落とす
-        if let Some(i) = rest.find("<!--") {
-            out.push_str(&rest[..i]);
-            match rest[i..].find("-->") {
-                Some(j) => rest = &rest[i + j + 3..],
-                None => return out.trim().to_string(),
+        if html[i..].starts_with("<!--") {
+            match html[i + 4..].find("-->") {
+                Some(j) => i += 4 + j + 3,
+                // 閉じていないので、以降はコメントの途中とみなして捨てる
+                None => break,
             }
             continue;
         }
 
-        match rest.find('<') {
-            None => {
-                out.push_str(rest);
-                return out.trim().to_string();
-            }
-            Some(i) => {
-                out.push_str(&rest[..i]);
-                match rest[i..].find('>') {
-                    Some(j) => rest = &rest[i + j + 1..],
-                    // 閉じていないので、以降はタグの途中とみなして捨てる
-                    None => return out.trim().to_string(),
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            let mut quote: Option<u8> = None;
+
+            while j < bytes.len() {
+                let c = bytes[j];
+                // `"` `'` `>` は ASCII なので、UTF-8 の後続バイトと衝突しない
+                match quote {
+                    Some(q) if c == q => quote = None,
+                    Some(_) => {}
+                    None if c == b'"' || c == b'\'' => quote = Some(c),
+                    None if c == b'>' => break,
+                    None => {}
                 }
+                j += 1;
             }
+
+            if j >= bytes.len() {
+                // 閉じていないので、以降はタグの途中とみなして捨てる
+                break;
+            }
+            i = j + 1;
+            continue;
         }
+
+        let ch = html[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
+
+    decode_refs(out.trim())
+}
+
+/// HTML の文字参照を戻す。
+///
+/// タグを外しただけの文字列には `&amp;` などが残っている。そのまま Slack 用に
+/// escape すると `&amp;amp;` になって、画面に `&amp;` と出てしまう。
+///
+/// `&amp;` を最後に処理するのが要点。先に戻すと `&amp;lt;` が `<` になって、
+/// 書き手が意図した「`&lt;` という文字列」が消える。
+fn decode_refs(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 /// mrkdwn のリンク。
@@ -652,6 +689,22 @@ mod tests {
             from_markdown("<table><tr><td>important</td></tr></table>").contains("important"),
             "HTML の表の中身が消えている"
         );
+    }
+
+    /// 属性値の中の `>` でタグを切らないこと。
+    #[test]
+    fn tag_attributes_may_contain_gt() {
+        assert_eq!(from_markdown(r#"<span title="a > b">text</span>"#), "text");
+    }
+
+    /// HTML の文字参照を二重に escape しないこと。
+    ///
+    /// タグを外した文字列には `&amp;` が残っているので、そのまま escape すると
+    /// 画面に `&amp;` と出る。
+    #[test]
+    fn html_character_references_are_decoded_once() {
+        assert_eq!(from_markdown("<b>A &amp; B</b>"), "A &amp; B");
+        assert_eq!(from_markdown("<b>&lt;tag&gt;</b>"), "&lt;tag&gt;");
     }
 
     /// HTML コメントは中身ごと落とすこと。

@@ -406,6 +406,9 @@ impl Message {
                 }
             }
         }
+
+        // 諦めたことが error で残らないと、落ちた通知に気付けない
+        error!(channel, link, "POST gave up: too many retries");
     }
 }
 
