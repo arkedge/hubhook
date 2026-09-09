@@ -955,6 +955,10 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             // 中身に太字が混ざっていたら囲まない。`# **重要** の話` を囲むと
             // `**重要* の話*` になって区切りが重なり、mrkdwn として壊れる。
             // 見出し全体の太字は失うが、記法が壊れるより良い。
+            // 項目の 2 つめ以降のブロックなら行頭を揃える。印の直後なら
+            // 行の途中なので何も入らない
+            r.line_pad();
+
             if inner.is_empty() {
                 // 空の見出しで `**` を作らない
             } else if inner.contains('*') {
@@ -997,28 +1001,25 @@ fn end(r: &mut Renderer, tag: TagEnd) {
                 return;
             }
 
-            // 項目の中の引用は、字下げを引用記法の前に付ける。付けないと
-            // 2 行目以降の ">" が行頭に来て、項目の外の引用に見える
-            let pad = r.item_pads.last().cloned().unwrap_or_default();
-
             // 引用記法の ">" は生で置く。`&gt;` にすると Slack は引用として
             // 解釈せず、リテラルの ">" を表示する
             let quoted = inner
                 .trim_end()
                 .lines()
-                .enumerate()
-                .map(|(i, l)| {
-                    // 1 行目は印の直後なので字下げしない
-                    let pad = if i == 0 { "" } else { pad.as_str() };
+                .map(|l| {
                     if l.is_empty() {
-                        format!("{pad}>")
+                        ">".to_string()
                     } else {
-                        format!("{pad}> {l}")
+                        format!("> {l}")
                     }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            r.push(&quoted);
+
+            // 字下げは引用記法の前に付ける。中に入れると `> ` の後ろが空く。
+            // 項目の 2 つめ以降のブロックなら 1 行目にも要るので、行頭かどうかで
+            // 決める (印の直後は行の途中なので入らない)
+            r.push_lines(&quoted);
             r.blank_line();
         }
         TagEnd::List(_) => {
@@ -1226,6 +1227,23 @@ mod tests {
             from_markdown("- [x] task text\n  wrapped line"),
             "• ☑ task text\n    wrapped line"
         );
+    }
+
+    /// 項目の 2 つめ以降のブロックも項目の中に見せること。
+    ///
+    /// 見出しと引用は中身をまとめてから出すので、行頭を揃えないと列 0 に
+    /// 来て項目の外に見える。印の直後 (1 つめのブロック) では入れない。
+    #[test]
+    fn later_blocks_in_an_item_keep_the_indent() {
+        assert_eq!(
+            from_markdown("- intro\n\n  # Details"),
+            "• intro\n\n  *Details*"
+        );
+        assert_eq!(
+            from_markdown("- intro\n\n  > detail"),
+            "• intro\n\n  > detail"
+        );
+        assert_eq!(from_markdown("- # title"), "• *title*");
     }
 
     /// 項目の中の引用は、字下げを引用記法の前に付けること。
