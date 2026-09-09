@@ -54,69 +54,24 @@ impl std::fmt::Display for PostError {
     }
 }
 
-/// 退避しても直らないと分かっているエラー。
+/// 同じ payload で送り直して直る見込みのあるエラー。
 ///
-/// 認証・チャンネル・権限・レート制限は payload の形と無関係なので、中身を
-/// 変えて送り直しても同じ結果になる。
+/// 本文の表現を落として送り直していた頃は「直らないと分かっているものを
+/// 除いて再送する」で良かった。表現が 1 つになって同じ payload を送るように
+/// なった今は、payload の不正・宛先・権限・流量はどれも 2 回目に同じ結果を
+/// 返すので、再送は予算を捨てるだけになる。
+///
+/// なのでドキュメントが一時的だと言っているものだけ再送する。知らないエラーは
+/// 再送しない。同じものを送って直る根拠が無い。
 ///
 /// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
-fn is_hopeless(error: &str) -> bool {
+/// `internal_error` は "likely due to a transient issue on our end" と
+/// されている。
+fn is_transient(error: &str) -> bool {
     matches!(
         error,
-        // token
-        "invalid_auth"
-            | "not_authed"
-            | "account_inactive"
-            | "token_revoked"
-            | "token_expired"
-            | "not_allowed_token_type"
-            | "two_factor_setup_required"
-            // 権限・アクセス
-            | "access_denied"
-            | "no_permission"
-            | "missing_scope"
-            | "app_access_restricted"
-            | "enterprise_is_restricted"
-            | "ekm_access_denied"
-            | "team_access_not_granted"
-            | "org_login_required"
-            | "send_on_behalf_not_allowed"
-            | "messages_tab_disabled"
-            // 宛先
-            | "channel_not_found"
-            | "not_in_channel"
-            | "is_archived"
-            | "team_not_found"
-            | "team_added_to_org"
-            | "restricted_action"
-            | "restricted_action_read_only_channel"
-            | "restricted_action_thread_only_channel"
-            | "restricted_action_non_threadable_channel"
-            | "restricted_action_thread_locked"
-            // 流量
-            | "ratelimited"
-            | "rate_limited"
-            | "accesslimited"
-            | "message_limit_exceeded"
-            // 呼び出し方
-            | "deprecated_endpoint"
-            | "method_deprecated"
-            // attachment の数は退避しても変わらない
-            | "too_many_attachments"
+        "internal_error" | "fatal_error" | "request_timeout" | "service_unavailable"
     )
-}
-
-/// 同じ payload で再送すべきか。
-///
-/// [`is_hopeless`] に無いエラーは一時的なものの可能性があるので送り直す。
-/// `internal_error` はドキュメントで
-/// "The server could not complete your operation(s) without encountering an
-/// error, likely due to a transient issue on our end." とされている。
-///
-/// 一覧から漏れたエラーで通知が無言で落ちるより、無駄に 1 回投げる方が
-/// 損が小さい。再送は [`POST_BUDGET`] の中で行う。
-fn should_retry(error: &str) -> bool {
-    !is_hopeless(error)
 }
 
 /// `chat.postMessage` の応答。
@@ -280,10 +235,14 @@ pub enum Body {
 }
 
 impl Body {
+    /// 空白だけの本文は入れない。
+    ///
+    /// 空の `text` は `no_text` で拒否され、通知そのものが飛ばなくなる。
+    /// 呼び出し側で弾き忘れても壊れないように、ここで落とす。
     pub fn new(text: Option<String>) -> Self {
         match text {
-            Some(text) => Self::Text { text },
-            None => Self::Empty {},
+            Some(text) if !text.trim().is_empty() => Self::Text { text },
+            _ => Self::Empty {},
         }
     }
 
@@ -408,7 +367,7 @@ impl Message {
                 return;
             }
             Err(PostError::Api(e)) => {
-                if !should_retry(&e) {
+                if !is_transient(&e) {
                     error!(channel, error = %e, "POST failed");
                     return;
                 }
@@ -551,51 +510,42 @@ mod tests {
         Body::new(Some(body.to_string()))
     }
 
-    /// 直らないと分かっているエラーだけ再送しないこと。
+    /// 一時的だと分かっているエラーだけ再送すること。
     ///
-    /// 認証やチャンネルの問題は blocks を外しても直らないので、再送しても
-    /// 無駄打ちになりレート制限を悪化させる。
+    /// 同じ payload を送るので、payload の不正や権限の問題は 2 回目も同じ
+    /// 結果になる。再送しても予算を捨てるだけ。
     #[test]
-    fn hopeless_errors_are_not_retried() {
+    fn only_transient_errors_are_retried() {
         for e in [
+            "internal_error",
+            "fatal_error",
+            "request_timeout",
+            "service_unavailable",
+        ] {
+            assert!(is_transient(e), "{e} は再送すべき");
+        }
+
+        for e in [
+            // 宛先・権限・流量
             "invalid_auth",
-            "token_expired",
             "channel_not_found",
             "not_in_channel",
             "is_archived",
             "missing_scope",
             "restricted_action",
-            "restricted_action_read_only_channel",
             "team_access_not_granted",
-            "ekm_access_denied",
             "ratelimited",
-            "too_many_attachments",
-        ] {
-            assert!(is_hopeless(e), "{e} は再送すべきでない");
-        }
-    }
-
-    /// 列挙に無いエラーは再送すること。
-    ///
-    /// blocks が拒否されたときに返るエラーは分からないので、直らないと
-    /// 分かっているものだけを除いて退避する。`internal_error` は
-    /// ドキュメントで transient とされている。
-    #[test]
-    fn unknown_and_transient_errors_are_retried() {
-        for e in [
-            "invalid_blocks",
-            "invalid_blocks_format",
-            "msg_blocks_too_long",
+            // payload の不正。同じものを送り直しても通らない
             "invalid_arguments",
-            "internal_error",
-            "fatal_error",
-            "request_timeout",
-            "service_unavailable",
+            "invalid_blocks",
+            "msg_blocks_too_long",
             "attachment_payload_limit_exceeded",
-            "markdown_text_conflict",
+            "too_many_attachments",
+            "no_text",
+            // 知らないエラー。同じものを送って直る根拠が無い
             "some_error_slack_has_not_documented_yet",
         ] {
-            assert!(!is_hopeless(e), "{e} は再送すべき");
+            assert!(!is_transient(e), "{e} は再送すべきでない");
         }
     }
 
@@ -661,46 +611,6 @@ mod tests {
             a.get("footer_icon").is_none(),
             "footer_icon が入っている: {a}"
         );
-    }
-
-    /// blocks を持ち、かつ直らないと分かっていないエラーのときだけ再送すること。
-    #[test]
-    fn retry_needs_a_fixable_error() {
-        assert!(
-            should_retry("internal_error"),
-            "transient なエラーで再送していない"
-        );
-        assert!(
-            !should_retry("invalid_auth"),
-            "直らないエラーで再送している"
-        );
-    }
-
-    /// 同じ payload を送り直してよいエラーだけリトライすること。
-    ///
-    /// `internal_error` と `fatal_error` は「一部が既に成功している可能性が
-    /// ある」とドキュメントにあるので、送り直すと通知が重複する。
-    #[test]
-    fn only_safe_errors_are_retried() {
-        assert!(
-            is_retriable("service_unavailable"),
-            "処理前に断られているので送り直せる"
-        );
-
-        for e in [
-            // 一部が投稿済みの可能性がある。送り直すと重複する
-            "internal_error",
-            "fatal_error",
-            // 送った内容の不備。同じものを送っても直らない
-            "request_timeout",
-            "invalid_arguments",
-            // 宛先・権限・流量
-            "invalid_auth",
-            "channel_not_found",
-            "ratelimited",
-        ] {
-            assert!(!is_retriable(e), "{e} は送り直すべきでない");
-        }
     }
 
     /// 予算を使い切っていたら再送しないこと。

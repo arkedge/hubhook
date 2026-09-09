@@ -20,6 +20,11 @@
 //! | `- 項目` | `• 項目` |
 //! | `1. 項目` | `1. 項目` (番号付きリストは無い) |
 //! | 表 | 行として並べる (見出し行は太字) |
+//!
+//! mrkdwn には文字を打ち消す記法が無いので、次は直せない。
+//!
+//! - markdown で escape した記号 (`\*literal\*`) は escape が外れた状態で
+//!   渡ってくるため、Slack が装飾として解釈する
 
 use pulldown_cmark::{BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -32,9 +37,16 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// リンクの URL 側。`<` `>` は区切りなので入れられないが、`&` は escape する。
+/// リンクの URL 側。
+///
+/// `<url|label>` の `<` `>` `|` は Slack が区切りとして読むので、URL に
+/// 入っているとリンク先が途中で切れる (`https://example.com/a|b` が
+/// `https://example.com/a` になる)。percent-encode して渡す。
 fn escape_url(url: &str) -> String {
     url.replace('&', "&amp;")
+        .replace('|', "%7C")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
 }
 
 /// HTML のタグとコメントを落として、見える文字だけ返す。
@@ -166,7 +178,13 @@ pub fn from_markdown(md: &str) -> String {
             }
             Event::Code(t) => {
                 let escaped = escape(&t);
-                r.push(&format!("`{escaped}`"));
+                // mrkdwn のコード span は ` で囲む以外に書き方が無いので、
+                // 中に ` があると区切りが壊れる。素のテキストとして出す。
+                if escaped.contains('`') {
+                    r.push(&escaped);
+                } else {
+                    r.push(&format!("`{escaped}`"));
+                }
             }
             Event::SoftBreak | Event::HardBreak => r.push("\n"),
             // Slack に水平線は無い。段落の切れ目としてだけ扱う
@@ -192,10 +210,10 @@ pub fn from_markdown(md: &str) -> String {
 fn start(r: &mut Renderer, tag: Tag) {
     match tag {
         Tag::Paragraph => r.blank_line(),
-        // 見出しが無いので太字で代用する
+        // 見出しが無いので太字で代用する。中身を読んでから決めるので開く
         Tag::Heading { .. } => {
             r.blank_line();
-            r.push("*");
+            r.open();
         }
         Tag::Strong => r.push("*"),
         Tag::Emphasis => r.push("_"),
@@ -261,7 +279,22 @@ fn end(r: &mut Renderer, tag: TagEnd) {
     match tag {
         TagEnd::Paragraph => r.blank_line(),
         TagEnd::Heading(_) => {
-            r.push("*");
+            let inner = r.close();
+            let inner = inner.trim();
+
+            // 中身が既に太字なら二重にしない。`# **重要**` が `**重要**` に
+            // なると、mrkdwn では太字として解釈されない。
+            //
+            // `*a* *b*` のように太字が 2 つ並ぶ場合も囲まないままにする。
+            // 見出し全体の太字は失うが、記法が壊れるより良い。
+            let already_bold = inner.len() > 1 && inner.starts_with('*') && inner.ends_with('*');
+            if inner.is_empty() {
+                // 空の見出しで `**` を作らない
+            } else if already_bold {
+                r.push(inner);
+            } else {
+                r.push(&format!("*{inner}*"));
+            }
             r.blank_line();
         }
         TagEnd::Strong => r.push("*"),
@@ -507,6 +540,39 @@ mod tests {
             out.contains("<https://example.com|text>"),
             "リンクが消えている: {out}"
         );
+    }
+
+    /// URL に区切り文字が入っていてもリンク先が切れないこと。
+    ///
+    /// `<url|label>` の `|` `<` `>` は Slack が区切りとして読むので、URL に
+    /// そのまま入れるとリンク先が途中で終わる。
+    #[test]
+    fn link_urls_escape_the_delimiters() {
+        assert_eq!(
+            from_markdown("[x](https://example.com/a|b)"),
+            "<https://example.com/a%7Cb|x>"
+        );
+        assert_eq!(
+            from_markdown("[x](https://example.com/a>b)"),
+            "<https://example.com/a%3Eb|x>"
+        );
+    }
+
+    /// コード span の中に ` があっても区切りを壊さないこと。
+    ///
+    /// mrkdwn には ` で囲む以外の書き方が無いので、囲むのを諦める。
+    #[test]
+    fn code_containing_a_backtick_is_not_fenced() {
+        assert_eq!(from_markdown("`` a`b ``"), "a`b");
+    }
+
+    /// 中身が既に太字の見出しを二重にしないこと。
+    ///
+    /// `**重要**` になると mrkdwn では太字として解釈されない。
+    #[test]
+    fn already_bold_headings_are_not_wrapped_again() {
+        assert_eq!(from_markdown("# **重要**"), "*重要*");
+        assert_eq!(from_markdown("# 普通"), "*普通*");
     }
 
     /// HTML のタグは落とすが、中の文字は残すこと。
