@@ -15,8 +15,8 @@ use futures::stream::TryStreamExt;
 
 use tracing::{debug, error, info, warn};
 
-use crypto_hashes::sha2::Sha256;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -139,13 +139,8 @@ impl FromRequest for Data {
                 .await;
             let p: Vec<u8> = p.unwrap();
 
-            let webhook_secret = &opt.webhook_secret.as_bytes();
-            let mut mac = HmacSha256::new_from_slice(webhook_secret).unwrap();
-            mac.update(&p);
-            let result = mac.finalize();
-
             // validate signature
-            if !compare_slice(&sig256, &result.into_bytes()) {
+            if !verify_signature(opt.webhook_secret.as_bytes(), &p, &sig256) {
                 error!("signature mismatch");
                 if !opt.debug {
                     return Err(ErrorBadRequest("signature mismatch!"));
@@ -452,17 +447,104 @@ async fn post_test(opt: &Opt, payload: &github::Payload) {
         .await;
 }
 
-fn compare_slice(a: &[u8], b: &[u8]) -> bool {
-    use std::cmp::Ordering;
+/// webhook の署名 (`X-Hub-Signature-256`) を検証する。
+///
+/// 比較は hmac の [`Mac::verify_slice`] に任せる。定数時間で比較されるので、
+/// 一致する先頭バイト数が処理時間に出ない。自前で 1 バイトずつ比較して
+/// 不一致で抜けると、その時間差から署名を 1 バイトずつ当てられてしまう。
+fn verify_signature(secret: &[u8], body: &[u8], signature: &[u8]) -> bool {
+    // HMAC の鍵は任意長を受け付けるので、この unwrap は落ちない
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(body);
 
-    if a.len() != b.len() {
-        return false;
+    mac.verify_slice(signature).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GitHub のドキュメントに載っている検証用の値。
+    ///
+    /// <https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries>
+    const SECRET: &[u8] = b"It's a Secret to Everybody";
+    const BODY: &[u8] = b"Hello, World!";
+    const SIGNATURE: &str = "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+
+    fn sig(hex_str: &str) -> Vec<u8> {
+        hex::decode(hex_str).expect("hex が壊れている")
     }
-    for (ai, bi) in a.iter().zip(b.iter()) {
-        match ai.cmp(bi) {
-            Ordering::Equal => continue,
-            _ => return false,
-        }
+
+    /// 正しい署名を受け入れること。
+    ///
+    /// ここが壊れると全部の webhook が弾かれて通知が止まる。
+    #[test]
+    fn correct_signature_is_accepted() {
+        assert!(verify_signature(SECRET, BODY, &sig(SIGNATURE)));
     }
-    true
+
+    /// 署名が違えば弾くこと。
+    ///
+    /// ここが壊れると誰でも偽の webhook を投げられる。
+    #[test]
+    fn wrong_signature_is_rejected() {
+        // 末尾 1 バイトだけ変える
+        let mut bad = sig(SIGNATURE);
+        *bad.last_mut().unwrap() ^= 0x01;
+        assert!(!verify_signature(SECRET, BODY, &bad));
+
+        // 先頭 1 バイトだけ変える (定数時間比較なので位置に関係なく弾く)
+        let mut bad = sig(SIGNATURE);
+        bad[0] ^= 0x01;
+        assert!(!verify_signature(SECRET, BODY, &bad));
+    }
+
+    /// 本文が変わっていれば弾くこと。
+    #[test]
+    fn tampered_body_is_rejected() {
+        assert!(!verify_signature(SECRET, b"Hello, World?", &sig(SIGNATURE)));
+    }
+
+    /// 鍵が違えば弾くこと。
+    #[test]
+    fn wrong_secret_is_rejected() {
+        assert!(!verify_signature(b"wrong secret", BODY, &sig(SIGNATURE)));
+    }
+
+    /// 長さが違う署名を弾くこと。
+    ///
+    /// 短い署名を「一致する分だけ」で通してしまうと、1 バイトの署名で
+    /// 通過できてしまう。
+    #[test]
+    fn wrong_length_signature_is_rejected() {
+        let full = sig(SIGNATURE);
+
+        assert!(!verify_signature(SECRET, BODY, &[]), "空の署名を通している");
+        assert!(
+            !verify_signature(SECRET, BODY, &full[..1]),
+            "先頭 1 バイトだけの署名を通している"
+        );
+        assert!(
+            !verify_signature(SECRET, BODY, &full[..full.len() - 1]),
+            "1 バイト短い署名を通している"
+        );
+
+        let mut longer = full.clone();
+        longer.push(0);
+        assert!(
+            !verify_signature(SECRET, BODY, &longer),
+            "1 バイト長い署名を通している"
+        );
+    }
+
+    /// 空の本文でも検証できること (本文なしのイベントは存在する)。
+    #[test]
+    fn empty_body_is_verified() {
+        let mut mac = HmacSha256::new_from_slice(SECRET).unwrap();
+        mac.update(b"");
+        let expected = mac.finalize().into_bytes();
+
+        assert!(verify_signature(SECRET, b"", &expected));
+        assert!(!verify_signature(SECRET, b"", &sig(SIGNATURE)));
+    }
 }

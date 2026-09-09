@@ -12,10 +12,9 @@ description = "GitHub notification manager"
 [dependencies]
 actix-service = "2.0.2"
 actix-web = "4.9.0"
-crypto-hashes = "0.10.0"
 futures = "0.3.30"
 hex = "0.4.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 regex = "1.10.4"
 reqwest = { version = "0.13.0", features = ["json"] }
 sentry = "0.49.0"
@@ -23,6 +22,9 @@ sentry-actix = "0.49.0"
 serde = "1.0.200"
 serde_json = "1.0.116"
 serde_path_to_error = "0.1.20"
+# hmac と digest の世代を揃える必要があるので直接依存にする
+# (crypto-hashes メタクレートは 2021 年から更新が無く sha2 0.10 で止まっている)
+sha2 = "0.11.0"
 structopt = "0.3.26"
 # team ごとの取得を 1 本にまとめるための非同期 Mutex だけを使う。
 # actix / reqwest 経由ですでに依存ツリーに入っている。
