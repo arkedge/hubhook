@@ -99,6 +99,13 @@ async fn post(
         .post(format!("{base}/api/chat.postMessage"))
         .timeout(timeout)
         .bearer_auth(token)
+        // reqwest の json() は charset を付けないため、Slack が
+        // missing_charset を warning で返す。先に入れておくと json() は
+        // Content-Type を上書きしない。
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )
         .json(payload)
         .send()
         .await
@@ -477,42 +484,54 @@ mod tests {
     ///
     /// 再送は「1 回目の応答を読んで 2 回目を投げる」という手順そのものが
     /// 本体なので、HTTP を実際に通さないと壊れても気付けない。
+    type Captured<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
     fn spawn_slack(
         replies: Vec<serde_json::Value>,
-    ) -> (
-        String,
-        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    ) {
-        use actix_web::{App, HttpResponse, HttpServer, web};
+    ) -> (String, Captured<serde_json::Value>, Captured<String>) {
+        use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
         use std::sync::{Arc, Mutex};
 
-        let got: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let got: Captured<serde_json::Value> = Arc::new(Mutex::new(Vec::new()));
+        let ctypes: Captured<String> = Arc::new(Mutex::new(Vec::new()));
         let replies = Arc::new(Mutex::new(replies));
         let got_srv = got.clone();
+        let ctypes_srv = ctypes.clone();
 
         let srv = HttpServer::new(move || {
             let got = got_srv.clone();
+            let ctypes = ctypes_srv.clone();
             let replies = replies.clone();
 
             App::new().route(
                 "/api/chat.postMessage",
-                web::post().to(move |body: web::Json<serde_json::Value>| {
-                    let got = got.clone();
-                    let replies = replies.clone();
+                web::post().to(
+                    move |req: HttpRequest, body: web::Json<serde_json::Value>| {
+                        let got = got.clone();
+                        let ctypes = ctypes.clone();
+                        let replies = replies.clone();
 
-                    async move {
-                        got.lock().unwrap().push(body.into_inner());
+                        async move {
+                            got.lock().unwrap().push(body.into_inner());
+                            ctypes.lock().unwrap().push(
+                                req.headers()
+                                    .get("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            );
 
-                        let mut replies = replies.lock().unwrap();
-                        let reply = if replies.is_empty() {
-                            serde_json::json!({ "ok": true })
-                        } else {
-                            replies.remove(0)
-                        };
+                            let mut replies = replies.lock().unwrap();
+                            let reply = if replies.is_empty() {
+                                serde_json::json!({ "ok": true })
+                            } else {
+                                replies.remove(0)
+                            };
 
-                        HttpResponse::Ok().json(reply)
-                    }
-                }),
+                            HttpResponse::Ok().json(reply)
+                        }
+                    },
+                ),
             )
         })
         .bind("127.0.0.1:0")
@@ -521,7 +540,7 @@ mod tests {
         let addr = srv.addrs()[0];
         actix_web::rt::spawn(srv.run());
 
-        (format!("http://{addr}"), got)
+        (format!("http://{addr}"), got, ctypes)
     }
 
     fn rejected(error: &str) -> Vec<serde_json::Value> {
@@ -730,10 +749,32 @@ mod tests {
         );
     }
 
+    /// `Content-Type` に charset を付けること。
+    ///
+    /// 無いと Slack が `missing_charset` を warning で返す。reqwest の
+    /// `json()` は charset を付けないので、こちらで先に入れている。
+    /// 順序を戻すと `json()` の既定に負けるので、実際に送った値で確かめる。
+    #[actix_web::test]
+    async fn post_sends_the_charset() {
+        let (base, _got, ctypes) = spawn_slack(vec![]);
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let ctypes = ctypes.lock().unwrap();
+        assert_eq!(ctypes.len(), 1, "送信回数が違う");
+        assert!(
+            ctypes[0].contains("charset=utf-8"),
+            "charset が付いていない: {}",
+            ctypes[0]
+        );
+    }
+
     /// 通ったら 1 回で終わること。
     #[actix_web::test]
     async fn success_posts_once() {
-        let (base, got) = spawn_slack(vec![]);
+        let (base, got, _ctypes) = spawn_slack(vec![]);
 
         message(blocks("## body", Some("body")))
             .post_message_to(&base, "token", "channel", None)
@@ -751,7 +792,7 @@ mod tests {
     /// blocks 由来のエラーなら、従来の表現で再送すること。
     #[actix_web::test]
     async fn block_error_is_retried_as_text() {
-        let (base, got) = spawn_slack(rejected("invalid_blocks"));
+        let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
 
         message(blocks("## body", Some("*Assignees*: sksat")))
             .post_message_to(&base, "token", "channel", None)
@@ -771,7 +812,7 @@ mod tests {
     /// blocks 由来でないエラーでは再送しないこと。
     #[actix_web::test]
     async fn other_errors_are_not_retried() {
-        let (base, got) = spawn_slack(rejected("invalid_auth"));
+        let (base, got, _ctypes) = spawn_slack(rejected("invalid_auth"));
 
         message(blocks("## body", Some("body")))
             .post_message_to(&base, "token", "channel", None)
@@ -783,7 +824,7 @@ mod tests {
     /// blocks を持たない payload では再送しないこと。
     #[actix_web::test]
     async fn blockless_payloads_are_not_retried() {
-        let (base, got) = spawn_slack(rejected("invalid_blocks"));
+        let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
 
         message(Body::new(vec![], None))
             .post_message_to(&base, "token", "channel", None)
