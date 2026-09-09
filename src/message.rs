@@ -3,8 +3,29 @@ use crate::slack;
 
 use tracing::info;
 
+/// `slack::Message` を作らなかった理由。
+///
+/// 「通知しないと決めているケース」と「想定が崩れているケース」を区別する。
+/// 区別せずに全部 `error!` で出すと、本物の失敗が埋もれる。issues は 16 個の
+/// action のうち 2 個しか通知対象にしていないので、大半が前者になる。
+#[derive(Debug)]
+pub enum NotRendered {
+    /// 通知対象にしていない action / state。想定どおりの動作。
+    Skipped(String),
+    /// レンダリングに必要な情報が payload に無い。想定が崩れている。
+    Unexpected(String),
+}
+
+impl std::fmt::Display for NotRendered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Skipped(why) | Self::Unexpected(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 impl TryFrom<&github::Payload> for slack::Message {
-    type Error = ();
+    type Error = NotRendered;
 
     fn try_from(payload: &github::Payload) -> Result<Self, Self::Error> {
         use github::Payload;
@@ -148,7 +169,7 @@ fn users2str(
 }
 
 impl TryFrom<&github::Issues> for slack::Message {
-    type Error = ();
+    type Error = NotRendered;
 
     fn try_from(issues: &github::Issues) -> Result<Self, Self::Error> {
         let repo = &issues.repository;
@@ -243,13 +264,16 @@ impl TryFrom<&github::Issues> for slack::Message {
 
                 Ok(Self { text, attachments })
             }
-            _ => Err(()),
+            _ => Err(NotRendered::Skipped(format!(
+                "issues action {:?}",
+                issues.action
+            ))),
         }
     }
 }
 
 impl TryFrom<&github::PullRequest> for slack::Message {
-    type Error = ();
+    type Error = NotRendered;
 
     fn try_from(pull_request: &github::PullRequest) -> Result<Self, Self::Error> {
         let repo = &pull_request.repository;
@@ -302,7 +326,12 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                         None => format!("team {slug}", slug = team.slug),
                     },
                     // user も team も無い payload は想定していないので通知しない
-                    (None, None) => return Err(()),
+                    (None, None) => {
+                        return Err(NotRendered::Unexpected(
+                            "review request has neither requested_reviewer nor requested_team"
+                                .to_string(),
+                        ));
+                    }
                 };
 
                 let text = format!(
@@ -369,13 +398,16 @@ impl TryFrom<&github::PullRequest> for slack::Message {
 
                 Ok(Self { text, attachments })
             }
-            _ => Err(()),
+            _ => Err(NotRendered::Skipped(format!(
+                "pull_request action {:?}",
+                pull_request.action
+            ))),
         }
     }
 }
 
 impl TryFrom<&github::IssueComment> for slack::Message {
-    type Error = ();
+    type Error = NotRendered;
 
     fn try_from(issue_comment: &github::IssueComment) -> Result<Self, Self::Error> {
         let repo = &issue_comment.repository;
@@ -411,18 +443,24 @@ impl TryFrom<&github::IssueComment> for slack::Message {
 
                 Ok(Self { text, attachments })
             }
-            _ => Err(()),
+            _ => Err(NotRendered::Skipped(format!(
+                "issue_comment action {:?}",
+                issue_comment.action
+            ))),
         }
     }
 }
 
 impl TryFrom<&github::PullRequestReview> for slack::Message {
-    type Error = ();
+    type Error = NotRendered;
 
     fn try_from(review: &github::PullRequestReview) -> Result<Self, Self::Error> {
         // edited / dismissed は通知しない
         if review.action != github::PullRequestReviewAction::Submitted {
-            return Err(());
+            return Err(NotRendered::Skipped(format!(
+                "pull_request_review action {:?}",
+                review.action
+            )));
         }
 
         let repo = &review.repository;
@@ -438,12 +476,19 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
                 // review が飛んでくる。それ自体には情報が無く、個々のコメントは
                 // pull_request_review_comment 側で通知されるので捨てる (#122)
                 if body.is_empty() {
-                    return Err(());
+                    return Err(NotRendered::Skipped(
+                        "pull_request_review with empty body".to_string(),
+                    ));
                 }
                 ("commented on", slack::Color::Comment)
             }
             // GitHub が state を増やしても落ちないように、未知の state は通知しない
-            _ => return Err(()),
+            _ => {
+                return Err(NotRendered::Skipped(format!(
+                    "unknown pull_request_review state {:?}",
+                    r.state
+                )));
+            }
         };
 
         let text = format!(
@@ -480,11 +525,14 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
 }
 
 impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
-    type Error = ();
+    type Error = NotRendered;
 
     fn try_from(review_comment: &github::PullRequestReviewComment) -> Result<Self, Self::Error> {
         if review_comment.action != github::PullRequestReviewCommentAction::Created {
-            return Err(());
+            return Err(NotRendered::Skipped(format!(
+                "pull_request_review_comment action {:?}",
+                review_comment.action
+            )));
         }
 
         let repo = &review_comment.repository;
@@ -526,11 +574,11 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkStyle, assignees_line, with_assignees};
+    use super::{LinkStyle, NotRendered, assignees_line, with_assignees};
     use crate::github::testing::de;
     use crate::slack;
 
-    fn message(event: &str, test_json: &str) -> Result<slack::Message, ()> {
+    fn message(event: &str, test_json: &str) -> Result<slack::Message, NotRendered> {
         let payload = de(event, test_json);
         (&payload).try_into()
     }
@@ -885,5 +933,42 @@ mod tests {
         assert!(!attach.body.blocks()[0].text().is_empty(), "本文が空");
         // どのファイルへのコメントかが分かること
         assert!(attach.title.is_some(), "path が入っていない");
+    }
+    /// 通知対象にしていない action は `Skipped` になり、理由に action 名が入ること。
+    /// `Unexpected` と一緒にすると本物の失敗がログで埋もれる。
+    #[test]
+    fn unsupported_action_is_skipped_with_the_action_name() {
+        let err = message("pull_request_review", "pull_request_review.dismissed.json")
+            .expect_err("dismissed は通知しない");
+
+        match err {
+            NotRendered::Skipped(why) => {
+                assert!(why.contains("Dismissed"), "action 名が入っていない: {why}")
+            }
+            NotRendered::Unexpected(why) => {
+                panic!("意図的なスキップが想定外扱いされている: {why}")
+            }
+        }
+    }
+
+    /// user も team も無い review request は想定が崩れているので `Unexpected`。
+    /// こちらはログに出したい側。
+    #[test]
+    fn review_request_without_reviewer_is_unexpected() {
+        let err = message(
+            "pull_request",
+            "pull_request.review_requested.no-reviewer.derived.json",
+        )
+        .expect_err("user も team も無ければ通知は作れない");
+
+        match err {
+            NotRendered::Unexpected(why) => {
+                assert!(
+                    why.contains("requested_reviewer"),
+                    "理由が分からない: {why}"
+                )
+            }
+            NotRendered::Skipped(why) => panic!("想定外が意図的なスキップ扱い: {why}"),
+        }
     }
 }
