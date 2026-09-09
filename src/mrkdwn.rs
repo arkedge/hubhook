@@ -255,38 +255,75 @@ fn is_absolute(url: &str) -> bool {
 /// タグから属性値を取り出す。
 ///
 /// 生 HTML の `<a href>` や `<img src>` の行き先を捨てないために使う。
+///
+/// 属性を順に読む。名前を検索すると、別の属性値の中の文字列
+/// (`<a title="note href=https://evil.example.com">`) を属性と見て、行き先を
+/// 捏造してしまう。引用符の中は値なので、名前を探す対象にしない。
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut from = 0;
+    let bytes = tag.as_bytes();
+    let mut i = 0;
 
-    while let Some(i) = lower[from..].find(name) {
-        let at = from + i;
-        // 属性名の切れ目を確かめる。`"` を境界に含めると、別の属性値の中の
-        // 文字列 (`<a title="href=...">`) から行き先を捏造してしまう。
-        let before_ok = at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace();
-        let rest = &tag[at + name.len()..];
-        let rest_trimmed = rest.trim_start();
+    // 先頭はタグ名で属性ではない
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
 
-        if before_ok && rest_trimmed.starts_with('=') {
-            let value = rest_trimmed[1..].trim_start();
-            let quoted = value.strip_prefix('"').or_else(|| value.strip_prefix('\''));
-            return match quoted {
-                Some(v) => {
-                    let q = value.as_bytes()[0] as char;
-                    v.find(q).map(|e| v[..e].to_string())
-                }
-                // 引用符なしの値は空白まで
-                None => Some(
-                    value
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches('/')
-                        .to_string(),
-                ),
-            };
+    while i < bytes.len() {
+        // 属性の前の空白と、閉じ方を表す `/`
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
         }
-        from = at + name.len();
+
+        let from = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+
+        // 名前が読めなければ、これ以上属性は無い
+        if i == from {
+            return None;
+        }
+        let found = tag[from..i].eq_ignore_ascii_case(name);
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        // 値を持たない属性 (`<td nowrap>`)
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+
+        let value = match bytes[i] {
+            q @ (b'"' | b'\'') => {
+                let from = i + 1;
+                // 閉じていない引用符は壊れたタグなので、行き先は使わない
+                let end = from + tag[from..].find(q as char)?;
+                i = end + 1;
+                &tag[from..end]
+            }
+            // 引用符の無い値は空白か `>` まで。末尾の `/` は値の一部で、
+            // 閉じ方を表す `/` は空白で区切られている
+            _ => {
+                let from = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                    i += 1;
+                }
+                &tag[from..i]
+            }
+        };
+
+        if found {
+            return Some(value.to_string());
+        }
     }
 
     None
@@ -1131,6 +1168,31 @@ mod tests {
         assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
         assert!(out.contains("inner"), "中身が消えている: {out:?}");
         assert_eq!(out.matches("```").count(), 2, "フェンスの数が違う: {out:?}");
+    }
+
+    /// 別の属性値の中に属性の形があっても行き先にしないこと。
+    ///
+    /// 空白の後なら名前の切れ目としては正しいので、引用符の中を見ないと
+    /// `title` に書いた URL がリンク先になってしまう。
+    #[test]
+    fn an_attribute_inside_a_quoted_value_is_not_an_attribute() {
+        let out = from_markdown(r#"<a title="note href=https://evil.example.com">label</a>"#);
+
+        assert!(
+            !out.contains("evil.example.com"),
+            "行き先を捏造した: {out:?}"
+        );
+    }
+
+    /// 引用符の無い値の末尾の `/` を落とさないこと。
+    ///
+    /// HTML では値の一部で、閉じ方を表す `/` は空白で区切られている。
+    /// 落とすと別の場所を指す。
+    #[test]
+    fn an_unquoted_value_keeps_its_trailing_slash() {
+        let out = from_markdown("<a href=https://example.com/path/>label</a>");
+
+        assert_eq!(out, "label (https://example.com/path/)");
     }
 
     /// 別の属性値から行き先を捏造しないこと。
