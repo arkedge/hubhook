@@ -746,6 +746,27 @@ mod tests {
         assert_eq!(got[0], got[1], "違う payload を送っている");
     }
 
+    /// 直らないままでも `MAX_RETRIES + 1` 回で打ち切ること。
+    ///
+    /// 上限が効いていないと、Slack が落ちている間ずっと投げ続ける。1 回目が
+    /// 通ってしまうテストでは回数の間違いに気付けないので、全部断らせる。
+    #[actix_web::test]
+    async fn retries_stop_at_the_limit() {
+        let always_down =
+            vec![serde_json::json!({ "ok": false, "error": "service_unavailable" }); 10];
+        let (base, got, _ctypes) = spawn_slack(always_down);
+
+        message(text("*body*"))
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
+            .await;
+
+        assert_eq!(
+            got.lock().unwrap().len(),
+            MAX_RETRIES + 1,
+            "打ち切る回数が違う"
+        );
+    }
+
     /// 直らないと分かっているエラーでは再送しないこと。
     #[actix_web::test]
     async fn other_errors_are_not_retried() {
