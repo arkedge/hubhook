@@ -150,12 +150,18 @@ struct PendingTag {
 /// 中の `"` は HTML でも文字として扱われ、次の `>` でタグが閉じる。全部を
 /// 囲みの始まりとみなすと、`<div class=foo" >visible</div>` が閉じないタグに
 /// なって visible まで消える。
+///
+/// 引用符なしの値の中の `=` も文字。`<div data=a=" >visible</div>` の `a="` は
+/// 値そのもので、ここで `=` を新しい値の始まりと見ると引用符の中に入って
+/// しまう。
 #[derive(Clone, Copy)]
 enum TagScan {
-    /// タグ名や属性名、引用符なしの値
+    /// タグ名や属性名
     Plain,
     /// `=` の直後
     AfterEq,
+    /// 引用符なしの値の中。`=` も引用符も文字として扱う
+    Unquoted,
     /// 引用符で囲まれた値の中
     Quoted(u8),
 }
@@ -173,10 +179,14 @@ fn scan_tag(s: &str, from: usize, state: &mut TagScan) -> Option<usize> {
             (TagScan::Quoted(q), _) => TagScan::Quoted(q),
             // 囲みの外の `>` でタグが閉じる
             (_, b'>') => return Some(i),
-            (TagScan::AfterEq, b'"' | b'\'') => TagScan::Quoted(c),
             (TagScan::AfterEq, _) if c.is_ascii_whitespace() => TagScan::AfterEq,
-            (_, b'=') => TagScan::AfterEq,
-            _ => TagScan::Plain,
+            (TagScan::AfterEq, b'"' | b'\'') => TagScan::Quoted(c),
+            (TagScan::AfterEq, _) => TagScan::Unquoted,
+            // 引用符なしの値の中では `=` も引用符も文字。値の終わりは空白
+            (TagScan::Unquoted, _) if c.is_ascii_whitespace() => TagScan::Plain,
+            (TagScan::Unquoted, _) => TagScan::Unquoted,
+            (TagScan::Plain, b'=') => TagScan::AfterEq,
+            (TagScan::Plain, _) => TagScan::Plain,
         };
     }
 
@@ -1536,6 +1546,15 @@ mod tests {
     #[test]
     fn a_multiline_img_keeps_its_alt() {
         assert_eq!(from_markdown("<img\n alt=\"shot\"\n src=\"x\">"), "shot");
+    }
+
+    /// 引用符なしの値の中の `=` も文字として扱うこと。
+    ///
+    /// `<div data=a=" >visible</div>` の `a="` は値そのもの。`=` を新しい値の
+    /// 始まりと見ると引用符の中に入って、閉じないタグになる。
+    #[test]
+    fn an_equals_inside_an_unquoted_value_is_not_a_new_value() {
+        assert_eq!(from_markdown(r#"<div data=a=" >visible</div>"#), "visible");
     }
 
     /// 引用符なしの値の中の `"` でタグを開いたままにしないこと。
