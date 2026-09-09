@@ -1548,6 +1548,29 @@ mod tests {
         assert_eq!(from_markdown("<img\n alt=\"shot\"\n src=\"x\">"), "shot");
     }
 
+    /// 壊れた属性でも、囲みの外の `>` でタグを閉じて中身を残すこと。
+    ///
+    /// HTML の tokenizer に合わせる。引用符が閉じていない場合だけは
+    /// eof-in-tag でタグごと捨てられるので、ブラウザと同じく何も出さない。
+    #[test]
+    fn malformed_attributes_keep_the_content() {
+        for tag in [
+            r#"<div class=foo" >"#,
+            r#"<div data=a=" >"#,
+            r#"<div a=1 b='2' c=3>"#,
+            r#"<div a="x>y">"#,
+            r#"<div a='x>y'>"#,
+            r#"<div a=>"#,
+            r#"<div a= >"#,
+            r#"<div a=b=c=d>"#,
+            r#"<div ="x">"#,
+            r#"<div a b c>"#,
+        ] {
+            let out = from_markdown(&format!("{tag}visible</div>"));
+            assert_eq!(out, "visible", "tag={tag}");
+        }
+    }
+
     /// 引用符なしの値の中の `=` も文字として扱うこと。
     ///
     /// `<div data=a=" >visible</div>` の `a="` は値そのもの。`=` を新しい値の
