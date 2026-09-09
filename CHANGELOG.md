@@ -4,6 +4,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-10
+
+No notification with a body was delivered on 0.7.0. Slack does not accept
+`blocks` inside an attachment, so every one of them was rejected and dropped.
+
+### Fixed
+
+- Bodies were sent as markdown blocks inside an attachment, which Slack always
+  rejects with `internal_error`, so no notification with a body was posted.
+  Convert GitHub Flavored Markdown to Slack mrkdwn instead ([#354])
+- A notification could be dropped without the channel, the link or the reason
+  reaching the log, leaving nothing to investigate ([#351])
+- A transient Slack error dropped the notification instead of being retried
+  ([#352])
+- `Content-Type` did not declare the charset, so the encoding of a non-ASCII
+  body was left to Slack to guess ([#355])
+
+### Changed
+
+- Take the log level from `RUST_LOG`, and log the fields needed to tell why a
+  notification was dropped ([#353])
+
 ## [0.7.0] - 2026-09-09
 
 More events are notified, more query fields can be matched, and the Slack
@@ -68,7 +90,8 @@ corrected to 0.7.0 here.
 
 First release.
 
-[Unreleased]: https://github.com/arkedge/hubhook/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/arkedge/hubhook/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/arkedge/hubhook/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/arkedge/hubhook/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/arkedge/hubhook/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/arkedge/hubhook/releases/tag/v0.5.0
@@ -97,3 +120,8 @@ First release.
 [#347]: https://github.com/arkedge/hubhook/pull/347
 [#348]: https://github.com/arkedge/hubhook/pull/348
 [#349]: https://github.com/arkedge/hubhook/pull/349
+[#351]: https://github.com/arkedge/hubhook/pull/351
+[#352]: https://github.com/arkedge/hubhook/pull/352
+[#353]: https://github.com/arkedge/hubhook/pull/353
+[#354]: https://github.com/arkedge/hubhook/pull/354
+[#355]: https://github.com/arkedge/hubhook/pull/355
