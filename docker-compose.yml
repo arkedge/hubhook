@@ -9,6 +9,7 @@ services:
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
       - SENTRY_DSN=${SENTRY_DSN}
       - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - RUST_LOG=${RUST_LOG}
     ports:
       - 8080:${HUBHOOK_PORT}
     volumes:

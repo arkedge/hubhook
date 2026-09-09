@@ -21,9 +21,11 @@ for a release.
 |`SENTRY_DSN`|Sentry DSN|
 |`GITHUB_TOKEN`|used to expand team mentions (optional)|
 |`CONFIG_PATH`|where the config lives (optional, defaults to `/config/config.json`)|
+|`RUST_LOG`|log level and filter (optional, defaults to `info`)|
 
-Everything but the last two is required. `docker-compose.yml` and
-`.env.example` are set up for running it locally.
+Only `HUBHOOK_PORT`, `SLACK_TOKEN`, `WEBHOOK_SECRET` and `SENTRY_DSN` are
+required. `docker-compose.yml` and `.env.example` are set up for running it
+locally.
 
 ## Configuration
 
