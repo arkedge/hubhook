@@ -1013,7 +1013,7 @@ mod tests {
     fn expand_budget_leaves_room_for_slack_post() {
         const GITHUB_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
-        // Slack 側の予算は退避のための再送も含む
+        // Slack 側の予算は送り直す分も含む
         assert!(TOTAL_EXPAND_BUDGET + crate::slack::POST_BUDGET < GITHUB_WEBHOOK_TIMEOUT);
         // 1 リクエストのタイムアウトが予算より長いと予算が意味を持たない
         assert!(API_TIMEOUT <= TOTAL_EXPAND_BUDGET);
