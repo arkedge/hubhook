@@ -473,6 +473,8 @@ pub fn from_markdown(md: &str) -> String {
     opts.insert(Options::ENABLE_TASKLISTS);
     // `> [!NOTE]` のような GitHub alerts。名前に反してこれだけを指す
     opts.insert(Options::ENABLE_GFM);
+    // 有効にしないと `[^1]: 定義` がリンク参照定義として扱われ、定義ごと消える
+    opts.insert(Options::ENABLE_FOOTNOTES);
 
     let mut r = Renderer::new();
 
@@ -499,6 +501,11 @@ pub fn from_markdown(md: &str) -> String {
             // Slack に水平線は無い。段落の切れ目としてだけ扱う
             Event::Rule => r.block_start(),
             Event::TaskListMarker(done) => r.push(if done { "☑ " } else { "☐ " }),
+            // Slack に脚注は無いので、markdown の書き方をそのまま残す
+            Event::FootnoteReference(label) => {
+                let escaped = escape(&label);
+                r.push(&format!("[^{escaped}]"));
+            }
             // タグは落とすが中の文字は残す。pulldown-cmark は HTML ブロックを
             // まとめて 1 つのイベントで渡すので、丸ごと捨てると本文が消える
             Event::Html(h) | Event::InlineHtml(h) => {
@@ -577,6 +584,11 @@ fn start(r: &mut Renderer, tag: Tag) {
         Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
             r.links.push(dest_url.to_string());
             r.open();
+        }
+        Tag::FootnoteDefinition(label) => {
+            r.block_start();
+            let escaped = escape(&label);
+            r.push(&format!("[^{escaped}]: "));
         }
         Tag::Table(_) => {
             r.block_start();
@@ -685,6 +697,7 @@ fn end(r: &mut Renderer, tag: TagEnd) {
                 t.rows.push(row);
             }
         }
+        TagEnd::FootnoteDefinition => r.blank_line(),
         TagEnd::Table => {
             if let Some(t) = r.table.take() {
                 let rendered = render_table(&t.rows);
@@ -960,6 +973,17 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 脚注の定義を落とさないこと。
+    ///
+    /// `ENABLE_FOOTNOTES` が無いと定義がリンク参照定義として扱われて消える。
+    #[test]
+    fn footnote_definitions_are_kept() {
+        let out = from_markdown("本文[^1]\n\n[^1]: **定義**");
+
+        assert!(out.contains("[^1]"), "参照が消えている: {out:?}");
+        assert!(out.contains("*定義*"), "定義が消えている: {out:?}");
     }
 
     /// 散文に書かれた ``` でもフェンスを開かせないこと。
