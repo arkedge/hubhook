@@ -278,7 +278,7 @@ struct Renderer {
     ///
     /// 項目の中に段落が来ると (blank line を含むリスト) 段落として空行を
     /// 入れてしまい、`• ` と本文が離れてしまう。
-    at_item_start: bool,
+    after_marker: bool,
 }
 
 #[derive(Default)]
@@ -296,7 +296,7 @@ impl Renderer {
             table: None,
             pending_href: None,
             in_html_comment: false,
-            at_item_start: false,
+            after_marker: false,
         }
     }
 
@@ -448,12 +448,12 @@ impl Renderer {
 
     /// ブロックの始まり。段落の区切りを入れる。
     ///
-    /// ただしリスト項目の印を書いた直後は入れない。入れると印と中身が離れて
-    /// `• ` だけの行ができる。段落に限らず、見出しやコードブロックが項目の
-    /// 先頭に来ることもある。
+    /// ただしリスト項目の印や脚注のラベルを書いた直後は入れない。入れると印と
+    /// 中身が離れて `• ` や `[^1]: ` だけの行ができる。段落に限らず、見出しや
+    /// コードブロックが先頭に来ることもある。
     fn block_start(&mut self) {
-        if self.at_item_start {
-            self.at_item_start = false;
+        if self.after_marker {
+            self.after_marker = false;
         } else {
             self.blank_line();
         }
@@ -562,7 +562,7 @@ fn start(r: &mut Renderer, tag: Tag) {
             if r.lists.is_empty() {
                 r.blank_line();
             } else {
-                r.at_item_start = false;
+                r.after_marker = false;
                 r.newline();
             }
             r.lists.push(first);
@@ -579,7 +579,7 @@ fn start(r: &mut Renderer, tag: Tag) {
                 _ => "• ".to_string(),
             };
             r.push(&format!("{indent}{marker}"));
-            r.at_item_start = true;
+            r.after_marker = true;
         }
         Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
             r.links.push(dest_url.to_string());
@@ -589,6 +589,10 @@ fn start(r: &mut Renderer, tag: Tag) {
             r.block_start();
             let escaped = escape(&label);
             r.push(&format!("[^{escaped}]: "));
+
+            // 定義の中身は段落なので、印の直後だと伝えないと `[^1]: ` だけの
+            // 行になって定義が離れる
+            r.after_marker = true;
         }
         Tag::Table(_) => {
             r.block_start();
@@ -982,8 +986,7 @@ mod tests {
     fn footnote_definitions_are_kept() {
         let out = from_markdown("本文[^1]\n\n[^1]: **定義**");
 
-        assert!(out.contains("[^1]"), "参照が消えている: {out:?}");
-        assert!(out.contains("*定義*"), "定義が消えている: {out:?}");
+        assert_eq!(out, "本文[^1]\n\n[^1]: *定義*");
     }
 
     /// 散文に書かれた ``` でもフェンスを開かせないこと。
