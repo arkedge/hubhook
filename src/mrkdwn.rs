@@ -30,13 +30,25 @@
 
 use pulldown_cmark::{BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
 
-/// Slack のテキストで意味を持つ 3 文字。
+/// ユーザが書いた文字列を Slack に渡せる形にする。
 ///
+/// `&` `<` `>` は Slack のテキストで意味を持つので escape する。
 /// <https://docs.slack.dev/messaging/formatting-message-text>
+///
+/// あわせてコードフェンスを無効化する。本文に裸の ``` があると、Slack が
+/// フェンスとして読んで以降の本文と Assignees まで飲み込む。コードの中だけ
+/// 気にしていると、散文に書かれた ``` を取りこぼす。ユーザ由来の文字列は
+/// 全部この関数を通るので、ここで一度に守る。
+///
+/// こちらが組み立てる `*太字*` や `<url|label>` はこの関数を通らないので、
+/// 無効化の対象にならない。
 fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
+    let escaped = text
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;")
+        .replace('>', "&gt;");
+
+    neutralize_fences(&escaped)
 }
 
 /// リンクの URL 側。
@@ -473,9 +485,7 @@ pub fn from_markdown(md: &str) -> String {
                 r.push(&escaped);
             }
             Event::Code(t) => {
-                // 中の ``` を先に無効化する。素で出すとフェンスを開いて
-                // 以降の本文を飲み込む。
-                let escaped = neutralize_fences(&escape(&t));
+                let escaped = escape(&t);
 
                 // mrkdwn のコード span は ` で囲む以外に書き方が無いので、
                 // 中に ` が残っていると区切りが壊れる。素のテキストで出す。
@@ -950,6 +960,17 @@ mod tests {
     fn line_breaking_tags_keep_the_break() {
         assert_eq!(from_markdown("first<br>second"), "first\nsecond");
         assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 散文に書かれた ``` でもフェンスを開かせないこと。
+    ///
+    /// コードの中だけ見ていると取りこぼす。
+    #[test]
+    fn fences_in_prose_are_neutralized() {
+        let out = from_markdown("見出しは ``` で囲みます\n\nafter");
+
+        assert!(out.ends_with("after"), "本文が飲まれている: {out:?}");
+        assert!(!out.contains("```"), "無効化されていない: {out:?}");
     }
 
     /// インラインコードの中の ``` でもフェンスを開かせないこと。
