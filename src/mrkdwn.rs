@@ -122,25 +122,44 @@ struct PendingTag {
     text: String,
     /// ここまでは読んだ
     scanned: usize,
-    /// 読んでいる途中の引用符
-    quote: Option<u8>,
+    /// 読んでいる位置の状態
+    state: TagScan,
+}
+
+/// タグを読んでいる位置の状態。
+///
+/// 引用符は `=` の直後に来たときだけ値の囲みになる。属性名や引用符なしの値の
+/// 中の `"` は HTML でも文字として扱われ、次の `>` でタグが閉じる。全部を
+/// 囲みの始まりとみなすと、`<div class=foo" >visible</div>` が閉じないタグに
+/// なって visible まで消える。
+#[derive(Clone, Copy)]
+enum TagScan {
+    /// タグ名や属性名、引用符なしの値
+    Plain,
+    /// `=` の直後
+    AfterEq,
+    /// 引用符で囲まれた値の中
+    Quoted(u8),
 }
 
 /// タグを閉じる `>` の位置。`from` から続きを読む。
 ///
 /// 引用符の中の `>` は属性値の一部なのでタグの終わりではない。閉じていなければ
 /// `None` で、その場合は次のイベントに続いている。
-fn scan_tag(s: &str, from: usize, quote: &mut Option<u8>) -> Option<usize> {
-    // 先頭の `<` は読まない。`"` `'` `>` は ASCII なので UTF-8 の後続バイトと
-    // 衝突しない
+fn scan_tag(s: &str, from: usize, state: &mut TagScan) -> Option<usize> {
+    // 先頭の `<` は読まない。`"` `'` `=` `>` は ASCII なので UTF-8 の後続
+    // バイトと衝突しない
     for (i, &c) in s.as_bytes().iter().enumerate().skip(from.max(1)) {
-        match *quote {
-            Some(q) if c == q => *quote = None,
-            Some(_) => {}
-            None if c == b'"' || c == b'\'' => *quote = Some(c),
-            None if c == b'>' => return Some(i),
-            None => {}
-        }
+        *state = match (*state, c) {
+            (TagScan::Quoted(q), _) if c == q => TagScan::Plain,
+            (TagScan::Quoted(q), _) => TagScan::Quoted(q),
+            // 囲みの外の `>` でタグが閉じる
+            (_, b'>') => return Some(i),
+            (TagScan::AfterEq, b'"' | b'\'') => TagScan::Quoted(c),
+            (TagScan::AfterEq, _) if c.is_ascii_whitespace() => TagScan::AfterEq,
+            (_, b'=') => TagScan::AfterEq,
+            _ => TagScan::Plain,
+        };
     }
 
     None
@@ -615,7 +634,7 @@ impl Renderer {
                 let base = pending.text.len();
                 pending.text.push_str(&html[i..]);
 
-                let Some(end) = scan_tag(&pending.text, pending.scanned, &mut pending.quote) else {
+                let Some(end) = scan_tag(&pending.text, pending.scanned, &mut pending.state) else {
                     pending.scanned = pending.text.len();
                     self.pending_tag = Some(pending);
                     return decode_refs(&out);
@@ -636,15 +655,15 @@ impl Renderer {
 
             if bytes[i] == b'<' && opens_tag(bytes.get(i + 1)) {
                 let rest = &html[i..];
-                let mut quote = None;
+                let mut state = TagScan::Plain;
 
-                let Some(end) = scan_tag(rest, 1, &mut quote) else {
+                let Some(end) = scan_tag(rest, 1, &mut state) else {
                     // 閉じていないので次のイベントに続く。属性が複数行に
                     // 分かれているだけなので、捨てずに持ち越す
                     self.pending_tag = Some(PendingTag {
                         text: rest.to_string(),
                         scanned: rest.len(),
-                        quote,
+                        state,
                     });
                     return decode_refs(&out);
                 };
@@ -930,6 +949,15 @@ fn end(r: &mut Renderer, tag: TagEnd) {
         TagEnd::BlockQuote(_) => {
             r.quote_depth -= 1;
             let inner = r.close();
+
+            // 内側の階層では組み立て直さない。階層ごとに全体へ prefix を
+            // 付け直すと、深い入れ子で長さの 2 乗の時間がかかる (65KB の
+            // 入力で 0.5 秒)。Slack に入れ子の引用は無く、`> ` を重ねても
+            // 文字として出るだけなので、一番外側で 1 回付ければ足りる
+            if r.quote_depth > 0 {
+                r.push(&inner);
+                return;
+            }
 
             // 項目の中の引用は、字下げを引用記法の前に付ける。付けないと
             // 2 行目以降の ">" が行頭に来て、項目の外の引用に見える
@@ -1418,6 +1446,27 @@ mod tests {
     #[test]
     fn a_multiline_img_keeps_its_alt() {
         assert_eq!(from_markdown("<img\n alt=\"shot\"\n src=\"x\">"), "shot");
+    }
+
+    /// 引用符なしの値の中の `"` でタグを開いたままにしないこと。
+    ///
+    /// HTML では文字として扱われ、次の `>` でタグが閉じる。囲みの始まりと
+    /// みなすと閉じないタグになって、中の文字まで消える。
+    #[test]
+    fn a_stray_quote_does_not_swallow_the_tag() {
+        assert_eq!(
+            from_markdown(r#"<div class=foo" >visible</div>"#),
+            "visible"
+        );
+    }
+
+    /// 入れ子の引用を 1 階層にまとめること。
+    ///
+    /// Slack に入れ子の引用は無く、`> ` を重ねても文字として出るだけ。階層
+    /// ごとに prefix を付け直すと、深い入れ子で長さの 2 乗の時間がかかる。
+    #[test]
+    fn nested_quotes_are_flattened() {
+        assert_eq!(from_markdown("> a\n> > b"), "> a\n>\n> b");
     }
 
     /// タグを開かない `<` は文字として残すこと。
