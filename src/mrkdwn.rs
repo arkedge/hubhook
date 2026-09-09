@@ -295,6 +295,19 @@ impl Renderer {
         }
     }
 
+    /// ブロックの始まり。段落の区切りを入れる。
+    ///
+    /// ただしリスト項目の印を書いた直後は入れない。入れると印と中身が離れて
+    /// `• ` だけの行ができる。段落に限らず、見出しやコードブロックが項目の
+    /// 先頭に来ることもある。
+    fn block_start(&mut self) {
+        if self.at_item_start {
+            self.at_item_start = false;
+        } else {
+            self.blank_line();
+        }
+    }
+
     /// リストの入れ子に応じた字下げ。
     fn indent(&self) -> String {
         "    ".repeat(self.lists.len().saturating_sub(1))
@@ -332,7 +345,7 @@ pub fn from_markdown(md: &str) -> String {
             }
             Event::SoftBreak | Event::HardBreak => r.push("\n"),
             // Slack に水平線は無い。段落の切れ目としてだけ扱う
-            Event::Rule => r.blank_line(),
+            Event::Rule => r.block_start(),
             Event::TaskListMarker(done) => r.push(if done { "☑ " } else { "☐ " }),
             // タグは落とすが中の文字は残す。pulldown-cmark は HTML ブロックを
             // まとめて 1 つのイベントで渡すので、丸ごと捨てると本文が消える
@@ -353,17 +366,10 @@ pub fn from_markdown(md: &str) -> String {
 
 fn start(r: &mut Renderer, tag: Tag) {
     match tag {
-        // 項目の印の直後の段落は、印と本文を離さないように空行を入れない
-        Tag::Paragraph => {
-            if r.at_item_start {
-                r.at_item_start = false;
-            } else {
-                r.blank_line();
-            }
-        }
+        Tag::Paragraph => r.block_start(),
         // 見出しが無いので太字で代用する。中身を読んでから決めるので開く
         Tag::Heading { .. } => {
-            r.blank_line();
+            r.block_start();
             r.open();
         }
         Tag::Strong => r.push("*"),
@@ -371,11 +377,11 @@ fn start(r: &mut Renderer, tag: Tag) {
         Tag::Strikethrough => r.push("~"),
         // 中身を読んでから囲むかを決めるので開く
         Tag::CodeBlock(_) => {
-            r.blank_line();
+            r.block_start();
             r.open();
         }
         Tag::BlockQuote(kind) => {
-            r.blank_line();
+            r.block_start();
             // 中身を組み立ててから各行に "> " を付ける
             r.open();
 
@@ -397,6 +403,7 @@ fn start(r: &mut Renderer, tag: Tag) {
             if r.lists.is_empty() {
                 r.blank_line();
             } else {
+                r.at_item_start = false;
                 r.newline();
             }
             r.lists.push(first);
@@ -420,7 +427,7 @@ fn start(r: &mut Renderer, tag: Tag) {
             r.open();
         }
         Tag::Table(_) => {
-            r.blank_line();
+            r.block_start();
             r.table = Some(Table::default());
         }
         Tag::TableCell => r.open(),
@@ -841,6 +848,17 @@ mod tests {
     fn html_comments_are_dropped() {
         assert!(from_markdown("<!-- 説明 -->").is_empty());
         assert_eq!(from_markdown("<!-- 説明 -->text"), "text");
+    }
+
+    /// 段落以外で始まる項目でも印と中身が離れないこと。
+    ///
+    /// 見出しやコードブロックが項目の先頭に来ることもある。
+    #[test]
+    fn list_items_starting_with_a_block_keep_their_markers() {
+        assert_eq!(from_markdown("- # title"), "• *title*");
+
+        let out = from_markdown("- ```\ncode\n```");
+        assert!(!out.starts_with("• \n"), "印だけの行ができている: {out:?}");
     }
 
     /// 空行を含むリストでも印と本文が離れないこと。
