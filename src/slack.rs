@@ -487,12 +487,26 @@ impl Message {
         }
     }
 
-    pub async fn post_message(self, token: &str, channel: &str, username: Option<&str>) {
-        self.post_message_to(API_BASE, token, channel, username)
+    /// `link` は元になった GitHub の item。落ちた通知を後から辿るのに要る。
+    pub async fn post_message(
+        self,
+        token: &str,
+        channel: &str,
+        username: Option<&str>,
+        link: &str,
+    ) {
+        self.post_message_to(API_BASE, token, channel, username, link)
             .await
     }
 
-    async fn post_message_to(self, base: &str, token: &str, channel: &str, username: Option<&str>) {
+    async fn post_message_to(
+        self,
+        base: &str,
+        token: &str,
+        channel: &str,
+        username: Option<&str>,
+        link: &str,
+    ) {
         // reqwest にはデフォルトのタイムアウトが無い。Slack が応答しないと
         // webhook のレスポンスを返せず、GitHub 側が再送して通知が重複する。
         // リクエストごとに残り時間を渡すが、渡し忘れの上限としても入れておく。
@@ -530,7 +544,7 @@ impl Message {
 
         loop {
             let Some(left) = remaining(deadline, Instant::now()) else {
-                error!(channel, "POST gave up: out of budget");
+                error!(channel, link, "POST gave up: out of budget");
                 return;
             };
 
@@ -548,7 +562,7 @@ impl Message {
                 // リクエスト自体の失敗は payload を変えても直らない。
                 // 送り直すと待ち時間も倍になるので諦める。
                 Err(PostError::Request(e)) => {
-                    error!(channel, error = %e, "POST failed");
+                    error!(channel, link, error = %e, "POST failed");
                     return;
                 }
                 Err(PostError::Api(e)) => {
@@ -556,7 +570,7 @@ impl Message {
                     // 送る。先に退避を判定すると、この場合まで表現が落ちる。
                     if is_retriable(&e) {
                         if retries >= MAX_RETRIES {
-                            error!(channel, error = %e, "POST gave up: too many retries");
+                            error!(channel, link, error = %e, "POST gave up: too many retries");
                             return;
                         }
                         retries += 1;
@@ -574,7 +588,7 @@ impl Message {
                     } else {
                         // 諦めるが無音にはしない。channel と link が残っていれば
                         // 落ちた通知を後から追える。
-                        error!(channel, error = %e, "POST failed");
+                        error!(channel, link, error = %e, "POST failed");
                         return;
                     }
                 }
@@ -964,7 +978,7 @@ mod tests {
         let (base, _got, ctypes) = spawn_slack(vec![]);
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let ctypes = ctypes.lock().unwrap();
@@ -982,7 +996,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(vec![]);
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -1029,7 +1043,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
 
         message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -1053,7 +1067,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("internal_error"));
 
         message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -1073,7 +1087,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
 
         message(Body::new(vec![], None))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 2, "再送していない");
@@ -1088,7 +1102,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -1107,7 +1121,7 @@ mod tests {
         ]);
 
         message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -1130,7 +1144,7 @@ mod tests {
         ]);
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(
@@ -1154,7 +1168,7 @@ mod tests {
         ]);
 
         message(blocks("## body", Some("*Assignees*: sksat")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         let got = got.lock().unwrap();
@@ -1171,7 +1185,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_auth"));
 
         message(blocks("## body", Some("body")))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
@@ -1183,7 +1197,7 @@ mod tests {
         let (base, got, _ctypes) = spawn_slack(rejected("invalid_blocks"));
 
         message(Body::new(vec![], None))
-            .post_message_to(&base, "token", "channel", None)
+            .post_message_to(&base, "token", "channel", None, "https://example.com/item")
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 1, "無駄に再送している");
