@@ -140,6 +140,15 @@ fn should_fall_back(payload: &MessagePayload, error: &str) -> bool {
     payload.has_blocks() && !is_hopeless(error)
 }
 
+/// 1 通目が失敗したときに次に何を送るか。
+///
+/// 同じものを送る (リトライ) のと、表現を落として送る (退避) を混ぜると、
+/// 処理前に断られただけの場合まで表現が落ちる。
+enum Next {
+    Retry,
+    FallBack,
+}
+
 /// `chat.postMessage` の応答。
 ///
 /// Slack は API エラーも HTTP 200 で返し、本文の `ok` で示す。
@@ -504,7 +513,7 @@ impl Message {
             unfurl_media: false,
         };
 
-        match post(&client, base, token, &payload, POST_BUDGET).await {
+        let next = match post(&client, base, token, &payload, POST_BUDGET).await {
             Ok(()) => {
                 // どの表現で通ったかは、表現を変えたときの答え合わせに要る。
                 info!(channel, body = payload.body_kind(), "POST ok");
@@ -517,13 +526,17 @@ impl Message {
                 return;
             }
             Err(PostError::Api(e)) => {
-                if should_fall_back(&payload, &e) {
+                // 処理前に断られたなら、表現を落とす理由が無いので同じものを
+                // 送る。先に退避を判定すると、この場合まで表現が落ちる。
+                if is_retriable(&e) {
+                    warn!(channel, error = %e, "POST failed; retrying");
+                    Next::Retry
+                } else if should_fall_back(&payload, &e) {
                     // markdown ブロックが attachment 内で使えるか、本文が上限を
                     // 超えたかはこちらで判定できない。拒否されたら、従来の
                     // 表現 (attachment の text) に落として送る。
                     warn!(channel, error = %e, "POST rejected; falling back");
-                } else if is_retriable(&e) {
-                    warn!(channel, error = %e, "POST failed; retrying");
+                    Next::FallBack
                 } else {
                     // 諦めるが無音にはしない。channel と link が残っていれば
                     // 落ちた通知を後から追える。
@@ -531,16 +544,19 @@ impl Message {
                     return;
                 }
             }
-        }
+        };
 
-        // 再送も予算の中で行う。取り直すと webhook の締め切りを超えて
+        // 2 通目も予算の中で送る。取り直すと webhook の締め切りを超えて
         // GitHub が再送し、通知が重複する
         let Some(left) = remaining(deadline, Instant::now()) else {
-            error!(channel, "POST fallback skipped: out of budget");
+            error!(channel, "POST retry skipped: out of budget");
             return;
         };
 
-        let fallback = payload.into_text_fallback();
+        let fallback = match next {
+            Next::Retry => payload,
+            Next::FallBack => payload.into_text_fallback(),
+        };
         match post(&client, base, token, &fallback, left).await {
             // 届いてはいるが本来の表現が拒否された、という degraded success。
             Ok(()) => warn!(channel, body = fallback.body_kind(), "POST ok (fallback)"),
@@ -1043,6 +1059,23 @@ mod tests {
             .await;
 
         assert_eq!(got.lock().unwrap().len(), 2, "再送していない");
+    }
+
+    /// 処理前に断られたときは表現を落とさず同じものを送ること。
+    ///
+    /// 退避を先に判定すると、blocks を持つ payload では `service_unavailable`
+    /// でも表現が落ちてしまう。落とす理由が無い。
+    #[actix_web::test]
+    async fn retriable_errors_keep_the_blocks() {
+        let (base, got, _ctypes) = spawn_slack(rejected("service_unavailable"));
+
+        message(blocks("## body", Some("body")))
+            .post_message_to(&base, "token", "channel", None)
+            .await;
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "送り直していない");
+        assert_eq!(got[0], got[1], "表現が落ちている");
     }
 
     /// blocks 由来でないエラーでは再送しないこと。
