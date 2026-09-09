@@ -49,6 +49,8 @@ impl std::fmt::Display for PostError {
 ///
 /// 認証・チャンネル・権限・レート制限は payload の形と無関係なので、中身を
 /// 変えて送り直しても同じ結果になる。
+///
+/// エラー一覧は <https://docs.slack.dev/reference/methods/chat.postMessage>。
 fn is_hopeless(error: &str) -> bool {
     matches!(
         error,
@@ -79,8 +81,10 @@ fn is_hopeless(error: &str) -> bool {
 /// 無言で落ちるため、判断を反転させる。漏れたときの損は API 1 回分で、
 /// [`POST_BUDGET`] の中に収まる。
 ///
-/// `internal_error` はドキュメントで transient とされているので、まさに
-/// 再送すべき側。
+/// `internal_error` はドキュメントで
+/// "The server could not complete your operation(s) without encountering an
+/// error, likely due to a transient issue on our end." とされているので、
+/// まさに再送すべき側。
 fn should_retry(payload: &MessagePayload, error: &str) -> bool {
     payload.has_blocks() && !is_hopeless(error)
 }
