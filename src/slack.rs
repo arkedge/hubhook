@@ -144,6 +144,7 @@ fn should_fall_back(payload: &MessagePayload, error: &str) -> bool {
 ///
 /// 同じものを送る (リトライ) のと、表現を落として送る (退避) を混ぜると、
 /// 処理前に断られただけの場合まで表現が落ちる。
+#[derive(Clone, Copy)]
 enum Next {
     Retry,
     FallBack,
@@ -553,14 +554,26 @@ impl Message {
             return;
         };
 
-        let fallback = match next {
+        let second = match next {
             Next::Retry => payload,
             Next::FallBack => payload.into_text_fallback(),
         };
-        match post(&client, base, token, &fallback, left).await {
-            // 届いてはいるが本来の表現が拒否された、という degraded success。
-            Ok(()) => warn!(channel, body = fallback.body_kind(), "POST ok (fallback)"),
-            Err(e) => error!(channel, error = %e, "POST failed (fallback)"),
+
+        // 2 通目が何だったのかを取り違えると、ブロックが拒否されたのかどうかが
+        // 分からなくなる。リトライと退避でメッセージを分ける。
+        match post(&client, base, token, &second, left).await {
+            Ok(()) => match next {
+                // 同じものを送り直して通っただけなので、表現は落ちていない
+                Next::Retry => info!(channel, body = second.body_kind(), "POST ok (retry)"),
+                // 届いてはいるが本来の表現が拒否された、という degraded success
+                Next::FallBack => {
+                    warn!(channel, body = second.body_kind(), "POST ok (fallback)")
+                }
+            },
+            Err(e) => match next {
+                Next::Retry => error!(channel, error = %e, "POST failed (retry)"),
+                Next::FallBack => error!(channel, error = %e, "POST failed (fallback)"),
+            },
         }
     }
 }
