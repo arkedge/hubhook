@@ -575,11 +575,21 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
 #[cfg(test)]
 mod tests {
     use super::{LinkStyle, NotRendered, assignees_line, with_assignees};
-    use crate::github::testing::de;
+    use crate::github::testing::{de, de_without};
     use crate::slack;
 
     fn message(event: &str, test_json: &str) -> Result<slack::Message, NotRendered> {
         let payload = de(event, test_json);
+        (&payload).try_into()
+    }
+
+    /// 一部のフィールドを落とした payload で試す。
+    fn message_without(
+        event: &str,
+        test_json: &str,
+        keys: &[&str],
+    ) -> Result<slack::Message, NotRendered> {
+        let payload = de_without(event, test_json, keys);
         (&payload).try_into()
     }
 
@@ -955,9 +965,10 @@ mod tests {
     /// こちらはログに出したい側。
     #[test]
     fn review_request_without_reviewer_is_unexpected() {
-        let err = message(
+        let err = message_without(
             "pull_request",
-            "pull_request.review_requested.no-reviewer.derived.json",
+            "pull_request.review_requested.json",
+            &["requested_reviewer"],
         )
         .expect_err("user も team も無ければ通知は作れない");
 

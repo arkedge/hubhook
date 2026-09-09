@@ -418,6 +418,31 @@ pub(crate) mod testing {
             .unwrap_or_else(|e| panic!("{test_json}: {e}"))
             .expect("unsupported event")
     }
+
+    /// `test/` の payload からトップレベルのフィールドを落として deserialize する。
+    ///
+    /// examples に無い形を 1 テストのために作るのに fixture を足すと、
+    /// 数百行のコピーがリポジトリに残る。
+    ///
+    /// 落とすフィールドが元の payload に無ければ panic する。上流の
+    /// example が変わったときに、テストが意図と違う形を見ないようにする。
+    pub(crate) fn de_without(event: &str, test_json: &str, keys: &[&str]) -> Payload {
+        let path = format!("test/{test_json}");
+        let raw =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{test_json}: {e}"));
+        let obj = value.as_object_mut().expect("payload が object ではない");
+        for key in keys {
+            assert!(obj.remove(*key).is_some(), "{test_json} に {key} が無い");
+        }
+
+        let body = serde_json::to_vec(&value).expect("直列化に失敗");
+        Payload::from_event(event, &body)
+            .unwrap_or_else(|e| panic!("{test_json}: {e}"))
+            .expect("unsupported event")
+    }
 }
 
 #[cfg(test)]
