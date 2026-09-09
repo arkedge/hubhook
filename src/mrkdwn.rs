@@ -64,11 +64,15 @@ fn escape(text: &str) -> String {
 ///
 /// 空白も同じ。markdown は `[doc](<url with space>)` を許すが、mrkdwn の
 /// URL の中には置けない。
+///
+/// バックティックも encode する。行き先はユーザが書けるので、``` が入ると
+/// `<url|label>` の中で Slack のフェンスが開いてしまう。
 fn escape_url(url: &str) -> String {
     url.replace('&', "&amp;")
         .replace('|', "%7C")
         .replace('<', "%3C")
         .replace('>', "%3E")
+        .replace('`', "%60")
         .replace(' ', "%20")
         .replace('\t', "%09")
         .replace('\n', "%0A")
@@ -513,6 +517,20 @@ impl Renderer {
         }
 
         buf.push_str(s);
+    }
+
+    /// 組み立てた文字列を渡す。書き込み先が空なら移す。
+    ///
+    /// 引用の入れ子では、階層ごとに中身を親へ積む。コピーすると深さ × 長さ
+    /// のコピーになるので、空の書き込み先には移すだけにする。
+    fn push_owned(&mut self, s: String) {
+        let buf = self.bufs.last_mut().expect("書き込み先が無い");
+        if buf.is_empty() {
+            *buf = s;
+            return;
+        }
+
+        self.push(&s);
     }
 
     fn open(&mut self) {
@@ -975,7 +993,7 @@ fn end(r: &mut Renderer, tag: TagEnd) {
             // 入力で 0.5 秒)。Slack に入れ子の引用は無く、`> ` を重ねても
             // 文字として出るだけなので、一番外側で 1 回付ければ足りる
             if r.quote_depth > 0 {
-                r.push(&inner);
+                r.push_owned(inner);
                 return;
             }
 
@@ -1278,6 +1296,18 @@ mod tests {
     fn an_unlabeled_relative_destination_is_kept_as_text() {
         assert_eq!(from_markdown("![](docs/diagram.png)"), "docs/diagram.png");
         assert_eq!(from_markdown("![alt](docs/diagram.png)"), "alt");
+    }
+
+    /// URL のバックティックを percent-encode すること。
+    ///
+    /// 行き先はユーザが書けるので、``` が入ると `<url|label>` の中で Slack の
+    /// フェンスが開き、以降の本文と Assignees まで飲み込む。
+    #[test]
+    fn link_urls_encode_backticks() {
+        assert_eq!(
+            from_markdown("[l](https://example.com/a```b)"),
+            "<https://example.com/a%60%60%60b|l>"
+        );
     }
 
     /// URL の空白を percent-encode すること。
