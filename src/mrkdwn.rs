@@ -334,6 +334,12 @@ fn neutralize_fences(text: &str) -> String {
 /// 解釈されて、無いチャンネルへのリンクになる。相対パスも辿れない。
 fn link(url: &str, label: &str) -> String {
     if !is_absolute(url) {
+        // ラベルが無いと何も残らない。`![](docs/diagram.png)` のような
+        // 相対パスの画像だけの本文が空になり、通知から本文が消える
+        if label.trim().is_empty() {
+            return escape(url);
+        }
+
         return label.to_string();
     }
     if label.trim().is_empty() {
@@ -1262,6 +1268,16 @@ mod tests {
     #[test]
     fn special_characters_are_escaped() {
         assert_eq!(from_markdown("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+    }
+
+    /// ラベルの無い相対リンクは行き先を文字として残すこと。
+    ///
+    /// Slack から辿れないのでリンクにはしないが、消すと本文が空になることが
+    /// ある。相対パスの画像 1 つだけの本文は珍しくない。
+    #[test]
+    fn an_unlabeled_relative_destination_is_kept_as_text() {
+        assert_eq!(from_markdown("![](docs/diagram.png)"), "docs/diagram.png");
+        assert_eq!(from_markdown("![alt](docs/diagram.png)"), "alt");
     }
 
     /// URL の空白を percent-encode すること。
