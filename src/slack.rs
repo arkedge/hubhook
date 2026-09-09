@@ -391,14 +391,14 @@ impl Message {
                 // リクエスト自体の失敗は payload を変えても直らない。
                 // 送り直すと待ち時間も倍になるので諦める。
                 Err(PostError::Request(e)) => {
-                    error!(channel, error = %e, "POST failed");
+                    error!(channel, link, error = %e, "POST failed");
                     return;
                 }
                 Err(PostError::Api(e)) => {
                     if !is_retriable(&e) {
                         // 諦めるが無音にはしない。channel と link が残っていれば
                         // 落ちた通知を後から追える。
-                        error!(channel, error = %e, "POST failed");
+                        error!(channel, link, error = %e, "POST failed");
                         return;
                     }
 

@@ -93,6 +93,12 @@ fn strip_tags(html: &str) -> String {
                 // 閉じていないので、以降はタグの途中とみなして捨てる
                 break;
             }
+
+            // 区切りを意味するタグは、落とすと語がくっつく (`a<br>b` -> `ab`)
+            if let Some(sep) = tag_separator(&html[i + 1..j]) {
+                out.push(sep);
+            }
+
             i = j + 1;
             continue;
         }
@@ -102,7 +108,38 @@ fn strip_tags(html: &str) -> String {
         i += ch.len_utf8();
     }
 
-    decode_refs(out.trim())
+    // ここで trim すると `<br>` 単独の改行が消える。全体の trim は
+    // from_markdown の最後で行う
+    decode_refs(&out)
+}
+
+/// 落とすと語がくっついてしまうタグに対して、代わりに置く文字。
+///
+/// `<br>` と、段落・箇条書き・表の行の閉じタグは改行にする。表のセルは
+/// 改行だと縦に伸びるので空白にする。開きタグ側は前の要素の閉じタグで
+/// 区切りが入るので見ない。
+fn tag_separator(tag: &str) -> Option<char> {
+    let name = tag
+        .trim_start_matches('/')
+        .split([' ', '\t', '\n', '/'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if name == "br" {
+        return Some('\n');
+    }
+    if !tag.starts_with('/') {
+        return None;
+    }
+
+    match name.as_str() {
+        "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => {
+            Some('\n')
+        }
+        "td" | "th" => Some(' '),
+        _ => None,
+    }
 }
 
 /// HTML の文字参照を戻す。
@@ -113,13 +150,66 @@ fn strip_tags(html: &str) -> String {
 /// `&amp;` を最後に処理するのが要点。先に戻すと `&amp;lt;` が `<` になって、
 /// 書き手が意図した「`&lt;` という文字列」が消える。
 fn decode_refs(text: &str) -> String {
+    let text = decode_numeric(text);
+
+    // 全部の名前付き参照を持つには表か依存が要る。GitHub の本文で実際に
+    // 見かけるものだけ並べ、残りはそのまま出す (生で見えるが消えはしない)。
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'")
         .replace("&apos;", "'")
         .replace("&nbsp;", " ")
+        .replace("&copy;", "\u{a9}")
+        .replace("&reg;", "\u{ae}")
+        .replace("&deg;", "\u{b0}")
+        .replace("&middot;", "\u{b7}")
+        .replace("&times;", "\u{d7}")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&mdash;", "\u{2014}")
+        .replace("&hellip;", "\u{2026}")
+        .replace("&laquo;", "\u{ab}")
+        .replace("&raquo;", "\u{bb}")
+        // `&` は最後。先に戻すと `&amp;lt;` が `<` になって、書き手が意図した
+        // 「`&lt;` という文字列」が消える
         .replace("&amp;", "&")
+}
+
+/// 数値文字参照を戻す。`&#8230;` と `&#x2026;` の両方。
+fn decode_numeric(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+
+    while let Some(i) = rest.find("&#") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+
+        let (digits, radix) = match after.strip_prefix(['x', 'X']) {
+            Some(hex) => (hex, 16),
+            None => (after, 10),
+        };
+
+        let decoded = digits.find(';').filter(|end| *end > 0).and_then(|end| {
+            u32::from_str_radix(&digits[..end], radix)
+                .ok()
+                .and_then(char::from_u32)
+                .map(|c| (c, end))
+        });
+
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &digits[end + 1..];
+            }
+            // 参照になっていないのでそのまま出す
+            None => {
+                out.push_str("&#");
+                rest = after;
+            }
+        }
+    }
+
+    out.push_str(rest);
+    out
 }
 
 /// mrkdwn のリンク。
@@ -365,7 +455,9 @@ fn end(r: &mut Renderer, tag: TagEnd) {
         TagEnd::Strikethrough => r.push("~"),
         TagEnd::CodeBlock => {
             let code = r.close();
-            let code = code.trim_end();
+            // 閉じフェンスの直前の改行 1 つだけ落とす。trim_end だと
+            // コードの一部である末尾の空白や空行まで消える
+            let code = code.strip_suffix('\n').unwrap_or(&code);
 
             // Slack のコードブロックは ``` 固定で長さを変えられない。中に ```
             // があると途中で閉じて、以降の装飾まで崩れる。囲むのを諦める。
@@ -705,6 +797,41 @@ mod tests {
     fn html_character_references_are_decoded_once() {
         assert_eq!(from_markdown("<b>A &amp; B</b>"), "A &amp; B");
         assert_eq!(from_markdown("<b>&lt;tag&gt;</b>"), "&lt;tag&gt;");
+    }
+
+    /// 改行を意味するタグを落として語をくっつけないこと。
+    #[test]
+    fn line_breaking_tags_keep_the_break() {
+        assert_eq!(from_markdown("first<br>second"), "first\nsecond");
+        assert_eq!(from_markdown("<p>a</p><p>b</p>"), "a\nb");
+    }
+
+    /// 表のセルを落として語をくっつけないこと。
+    #[test]
+    fn html_table_cells_are_separated() {
+        assert_eq!(
+            from_markdown("<table><tr><td>A</td><td>B</td></tr></table>"),
+            "A B"
+        );
+    }
+
+    /// コードブロックの末尾の空行を消さないこと。
+    ///
+    /// 末尾の空白もコードの一部。閉じフェンスの直前の改行だけ落とす。
+    #[test]
+    fn code_blocks_keep_their_trailing_blank_lines() {
+        let out = from_markdown("```\ncode\n\n```");
+
+        assert!(out.contains("code\n\n```"), "空行が消えている: {out:?}");
+    }
+
+    /// 数値文字参照を戻すこと。
+    #[test]
+    fn numeric_character_references_are_decoded() {
+        assert_eq!(from_markdown("<b>&#8230;</b>"), "\u{2026}");
+        assert_eq!(from_markdown("<b>&#x2026;</b>"), "\u{2026}");
+        // 参照になっていないものはそのまま
+        assert_eq!(from_markdown("<b>&#;</b>"), "&amp;#;");
     }
 
     /// HTML コメントは中身ごと落とすこと。
