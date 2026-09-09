@@ -269,8 +269,27 @@ fn decode_refs(text: &str) -> String {
 /// フェンスを開いてしまい、以降の本文や Assignees まで飲み込む。
 ///
 /// 幅ゼロの文字を挟んで、見た目を保ったまま連続を切る。
+///
+/// 2 本ごとに切る。``` を置き換えるだけだと、5 本や 8 本の連続で置換後の
+/// 末尾と残りが繋がって ``` に戻ってしまう。
 fn neutralize_fences(text: &str) -> String {
-    text.replace("```", "`\u{200b}`\u{200b}`")
+    let mut out = String::with_capacity(text.len());
+    let mut run = 0;
+
+    for c in text.chars() {
+        if c == '`' {
+            if run == 2 {
+                out.push('\u{200b}');
+                run = 0;
+            }
+            run += 1;
+        } else {
+            run = 0;
+        }
+        out.push(c);
+    }
+
+    out
 }
 
 /// mrkdwn のリンク。
@@ -408,6 +427,8 @@ struct Renderer {
     item_pads: Vec<String>,
     /// 引用の中か。字下げは引用記法の外に付けるので、中では入れない
     quote_depth: usize,
+    /// コードブロックの中か。中身に空白を足すとコードが変わるので入れない
+    code_depth: usize,
 }
 
 #[derive(Default)]
@@ -429,6 +450,7 @@ impl Renderer {
             pending_tag: None,
             item_pads: Vec::new(),
             quote_depth: 0,
+            code_depth: 0,
         }
     }
 
@@ -488,10 +510,16 @@ impl Renderer {
     ///
     /// コードブロックからは呼ばない。フェンスや中身に空白を足すと、コード
     /// そのものが変わってしまう。
+    /// 行の頭でしか動かないので、書き出す側が何度呼んでも二重にならない。
     fn line_pad(&mut self) {
         // 引用の中身には入れない。引用記法の前に付けるので、中に入れると
         // `> ` の後ろが空くだけになる
         if self.quote_depth > 0 {
+            return;
+        }
+
+        // コードブロックの中身も字下げしない。空白を足すとコードが変わる
+        if self.code_depth > 0 {
             return;
         }
 
@@ -503,6 +531,38 @@ impl Renderer {
         if let Some(pad) = self.item_pads.last().cloned() {
             self.push(&pad);
         }
+    }
+
+    /// 複数行の文字列を足す。行ごとに項目の字下げを入れる。
+    ///
+    /// 表や生 HTML の区切りのように、1 回の push に改行が混ざるものがある。
+    /// そのままだと 2 行目以降が項目の外に見える。
+    fn push_lines(&mut self, s: &str) {
+        self.line_pad();
+
+        let pad = match self.item_pads.last() {
+            Some(pad) if self.quote_depth == 0 => pad.clone(),
+            _ => {
+                self.push(s);
+                return;
+            }
+        };
+
+        // 空行は字下げしない。末尾に空白だけが残る
+        let padded = s
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 || l.is_empty() {
+                    l.to_string()
+                } else {
+                    format!("{pad}{l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        self.push(&padded);
     }
 
     fn newline(&mut self) {
@@ -678,10 +738,13 @@ pub fn from_markdown(md: &str) -> String {
             Event::End(tag) => end(&mut r, tag),
             Event::Text(t) => {
                 let escaped = escape(&t);
+                // 改行を出したのが別のイベントでも行頭を揃える (`<br>` の後など)
+                r.line_pad();
                 r.push(&escaped);
             }
             Event::Code(t) => {
                 let escaped = escape(&t);
+                r.line_pad();
 
                 // mrkdwn のコード span は ` で囲む以外に書き方が無いので、
                 // 中に ` が残っていると区切りが壊れる。素のテキストで出す。
@@ -716,7 +779,8 @@ pub fn from_markdown(md: &str) -> String {
                 let visible = r.html_text(&h);
                 if !visible.is_empty() {
                     let escaped = escape(&visible);
-                    r.push(&escaped);
+                    // タグの区切りで改行が混ざる (`<br>` など)
+                    r.push_lines(&escaped);
                 }
             }
             _ => {}
@@ -746,6 +810,7 @@ fn start(r: &mut Renderer, tag: Tag) {
         Tag::CodeBlock(_) => {
             r.block_start();
             r.open();
+            r.code_depth += 1;
         }
         Tag::BlockQuote(kind) => {
             r.block_start();
@@ -846,6 +911,7 @@ fn end(r: &mut Renderer, tag: TagEnd) {
         TagEnd::Emphasis => r.push("_"),
         TagEnd::Strikethrough => r.push("~"),
         TagEnd::CodeBlock => {
+            r.code_depth -= 1;
             let code = r.close();
             // 閉じフェンスの直前の改行 1 つだけ落とす。trim_end だと
             // コードの一部である末尾の空白や空行まで消える
@@ -937,7 +1003,7 @@ fn end(r: &mut Renderer, tag: TagEnd) {
         TagEnd::Table => {
             if let Some(t) = r.table.take() {
                 let rendered = render_table(&t.rows);
-                r.push(&rendered);
+                r.push_lines(&rendered);
                 r.blank_line();
             }
         }
@@ -1042,6 +1108,47 @@ mod tests {
     #[test]
     fn ordered_lists_keep_their_numbers() {
         assert_eq!(from_markdown("1. a\n2. b"), "1. a\n2. b");
+    }
+
+    /// どの長さのバックティックの連続も切ること。
+    ///
+    /// ``` を置き換えるだけだと、5 本や 8 本で置換後の末尾と残りが繋がって
+    /// ``` に戻り、Slack のフェンスとして読まれる。
+    #[test]
+    fn every_backtick_run_is_split() {
+        for n in 3..=10 {
+            let out = super::neutralize_fences(&"`".repeat(n));
+            assert!(!out.contains("```"), "n={n} で繋がっている: {out:?}");
+        }
+    }
+
+    /// 生 HTML の改行の後も項目の字下げを続けること。
+    ///
+    /// 改行を出すのとその後の文字が別のイベントなので、書き出す側で行頭を
+    /// 揃えないとこぼれる。
+    #[test]
+    fn a_break_inside_an_item_keeps_the_indent() {
+        assert_eq!(from_markdown("- first<br>second"), "• first\n  second");
+    }
+
+    /// 項目の中の表も項目の字下げに揃えること。
+    #[test]
+    fn a_table_inside_an_item_keeps_the_indent() {
+        assert_eq!(
+            from_markdown("- item\n\n  | h |\n  | --- |\n  | v |"),
+            "• item\n\n  *h*\n  v"
+        );
+    }
+
+    /// 項目の中のコードブロックは字下げしないこと。
+    ///
+    /// フェンスや中身に空白を足すと、コードそのものが変わってしまう。
+    #[test]
+    fn code_inside_an_item_is_not_indented() {
+        assert_eq!(
+            from_markdown("- a\n\n  ```\n  code line\n  ```"),
+            "• a\n\n```\ncode line\n```"
+        );
     }
 
     /// 課題の折り返しをチェックボックスの後ろに揃えること。
