@@ -153,10 +153,20 @@ async fn post(
     if !warnings.is_empty() {
         // channel ごとに投稿するので、どの宛先の警告か分からないと追えない。
         // join せず配列のまま出す。確保が増えるし、構造も失われる
+        //
+        // 送った値も残す。Slack は切った後の値も理由も返さないので、警告の
+        // 名前だけでは何がどう削られたのか分からない。`username_too_long` は
+        // 表示名が切られたことしか言わず、どの display_name だったかは
+        // channel からも一意に決まらない。
         warn!(
             channel = %payload.channel,
             ok = body.ok,
             warnings = ?warnings,
+            username = payload.username.as_deref().unwrap_or(""),
+            // 上限がドキュメントに無いので、文字数とバイト数の両方を出す。
+            // どちらで切られているかはログを並べて初めて分かる
+            username_chars = payload.username.as_deref().map_or(0, |u| u.chars().count()),
+            username_bytes = payload.username.as_deref().map_or(0, str::len),
             "Slack returned warnings"
         );
     }
