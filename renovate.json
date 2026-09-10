@@ -7,30 +7,12 @@
   "lockFileMaintenance": { "enabled": true },
   "packageRules": [
     {
-      "groupName": "Rust",
-      "groupSlug": "rust",
-      "matchPackageNames": [
-        "rust",
-        "ghcr.io/sksat/cargo-chef-docker"
-      ]
-    },
-    {
       "groupName": "sentry-rust",
       "groupSlug": "sentry",
       "matchPackageNames": [
         "sentry",
         "sentry-actix"
       ]
-    }
-  ],
-  "customManagers": [
-    {
-      "customType": "regex",
-      "managerFilePatterns": ["/^rust-toolchain(\\.toml)?$/"],
-      "matchStrings": ["channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
-      "depNameTemplate": "rust",
-      "packageNameTemplate": "rust-lang/rust",
-      "datasourceTemplate": "github-releases"
     }
   ]
 }
