@@ -285,7 +285,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
         match pull_request.action {
             github::PullRequestAction::Opened => {
                 let text = format!(
-                    "[{repo}] Pull request opened by {user}",
+                    "[{repo}] Pull Request opened by {user}",
                     repo = repo_link(repo),
                     user = user_link(&pr.user)
                 );
@@ -378,7 +378,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                     let repo = repo_link(repo);
                     let assignees = users2str(assignees, ", ", Some(LinkStyle::Mrkdwn))
                         .expect("no assignees on pull request assigned event");
-                    format!("[{repo}] Pull request assigned to {assignees}",)
+                    format!("[{repo}] Pull Request assigned to {assignees}",)
                 };
 
                 let attach = {
@@ -425,10 +425,11 @@ impl TryFrom<&github::IssueComment> for slack::Message {
             github::IssueCommentAction::Created => {
                 let color = Some(slack::Color::Comment);
 
+                // GitHub の entity は固有名詞として扱う (README の表記に合わせる)
                 let typ = if issue.is_pull_request() {
-                    "pull request"
+                    "Pull Request"
                 } else {
-                    "issue"
+                    "Issue"
                 };
                 let text = format!(
                     "[{repo_name}] New comment by {username} on {typ} <{ic_link}|#{number}: {title}>",
@@ -499,7 +500,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
         };
 
         let text = format!(
-            "[{repo}] {user} {verb} pull request <{link}|#{number}: {title}>",
+            "[{repo}] {user} {verb} Pull Request <{link}|#{number}: {title}>",
             repo = repo_link(repo),
             user = user_link(&r.user),
             link = r.html_url,
@@ -555,7 +556,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
         };
 
         let text = format!(
-            "[{repo}] {kind} by {user} on pull request <{link}|#{number}: {title}>",
+            "[{repo}] {kind} by {user} on Pull Request <{link}|#{number}: {title}>",
             repo = repo_link(repo),
             user = user_link(&comment.user),
             link = comment.html_url,
