@@ -405,7 +405,19 @@ impl Message {
             match post(&client, base, token, &payload, left).await {
                 Ok(()) => {
                     // どの表現で通ったかは、表現を変えたときの答え合わせに要る。
-                    info!(channel, body = payload.body_kind(), "POST ok");
+                    //
+                    // 送った `text` もそのまま出す。文面が意図どおりか (誰が
+                    // 主語か、リンクが崩れていないか) は、ログに出ていないと
+                    // テストに println を仕込んで覗くしかない。
+                    //
+                    // 本文 (attachment) は出さない。長い上に Issue の中身が
+                    // ログに残り続けるので、有無だけを `body` で出す。
+                    info!(
+                        channel,
+                        text = %payload.text,
+                        body = payload.body_kind(),
+                        "POST ok"
+                    );
                     return;
                 }
                 // リクエスト自体の失敗は payload を変えても直らない。
