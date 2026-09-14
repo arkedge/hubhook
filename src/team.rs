@@ -3,6 +3,10 @@
 //! ルールは `body` に対する正規表現なので、`@Octocoders/octo-team` と書かれても
 //! `@sksat` を待っている個人のルールにはマッチせず、通知が飛ばなかった。
 //! team のメンバーは payload に入っていないため GitHub API で引く。
+//!
+//! `reviewer` ルールも同じ理由で team を展開する (#364)。team に review を
+//! 依頼した payload には slug しか入っておらず、`^sksat$` を待っている
+//! 個人のルールには当たらなかった。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,7 +45,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// team 数 × ページ数だけ伸びる。GitHub の webhook 配信タイムアウト (10 秒)
 /// を超えると再送され、通知が重複するので短く打ち切る。
 ///
-/// **これは展開フェーズだけの上限**で、webhook 全体の締め切りではない。
+/// **これは展開フェーズ全体の上限**で、webhook 全体の締め切りではない。
+/// body と reviewer の展開はこれを分け合う (`expand_deadline`)。
 /// 展開のあとに channel ごとの Slack POST が直列で走るため、channel が
 /// 複数あると合計は 10 秒を超えうる。端から端まで縛るには、
 /// 1 つの締め切りを配信まで通すか、配信を webhook の応答から外す必要がある。
@@ -71,6 +76,16 @@ const MAX_TEAMS_PER_BODY: usize = 8;
 /// 存在しない team を毎回引き直さないようにする。成功時より短くして、
 /// 一時的な失敗からは早めに復帰させる。
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// 展開フェーズの締め切り。
+///
+/// body のメンションと reviewer の team で **1 つを共有する**。別々に持つと、
+/// 両方を展開する webhook (team に review を依頼した PR の本文に team
+/// メンションがある、など) で合計が 2 倍になり、GitHub の配信タイムアウト
+/// (10 秒) を超えて再送される = 通知が重複する。
+pub fn expand_deadline() -> Instant {
+    Instant::now() + TOTAL_EXPAND_BUDGET
+}
 
 #[derive(Debug, Deserialize)]
 struct Member {
@@ -186,12 +201,57 @@ impl TeamResolver {
         }
     }
 
+    /// review を依頼された team をメンバーの login に展開する (#364)。
+    ///
+    /// `@` は付けない。`reviewer` の照合対象は payload から取った login や
+    /// slug (`sksat`, `octo-team`) なので、`@sksat` にすると
+    /// `^sksat$` のような既存ルールに当たらなくなる。
+    ///
+    /// 展開に失敗したときは空を返す (fail-open)。その webhook では slug を
+    /// 見ているルールだけが当たる。個人のルールは静かに漏れるので、
+    /// 失敗は log と Sentry に出す。
+    pub async fn expand_team(&self, org: &str, slug: &str, deadline: Instant) -> Vec<String> {
+        // token が無いときはここで諦める。イベントごとに warn と Sentry を
+        // 出すと「省略可・設定しなければ静かに無効」という設計と矛盾するので、
+        // 通知は起動時の warn 1 回だけにする。
+        if self.token.is_none() {
+            return Vec::new();
+        }
+
+        // GitHub のログイン名は大文字小文字を区別しない。正規化しないと
+        // 同じ team が別 key でキャッシュに載り、取得中ロックも効かない
+        // (body 側は `teams_in` で正規化している)。
+        let (org, slug) = (org.to_lowercase(), slug.to_lowercase());
+
+        match self.members(&org, &slug, deadline).await {
+            Ok(members) => {
+                debug!(
+                    "expanded review request to @{org}/{slug} to {} member(s)",
+                    members.len()
+                );
+                members
+            }
+            // 失敗はキャッシュしてあるので、同じ内容を Sentry に積み続けない
+            Err(Error::CachedFailure) => {
+                debug!("skipping review request to @{org}/{slug}: previous lookup failed (cached)");
+                Vec::new()
+            }
+            Err(e) => {
+                // 展開できなくても、slug を見ているルールは当たる
+                let msg = format!("could not expand review request to @{org}/{slug}: {e}");
+                warn!("{msg}");
+                sentry::capture_message(&msg, sentry::Level::Warning);
+                Vec::new()
+            }
+        }
+    }
+
     /// `body` 中の team メンションをメンバーの `@login` に展開し、
     /// スペース区切りで返す。team メンションが無ければ空文字。
     ///
     /// 展開に失敗しても、他のルールの判定は続けたいので空文字を返す
     /// (fail-open)。失敗は log と sentry に出す。
-    pub async fn expand_mentions(&self, body: &str) -> String {
+    pub async fn expand_mentions(&self, body: &str, deadline: Instant) -> String {
         // token が無いときはここで諦める。イベントごとに warn と Sentry を
         // 出すと「省略可・設定しなければ静かに無効」という設計と矛盾するので、
         // 通知は起動時の warn 1 回だけにする。
@@ -203,8 +263,6 @@ impl TeamResolver {
         if teams.is_empty() {
             return String::new();
         }
-
-        let deadline = Instant::now() + TOTAL_EXPAND_BUDGET;
 
         let mut mentions: Vec<String> = Vec::new();
         for (i, (org, slug)) in teams.iter().enumerate() {
@@ -572,6 +630,72 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
+    /// review を依頼された team がメンバーの login に展開されること (#364)。
+    ///
+    /// `@` を付けないこと。`reviewer` の照合対象は payload から取った login や
+    /// slug なので、`@sksat` にすると `^sksat$` のようなルールに当たらない。
+    #[actix_web::test]
+    async fn requested_team_expands_to_bare_logins() {
+        let r = api_resolver(spawn_api(vec![2], 200));
+        let members = r
+            .expand_team("Octocoders", "octo-team", far_deadline())
+            .await;
+
+        assert_eq!(members, vec!["u1_0", "u1_1"], "@ が付いていないこと");
+    }
+
+    /// 展開に失敗したら空を返すこと (fail-open)。
+    ///
+    /// その webhook では slug を見ているルールだけが当たる。
+    #[actix_web::test]
+    async fn requested_team_fails_open() {
+        let r = api_resolver(spawn_api(vec![], 403));
+        assert!(
+            r.expand_team("Octocoders", "octo-team", far_deadline())
+                .await
+                .is_empty()
+        );
+    }
+
+    /// token が無ければ API を叩かずに空を返すこと。
+    #[actix_web::test]
+    async fn requested_team_without_token_hits_no_api() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits) = spawn_api_counting(vec![2], 200, Duration::ZERO);
+        let r = TeamResolver::with_base_url(None, base);
+
+        assert!(
+            r.expand_team("Octocoders", "octo-team", far_deadline())
+                .await
+                .is_empty()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "API を叩いてはいけない");
+    }
+
+    /// body のメンションと同じキャッシュに載ること (#364)。
+    ///
+    /// 大文字小文字を正規化しないと、同じ team が別 key で載って
+    /// API を 2 回叩く。
+    #[actix_web::test]
+    async fn requested_team_shares_the_cache_with_mentions() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits) = spawn_api_counting(vec![2], 200, Duration::ZERO);
+        let r = api_resolver(base);
+
+        r.expand_team("Octocoders", "octo-team", far_deadline())
+            .await;
+        r.expand_mentions("@octocoders/octo-team おねがい", far_deadline())
+            .await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "同じ team を 2 回引いている"
+        );
+    }
+
     /// 最後の (満杯でない) ページまで辿ること。
     #[actix_web::test]
     async fn paginates_until_short_page() {
@@ -621,7 +745,8 @@ mod tests {
     async fn non_success_status_fails_open() {
         let r = api_resolver(spawn_api(vec![], 403));
         assert_eq!(
-            r.expand_mentions("@Octocoders/octo-team おねがい").await,
+            r.expand_mentions("@Octocoders/octo-team おねがい", far_deadline())
+                .await,
             ""
         );
     }
@@ -630,7 +755,9 @@ mod tests {
     #[actix_web::test]
     async fn members_are_expanded_as_mentions() {
         let r = api_resolver(spawn_api(vec![2], 200));
-        let expanded = r.expand_mentions("@Octocoders/octo-team おねがい").await;
+        let expanded = r
+            .expand_mentions("@Octocoders/octo-team おねがい", far_deadline())
+            .await;
 
         assert_eq!(expanded, "@u1_0 @u1_1");
     }
@@ -949,8 +1076,11 @@ mod tests {
     #[actix_web::test]
     async fn no_team_mention_expands_to_empty() {
         let r = resolver();
-        assert_eq!(r.expand_mentions("@sksat おねがい").await, "");
-        assert_eq!(r.expand_mentions("").await, "");
+        assert_eq!(
+            r.expand_mentions("@sksat おねがい", far_deadline()).await,
+            ""
+        );
+        assert_eq!(r.expand_mentions("", far_deadline()).await, "");
     }
 
     /// 空文字の token は未設定として扱うこと。
@@ -1025,7 +1155,8 @@ mod tests {
     async fn missing_token_fails_open() {
         let r = resolver();
         assert_eq!(
-            r.expand_mentions("@Octocoders/octo-team おねがい").await,
+            r.expand_mentions("@Octocoders/octo-team おねがい", far_deadline())
+                .await,
             ""
         );
     }

@@ -269,17 +269,34 @@ async fn webhook(
 
     //post_test(&opt, &payload).await;
 
-    // team メンションをメンバーの @login に展開してから照合する (#286)。
-    // body クエリを使う rule が 1 つも無ければ展開結果は使われないので、
-    // GitHub API を叩かない (repo / label / assignee だけの設定で待たされないため)。
-    let extra_mentions = if cfg.rule.iter().any(|r| r.uses_body()) {
-        teams.expand_mentions(payload.body()).await
+    // team をメンバーに展開してから照合する (#286, #364)。展開は body と
+    // reviewer の 2 か所で使うが、締め切りは 1 つを共有する (`expand_deadline`)。
+    // どちらも、使う rule が 1 つも無ければ GitHub API を叩かない
+    // (repo / label / assignee だけの設定で待たされないため)。
+    let deadline = team::expand_deadline();
+
+    // reviewer を先に展開する。予算を使い切ったときに落とすなら、body 由来の
+    // メンションより「自分宛の review request」を残したい。
+    let reviewers = match payload.requested_team() {
+        Some((org, slug)) if cfg.rule.iter().any(|r| r.uses_reviewer()) => {
+            teams.expand_team(org, slug, deadline).await
+        }
+        _ => Vec::new(),
+    };
+
+    let mentions = if cfg.rule.iter().any(|r| r.uses_body()) {
+        teams.expand_mentions(payload.body(), deadline).await
     } else {
         String::new()
     };
 
+    let expanded = github::Expanded {
+        mentions,
+        reviewers,
+    };
+
     // match rule
-    let matches = payload.match_rules(&cfg.rule, &extra_mentions);
+    let matches = payload.match_rules(&cfg.rule, &expanded);
 
     if matches.is_empty() {
         return Ok(HttpResponse::Ok().body("webhook"));
@@ -345,17 +362,34 @@ impl Rule {
                 .is_some_and(|q| q.body.is_some())
     }
 
-    /// `mentions` は team メンションを展開した `@login` の列、
-    /// `combined` は「元の本文 + `mentions`」を組み立てたもの (#286)。
+    /// reviewer クエリを使っているか (include / exclude のいずれか)。
+    ///
+    /// 使っていない rule しか無いなら、review を依頼された team を引く
+    /// 必要がない (#364)。
+    fn uses_reviewer(&self) -> bool {
+        self.query.reviewer.is_some()
+            || self
+                .exclude_query
+                .as_ref()
+                .is_some_and(|q| q.reviewer.is_some())
+    }
+
+    /// `expanded` は team を展開した結果、`combined` は「元の本文 +
+    /// 展開したメンション」を組み立てたもの (#286, #364)。
     /// どちらも webhook ごとに 1 回作って rule 間で使い回す。
-    fn check_match(&self, payload: &github::Payload, mentions: &str, combined: &str) -> bool {
-        let include_query_result = Rule::match_results(&self.query, payload, mentions, combined)
+    fn check_match(
+        &self,
+        payload: &github::Payload,
+        expanded: &github::Expanded,
+        combined: &str,
+    ) -> bool {
+        let include_query_result = Rule::match_results(&self.query, payload, expanded, combined)
             .iter()
             .all(|&r| r);
 
         if let Some(exclude_query) = &self.exclude_query {
             let exclude_query_result =
-                Rule::match_results(exclude_query, payload, mentions, combined)
+                Rule::match_results(exclude_query, payload, expanded, combined)
                     .iter()
                     .any(|&r| r);
             include_query_result && !exclude_query_result
@@ -367,7 +401,7 @@ impl Rule {
     fn match_results(
         query: &Query,
         payload: &github::Payload,
-        mentions: &str,
+        expanded: &github::Expanded,
         combined: &str,
     ) -> Vec<bool> {
         let r_repo = Rule::match_query(query.repo.as_ref(), &payload.repo().full_name);
@@ -392,7 +426,7 @@ impl Rule {
                 return true;
             }
 
-            if mentions.is_empty() {
+            if expanded.mentions.is_empty() {
                 return false;
             }
 
@@ -413,7 +447,7 @@ impl Rule {
             //    重くなるため。その結果、「本文の文脈 + member への末尾アンカー」
             //    (`レビュー.*@sksat$`) は並び順に依存するという制限が残る。
             //    稀な書き方のために全体のコストを上げない判断 (README に記載)。
-            mentions.split(' ').any(|m| re.is_match(m))
+            expanded.mentions.split(' ').any(|m| re.is_match(m))
         });
 
         let labels = payload.labels().iter().collect();
@@ -423,9 +457,22 @@ impl Rule {
         let r_assignee = Rule::match_query_vec(query.assignee.as_ref(), assignees);
 
         // review を依頼されたイベント以外では空なので、reviewer を指定した rule は
-        // review_requested にしかマッチしない
-        let r_reviewer =
-            Rule::match_query_vec(query.reviewer.as_ref(), payload.requested_reviewers());
+        // review_requested にしかマッチしない。
+        //
+        // team に依頼した payload には slug しか入っていないので、展開した
+        // メンバーの login も対象に足す (#364)。slug は残すので、slug で
+        // 書いてある既存のルールはそのまま当たる。
+        let mut reviewers = payload.requested_reviewers();
+
+        // 展開したメンバーを足すのは、その team に依頼したイベントだけ。
+        // 無条件に足すと、reviewer ルールが review_requested 以外にも当たり
+        // 始め、PR への commit やコメントごとに team 全員へ飛ぶ。
+        // 呼び出し側が「review_requested のときだけ詰める」ことに依存させない。
+        if payload.requested_team().is_some() {
+            reviewers.extend(expanded.reviewers.iter().map(String::as_str));
+        }
+
+        let r_reviewer = Rule::match_query_vec(query.reviewer.as_ref(), reviewers);
 
         // review_state を持たないイベントには、query が指定されていれば必ず不一致を返す。
         // 空文字を照合対象にすると、query は正規表現なので `.*` や `^$` のような
