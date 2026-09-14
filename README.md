@@ -83,10 +83,10 @@ Repository and account names are links. Assignees are put on a single line as
 `Assignees: a, b, c`. The attachment footer shows the login and avatar of
 whoever did it (the sender).
 
-The first line of a notification reads as follows. The verbs are GitHub's own
-words (`opened`, `assigned`, `approved`, `requested changes`, `requested a
-review`), and `Issue` and `Pull Request` are written as the names of the
-things they are.
+The first line of a notification reads as follows. Where GitHub has a word for
+what happened (`opened`, `assigned`, `approved`, `requested changes`,
+`commented on`, `requested a review`), the message uses it, and `Issue` and
+`Pull Request` are written as the names of the things they are.
 
 ```
 [org/repo] Issue opened by alice
