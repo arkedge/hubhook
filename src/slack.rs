@@ -310,8 +310,12 @@ impl MessagePayload {
     }
 }
 
-// Slack attachment の色パレット。
-// Closed は今のところ使っていないが、定義として残す
+/// Slack attachment の色パレット。
+///
+/// `good` / `warning` / `danger` は Slack が値を持つキーワード色。それ以外は
+/// GitHub Primer の hex を直接書いて、GitHub 上で見えている状態の色と揃える。
+///
+/// Merged / Closed は今のところ使っていないが、定義として残す
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -320,12 +324,22 @@ pub enum Color {
     Warning,
     Danger,
 
-    // GitHub
-    #[serde(rename = "#24292F")]
+    // GitHub Primer
+    /// review の approve。
+    ///
+    /// GitHub の Approved と同じ success 緑。`good` だと opened / assigned と
+    /// 同じ緑になって approve が埋もれるので、別の緑として持つ。
+    #[serde(rename = "#1F883D")]
+    Approved,
+    /// コメントの類。
+    ///
+    /// 状態を表さない通知なので neutral。fg.default (`#24292F`) は文字色で
+    /// 面を塗る色ではなく、Slack のダークテーマだと背景に溶けていた。
+    #[serde(rename = "#6E7781")]
     Comment,
-    #[serde(rename = "#6F42C1")]
+    #[serde(rename = "#8250DF")]
     Merged,
-    #[serde(rename = "#CB2431")]
+    #[serde(rename = "#CF222E")]
     Closed,
 }
 
@@ -569,6 +583,25 @@ mod tests {
             "some_error_slack_has_not_documented_yet",
         ] {
             assert!(!is_retriable(e), "{e} は送り直すべきでない");
+        }
+    }
+
+    /// 色は Slack のキーワードか GitHub Primer の hex として送ること。
+    ///
+    /// hex を間違えても Slack は黙って受けるので、値そのものを固定しておく。
+    #[test]
+    fn palette_serializes_to_the_expected_values() {
+        for (color, want) in [
+            (Color::Good, "good"),
+            (Color::Warning, "warning"),
+            (Color::Danger, "danger"),
+            (Color::Approved, "#1F883D"),
+            (Color::Comment, "#6E7781"),
+            (Color::Merged, "#8250DF"),
+            (Color::Closed, "#CF222E"),
+        ] {
+            let json = serde_json::to_value(&color).expect("直列化に失敗");
+            assert_eq!(json, want, "{color:?} の色が変わっている");
         }
     }
 
