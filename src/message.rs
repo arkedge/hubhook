@@ -189,7 +189,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                 // 以前はここにリンクを入れると unfurl でメッセージが崩れていたため
                 // 避けていたが、post 時に unfurl を明示的に切ったのでリンクにできる
                 let text = format!(
-                    "[{repo}] Issue created by {user}",
+                    "[{repo}] Issue opened by {user}",
                     repo = repo_link(repo),
                     user = user_link(user)
                 );
@@ -425,10 +425,11 @@ impl TryFrom<&github::IssueComment> for slack::Message {
             github::IssueCommentAction::Created => {
                 let color = Some(slack::Color::Comment);
 
+                // GitHub の entity は固有名詞として扱う (README の表記に合わせる)
                 let typ = if issue.is_pull_request() {
-                    "pull request"
+                    "Pull Request"
                 } else {
-                    "issue"
+                    "Issue"
                 };
                 let text = format!(
                     "[{repo_name}] New comment by {username} on {typ} <{ic_link}|#{number}: {title}>",
@@ -499,7 +500,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
         };
 
         let text = format!(
-            "[{repo}] {user} {verb} pull request <{link}|#{number}: {title}>",
+            "[{repo}] {user} {verb} Pull Request <{link}|#{number}: {title}>",
             repo = repo_link(repo),
             user = user_link(&r.user),
             link = r.html_url,
@@ -555,7 +556,7 @@ impl TryFrom<&github::PullRequestReviewComment> for slack::Message {
         };
 
         let text = format!(
-            "[{repo}] {kind} by {user} on pull request <{link}|#{number}: {title}>",
+            "[{repo}] {kind} by {user} on Pull Request <{link}|#{number}: {title}>",
             repo = repo_link(repo),
             user = user_link(&comment.user),
             link = comment.html_url,

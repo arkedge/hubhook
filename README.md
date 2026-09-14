@@ -83,6 +83,34 @@ Repository and account names are links. Assignees are put on a single line as
 `Assignees: a, b, c`. The attachment footer shows the login and avatar of
 whoever did it (the sender).
 
+The first line of a notification reads as follows. Where GitHub has a word for
+what happened (`opened`, `assigned`, `approved`, `requested changes`,
+`commented on`, `requested a review`), the message uses it, and `Issue` and
+`Pull Request` are written as the names of the things they are.
+
+```
+[org/repo] Issue opened by alice
+[org/repo] Issue assigned to alice, bob
+[org/repo] Pull Request opened by alice
+[org/repo] Pull Request assigned to alice, bob
+[org/repo] alice requested a review from bob
+[org/repo] alice requested a review from team reviewers
+[org/repo] New comment by alice on Issue #1: Title
+[org/repo] New comment by alice on Pull Request #1: Title
+[org/repo] alice approved Pull Request #1: Title
+[org/repo] alice requested changes on Pull Request #1: Title
+[org/repo] alice commented on Pull Request #1: Title
+[org/repo] New review comment by alice on Pull Request #1: Title
+[org/repo] New reply by alice on Pull Request #1: Title
+```
+
+Where the item is named depends on the event. A review, a comment or a reply
+names it on the first line as `#1: Title`. An Issue or a Pull Request being
+opened or assigned, and a review request, leave the first line to the people
+involved and put `#1 Title` in the attachment title instead. A review comment
+puts the path of the file it is on there, so the comment can be read against
+the file it belongs to.
+
 ## Team mention
 
 When a body mentions `@org/team`, the team members are fetched from the GitHub
