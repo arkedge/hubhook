@@ -476,7 +476,7 @@ impl TryFrom<&github::PullRequestReview> for slack::Message {
         let body = r.body.as_deref().unwrap_or("");
 
         let (verb, color) = match r.state.as_str() {
-            "approved" => ("approved", slack::Color::Merged),
+            "approved" => ("approved", slack::Color::Approved),
             "changes_requested" => ("requested changes on", slack::Color::Danger),
             "commented" => {
                 // インラインコメントだけを submit すると、body が空の `commented`
@@ -619,6 +619,24 @@ mod tests {
             "attach = {}",
             attach.body.text().expect("本文が無い")
         );
+    }
+
+    /// approve は merged の紫ではなく approve の緑で出すこと。
+    ///
+    /// 元は `Color::Merged` (`#6F42C1`) を使っていて、merge していないのに
+    /// merge されたように見えていた。
+    #[test]
+    fn approved_review_is_green() {
+        let msg = message(
+            "pull_request_review",
+            "pull_request_review.approved.derived.json",
+        )
+        .expect("approve は通知されるべき");
+
+        let attach = &msg.attachments.as_ref().unwrap()[0];
+        let json = serde_json::to_value(attach).expect("直列化に失敗");
+
+        assert_eq!(json["color"], "#1F883D", "attach = {json}");
     }
 
     /// インラインコメントだけを submit したときに飛んでくる、
