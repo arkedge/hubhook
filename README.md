@@ -104,10 +104,12 @@ things they are.
 [org/repo] New reply by alice on Pull Request #1: Title
 ```
 
-An event whose item is named on the first line (a review, a comment) puts the
-body in the attachment. One that is not (an Issue or a Pull Request being
-opened or assigned) puts `#1: Title` in the attachment title instead, which is
-why the subject of the sentence differs between the two.
+Where the item is named depends on the event. A review, a comment or a reply
+names it on the first line as `#1: Title`. An Issue or a Pull Request being
+opened or assigned, and a review request, leave the first line to the people
+involved and put `#1 Title` in the attachment title instead. A review comment
+puts the path of the file it is on there, so the comment can be read against
+the file it belongs to.
 
 ## Team mention
 
