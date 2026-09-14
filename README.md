@@ -83,6 +83,31 @@ Repository and account names are links. Assignees are put on a single line as
 `Assignees: a, b, c`. The attachment footer shows the login and avatar of
 whoever did it (the sender).
 
+The first line of a notification reads as follows. `opened`, `assigned`,
+`approved`, `requested changes` and `requested a review` are GitHub's own
+words, so the message says what the GitHub UI says.
+
+```
+[org/repo] Issue opened by alice
+[org/repo] Issue assigned to alice, bob
+[org/repo] Pull request opened by alice
+[org/repo] Pull request assigned to alice, bob
+[org/repo] alice requested a review from bob
+[org/repo] alice requested a review from team reviewers
+[org/repo] New comment by alice on issue #1: Title
+[org/repo] New comment by alice on pull request #1: Title
+[org/repo] alice approved pull request #1: Title
+[org/repo] alice requested changes on pull request #1: Title
+[org/repo] alice commented on pull request #1: Title
+[org/repo] New review comment by alice on pull request #1: Title
+[org/repo] New reply by alice on pull request #1: Title
+```
+
+An event whose item is named on the first line (a review, a comment) puts the
+body in the attachment. One that is not (an Issue or a Pull Request being
+opened or assigned) puts `#1: Title` in the attachment title instead, which is
+why the subject of the sentence differs between the two.
+
 ## Team mention
 
 When a body mentions `@org/team`, the team members are fetched from the GitHub

@@ -189,7 +189,7 @@ impl TryFrom<&github::Issues> for slack::Message {
                 // 以前はここにリンクを入れると unfurl でメッセージが崩れていたため
                 // 避けていたが、post 時に unfurl を明示的に切ったのでリンクにできる
                 let text = format!(
-                    "[{repo}] Issue created by {user}",
+                    "[{repo}] Issue opened by {user}",
                     repo = repo_link(repo),
                     user = user_link(user)
                 );
@@ -285,7 +285,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
         match pull_request.action {
             github::PullRequestAction::Opened => {
                 let text = format!(
-                    "[{repo}] Pull Request opened by {user}",
+                    "[{repo}] Pull request opened by {user}",
                     repo = repo_link(repo),
                     user = user_link(&pr.user)
                 );
@@ -378,7 +378,7 @@ impl TryFrom<&github::PullRequest> for slack::Message {
                     let repo = repo_link(repo);
                     let assignees = users2str(assignees, ", ", Some(LinkStyle::Mrkdwn))
                         .expect("no assignees on pull request assigned event");
-                    format!("[{repo}] Pull Request assigned to {assignees}",)
+                    format!("[{repo}] Pull request assigned to {assignees}",)
                 };
 
                 let attach = {
