@@ -57,7 +57,7 @@ Values are case-insensitive regular expressions.
 |body|body of an Issue, Issue Comment, review or review comment|
 |label|Issue label|
 |assignee|login of an Issue / PR assignee|
-|reviewer|login of a requested reviewer, or the slug of a requested team|
+|reviewer|login of a requested reviewer, the slug of a requested team, or the login of a member of that team|
 |review_state|`pull_request_review` state (`approved` / `changes_requested` / `commented`)|
 
 ## Notified events
@@ -103,3 +103,18 @@ API and expanded to `@login` before the `body` query is matched. A mention of
 A rule that combines body context with an anchor on a member, such as
 `review.*@sksat$`, depends on the order of the expanded logins and may not
 match.
+
+The same expansion applies to a review requested from a team. The payload
+carries only the slug, so `"reviewer": "^sksat$"` would not match a request
+sent to a team `sksat` belongs to; the members are fetched and matched as well.
+The slug itself still matches, so `"reviewer": "^octo-team$"` keeps working.
+
+- The team's `login`s are matched without the `@` prefix, unlike the body
+- Only the team of **that** event is expanded, so nothing is fetched for a
+  request sent to a single user
+- Nothing is fetched unless some rule uses `reviewer`
+- Without `GITHUB_TOKEN`, or when the API call fails, only the slug matches.
+  A rule written with a login then notifies nothing, so the failure is logged
+  and sent to Sentry
+- The body and the review request share one expansion budget, so subscribing
+  to both cannot double the time spent before the notification is posted

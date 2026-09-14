@@ -216,6 +216,29 @@ pub enum PullRequestReviewCommentAction {
     Deleted,
 }
 
+/// 照合の前に、webhook ごとに 1 回だけ組み立てる展開結果 (#286, #364)。
+///
+/// rule ごとに引き直すと、rule の数だけ GitHub API を叩くことになる。
+#[derive(Debug, Default)]
+pub struct Expanded {
+    /// body の team メンションを展開した `@login` の列 (スペース区切り)
+    pub mentions: String,
+    /// review を依頼された team のメンバーの login (`@` は付かない)
+    pub reviewers: Vec<String>,
+}
+
+/// team の `html_url` (`https://github.com/orgs/<org>/teams/<slug>`) から
+/// org を取る。
+///
+/// `organization` が入っていない payload でも review request の通知を
+/// 落とさないための保険なので、想定した形でなければ諦める。
+fn org_in_team_url(url: &str) -> Option<&str> {
+    url.split_once("/orgs/")?
+        .1
+        .split_once("/teams/")
+        .map(|s| s.0)
+}
+
 use crate::{Rule, RuleMatchResult};
 impl Payload {
     /// `X-GitHub-Event` に対応する variant として deserialize する。
@@ -347,6 +370,33 @@ impl Payload {
         reviewers
     }
 
+    /// review を依頼された team の `(org, slug)` (#364)。
+    ///
+    /// team のメンバーは payload に入っていないので、`reviewer` ルールを
+    /// login で書けるようにするには GitHub API で引く必要がある。その引数。
+    ///
+    /// org は `organization` から取る。`repository.owner` は org 所有の
+    /// リポジトリでも user が入りうる (octokit の example がまさにそれで、
+    /// owner は `Codertocat`、team は `Octocoders` のもの)。
+    /// `organization` が無い payload でも通知を落とさないよう、team の
+    /// `html_url` (`https://github.com/orgs/<org>/teams/<slug>`) から拾う。
+    pub fn requested_team(&self) -> Option<(&str, &str)> {
+        let Payload::PullRequest(pr) = self else {
+            return None;
+        };
+        if pr.action != PullRequestAction::ReviewRequested {
+            return None;
+        }
+
+        let team = pr.requested_team.as_ref()?;
+        let org = match &pr.organization {
+            Some(org) => org.login.as_str(),
+            None => org_in_team_url(team.html_url.as_ref()?.as_str())?,
+        };
+
+        Some((org, team.slug.as_str()))
+    }
+
     /// `pull_request_review` の review state (`approved` / `changes_requested` /
     /// `commented` など)。それ以外のイベントでは `None`。
     pub fn review_state(&self) -> Option<&str> {
@@ -356,30 +406,34 @@ impl Payload {
         }
     }
 
-    /// `extra_mentions` は team メンションを展開した `@login` の列 (#286)。
+    /// `expanded` は team を展開した結果 (#286, #364)。
     ///
-    /// 本文と連結せずにそのまま渡す。連結すると、`$` などのアンカーを使う
-    /// 既存ルールの意味が変わってしまう (`@org/team$` が末尾に一致しなくなる、
-    /// exclude_query 側では除外されるべきものが除外されなくなる)。
+    /// メンションは本文と連結せずにそのまま渡す。連結すると、`$` などの
+    /// アンカーを使う既存ルールの意味が変わってしまう (`@org/team$` が末尾に
+    /// 一致しなくなる、exclude_query 側では除外されるべきものが除外されない)。
     pub fn match_rules(
         &self,
         rules: &[Rule],
-        extra_mentions: &str,
+        expanded: &Expanded,
     ) -> HashMap<String, RuleMatchResult> {
         // 「本文 + 展開結果」は rule ごとに使うので、ここで 1 回だけ組み立てる。
         // rule ごとに format! すると、展開結果が大きいときに rule 数だけ
         // 確保と走査を繰り返すことになる。
-        let combined = if extra_mentions.is_empty() {
+        let combined = if expanded.mentions.is_empty() {
             String::new()
         } else {
-            format!("{body} {extra_mentions}", body = self.body())
+            format!(
+                "{body} {mentions}",
+                body = self.body(),
+                mentions = expanded.mentions
+            )
         };
 
         let mut v = HashMap::<String, RuleMatchResult>::new();
 
         for r in rules {
             // not match
-            if !r.check_match(self, extra_mentions, &combined) {
+            if !r.check_match(self, expanded, &combined) {
                 continue;
             }
 
@@ -447,9 +501,17 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use crate::github::testing::de;
+    use crate::github::testing::{de, de_without};
     use crate::github::*;
     use serde_json::Value;
+
+    /// body の team メンションだけを展開した状態。
+    fn mentions(mentions: &str) -> Expanded {
+        Expanded {
+            mentions: mentions.to_string(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn unsupported_event_is_ignored() {
@@ -580,7 +642,7 @@ mod tests {
             "pull_request_review.approved.derived.json",
         );
         assert!(
-            !p.match_rules(&rules, "").is_empty(),
+            !p.match_rules(&rules, &mentions("")).is_empty(),
             "review にはマッチするべき"
         );
 
@@ -590,7 +652,7 @@ mod tests {
             "pull_request_review_comment.created.with-organization.json",
         );
         assert!(
-            p.match_rules(&rules, "").is_empty(),
+            p.match_rules(&rules, &mentions("")).is_empty(),
             "review_state を持たないイベントにマッチしてはいけない"
         );
     }
@@ -685,6 +747,132 @@ mod tests {
         assert_eq!(p.requested_reviewers(), vec!["octo-team"]);
     }
 
+    /// #364: 展開する team の `(org, slug)` が取れること。
+    ///
+    /// org は `organization` から取る。`repository.owner` ではないのは、
+    /// octokit の example がまさに食い違っているため (owner は user の
+    /// `Codertocat`、team は `Octocoders` のもの)。
+    #[test]
+    fn requested_team_gives_the_org_and_slug() {
+        let p = de(
+            "pull_request",
+            "pull_request.review_requested.team.derived.json",
+        );
+        assert_eq!(p.requested_team(), Some(("Octocoders", "octo-team")));
+    }
+
+    /// #364: `organization` が無くても team の html_url から org を拾うこと。
+    ///
+    /// ここを諦めると、その payload では team の review request が
+    /// 個人ルールに当たらなくなる (静かに通知が飛ばない)。
+    #[test]
+    fn requested_team_falls_back_to_the_team_url() {
+        let p = de_without(
+            "pull_request",
+            "pull_request.review_requested.team.derived.json",
+            &["organization"],
+        );
+        assert_eq!(p.requested_team(), Some(("Octocoders", "octo-team")));
+    }
+
+    /// #364: team に依頼していないイベントでは展開対象が無いこと。
+    /// 無駄に GitHub API を叩かないため。
+    #[test]
+    fn requested_team_is_none_without_a_team() {
+        let p = de("pull_request", "pull_request.review_requested.json");
+        assert!(p.requested_team().is_none(), "user への依頼で team を引く");
+
+        let p = de(
+            "pull_request",
+            "pull_request.assigned.with-organization.json",
+        );
+        assert!(p.requested_team().is_none());
+    }
+
+    /// #364: team への review request が、展開したメンバーの login を
+    /// 見ているルールに当たること。
+    ///
+    /// payload には slug しか入っていないので、展開しないと `^octocat$` を
+    /// 待っている個人のルールには当たらない。
+    #[test]
+    fn reviewer_rule_matches_an_expanded_team_member() {
+        let rule: crate::Rule = serde_json::from_str(
+            r#"{"channel":"test","display_name":"x","query":{"reviewer":"^octocat$"}}"#,
+        )
+        .unwrap();
+        let rules = vec![rule];
+
+        let p = de(
+            "pull_request",
+            "pull_request.review_requested.team.derived.json",
+        );
+
+        assert!(
+            p.match_rules(&rules, &Expanded::default()).is_empty(),
+            "展開前は slug しか無いのでマッチしない"
+        );
+
+        let expanded = Expanded {
+            reviewers: vec!["octocat".to_string(), "hubot".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !p.match_rules(&rules, &expanded).is_empty(),
+            "展開したメンバーにはマッチするべき"
+        );
+    }
+
+    /// #364: 展開しても slug を見ている既存のルールは当たること。
+    #[test]
+    fn reviewer_rule_on_the_slug_still_matches() {
+        let rule: crate::Rule = serde_json::from_str(
+            r#"{"channel":"test","display_name":"x","query":{"reviewer":"^octo-team$"}}"#,
+        )
+        .unwrap();
+        let rules = vec![rule];
+
+        let p = de(
+            "pull_request",
+            "pull_request.review_requested.team.derived.json",
+        );
+
+        let expanded = Expanded {
+            reviewers: vec!["octocat".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !p.match_rules(&rules, &expanded).is_empty(),
+            "slug 指定のルールが当たらなくなっている"
+        );
+    }
+
+    /// #364: 展開したメンバーは review_requested 以外には持ち込まないこと。
+    ///
+    /// `reviewer` ルールが他のイベントに当たり始めると、PR への commit や
+    /// コメントごとに team 全員へ飛ぶ。
+    #[test]
+    fn expanded_reviewers_do_not_leak_into_other_events() {
+        let rule: crate::Rule = serde_json::from_str(
+            r#"{"channel":"test","display_name":"x","query":{"reviewer":"^octocat$"}}"#,
+        )
+        .unwrap();
+        let rules = vec![rule];
+
+        let expanded = Expanded {
+            reviewers: vec!["octocat".to_string()],
+            ..Default::default()
+        };
+
+        let p = de(
+            "pull_request",
+            "pull_request.assigned.with-organization.json",
+        );
+        assert!(
+            p.match_rules(&rules, &expanded).is_empty(),
+            "review_requested 以外にマッチしてはいけない"
+        );
+    }
+
     /// review_requested 以外のイベントでは reviewer は空にする。
     /// ここが空でないと、PR への commit やコメントごとに reviewer 全員へ
     /// 通知が飛んでしまう。
@@ -725,12 +913,12 @@ mod tests {
 
         // 展開前: team メンションのままなので個人のルールには当たらない
         assert!(
-            p.match_rules(&rules, "").is_empty(),
+            p.match_rules(&rules, &mentions("")).is_empty(),
             "展開前にマッチしてはいけない"
         );
 
         // 展開後: メンバーの @login が body に足されるのでマッチする
-        let matched = p.match_rules(&rules, "@sksat @meltingrabbit");
+        let matched = p.match_rules(&rules, &mentions("@sksat @meltingrabbit"));
         assert!(matched.contains_key("test"), "展開後はマッチするべき");
     }
 
@@ -757,9 +945,13 @@ mod tests {
             )
             .unwrap(),
         ];
-        assert!(!p.match_rules(&rules, "").is_empty(), "展開前はマッチする");
         assert!(
-            !p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            !p.match_rules(&rules, &mentions("")).is_empty(),
+            "展開前はマッチする"
+        );
+        assert!(
+            !p.match_rules(&rules, &mentions("@sksat @meltingrabbit"))
+                .is_empty(),
             "展開すると末尾アンカーが効かなくなっている"
         );
 
@@ -770,9 +962,13 @@ mod tests {
             )
             .unwrap(),
         ];
-        assert!(p.match_rules(&rules, "").is_empty(), "展開前は除外される");
         assert!(
-            p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            p.match_rules(&rules, &mentions("")).is_empty(),
+            "展開前は除外される"
+        );
+        assert!(
+            p.match_rules(&rules, &mentions("@sksat @meltingrabbit"))
+                .is_empty(),
             "展開すると除外が効かなくなっている"
         );
     }
@@ -798,11 +994,15 @@ mod tests {
         ];
 
         // 展開前は @sksat が本文に無いのでマッチしない
-        assert!(p.match_rules(&rules, "").is_empty(), "展開前はマッチしない");
+        assert!(
+            p.match_rules(&rules, &mentions("")).is_empty(),
+            "展開前はマッチしない"
+        );
 
         // 展開すると、本文の文脈と合わせてマッチする
         assert!(
-            !p.match_rules(&rules, "@sksat @meltingrabbit").is_empty(),
+            !p.match_rules(&rules, &mentions("@sksat @meltingrabbit"))
+                .is_empty(),
             "本文の文脈と展開結果を組み合わせたパターンが効いていない"
         );
     }
@@ -827,13 +1027,14 @@ mod tests {
 
         // 最後に並んでいる場合
         assert!(
-            !p.match_rules(&rules, "@aaa @sksat").is_empty(),
+            !p.match_rules(&rules, &mentions("@aaa @sksat")).is_empty(),
             "末尾にいるときはマッチするべき"
         );
 
         // 途中に並んでいる場合も同じ結果になること
         assert!(
-            !p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            !p.match_rules(&rules, &mentions("@aaa @sksat @zzz"))
+                .is_empty(),
             "並び順で結果が変わっている"
         );
     }
@@ -862,14 +1063,15 @@ mod tests {
 
         // sksat が最後に並んでいる場合
         assert!(
-            !p.match_rules(&rules, "@aaa @sksat").is_empty(),
+            !p.match_rules(&rules, &mentions("@aaa @sksat")).is_empty(),
             "末尾にいるときはマッチするべき"
         );
 
         // 後ろに別のメンバーが並ぶとマッチしない (既知の制限)。
         // ここが通るように変えるなら、走査量の上限も併せて設計すること。
         assert!(
-            p.match_rules(&rules, "@aaa @sksat @zzz").is_empty(),
+            p.match_rules(&rules, &mentions("@aaa @sksat @zzz"))
+                .is_empty(),
             "制限が解消されている。README と このテストの意図を更新すること"
         );
     }
