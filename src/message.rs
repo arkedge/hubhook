@@ -902,6 +902,34 @@ mod tests {
         assert!(msg.text.contains("|octocat>"), "text = {}", msg.text);
     }
 
+    /// #87: review request の主語は「依頼した側」であること。
+    ///
+    /// `sender` (操作した人) と `requested_reviewer` (依頼された人) は
+    /// どちらも user なので、取り違えても型では止まらない。入れ替わると
+    /// 「レビューを頼まれた人が誰かに頼んだ」という逆の意味の文になる。
+    #[test]
+    fn review_request_names_the_requester_as_the_subject() {
+        let msg = message("pull_request", "pull_request.review_requested.json")
+            .expect("review request は通知されるべき");
+
+        // fixture では Codertocat が octocat に依頼している。
+        // repo (Codertocat/Hello-World) にも同じ名前が出るので、
+        // 動詞の前後で切って主語と目的語を見る。
+        let (subject, object) = msg
+            .text
+            .split_once("requested a review from")
+            .unwrap_or_else(|| panic!("文面が変わっている: {}", msg.text));
+
+        assert!(
+            subject.ends_with("|Codertocat> "),
+            "主語が依頼した側でない: {subject}"
+        );
+        assert!(
+            object.contains("|octocat>"),
+            "目的語が依頼された側でない: {object}"
+        );
+    }
+
     /// #87: team への review request が team 名で通知されること。
     #[test]
     fn team_review_request_notifies_with_slug() {
