@@ -1,4 +1,4 @@
-FROM ghcr.io/sksat/cargo-chef-docker:1.97.1-bookworm as chef
+FROM ghcr.io/sksat/cargo-chef-docker:1.100.0-bookworm as chef
 LABEL maintainer "sksat <sksat@arkedgespace.com>"
 
 WORKDIR build
